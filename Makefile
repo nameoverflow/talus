@@ -17,3 +17,11 @@ stack-test:
 	mkdir -p build
 	swiftc Sources/WindowStack.swift Tests/WindowStackTests.swift -o build/stack-tests
 	build/stack-tests
+XMONAD_SRC ?= ../xmonad-macos/src
+xmonad-oracle:
+	mkdir -p build/oracle
+	ghc -O -i$(XMONAD_SRC) -outputdir build/oracle Tests/StackOracle.hs -o build/oracle/haskell
+	swiftc Sources/WindowStack.swift Tests/StackOracle.swift -o build/oracle/swift
+	build/oracle/haskell > build/oracle/expected
+	build/oracle/swift > build/oracle/actual
+	diff -u build/oracle/expected build/oracle/actual
