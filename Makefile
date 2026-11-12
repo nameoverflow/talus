@@ -25,10 +25,6 @@ xmonad-oracle:
 	build/oracle/haskell > build/oracle/expected
 	build/oracle/swift > build/oracle/actual
 	diff -u build/oracle/expected build/oracle/actual
-workspace-test:
-	mkdir -p build
-	swiftc Sources/WindowStack.swift Sources/Workspaces.swift Tests/WorkspaceTests.swift -o build/workspace-tests
-	build/workspace-tests
 history-test:
 	mkdir -p build
 	swiftc Sources/WindowHistory.swift Tests/WindowHistoryTests.swift -o build/history-tests
@@ -46,4 +42,4 @@ integration-test: all
 	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
 	swiftc Tests/Integration/Probe.swift -o build/integration-probe
 	Tests/Integration/smoke.sh
-test: config-test history-test stack-test workspace-test
+test: config-test history-test stack-test

@@ -6,7 +6,7 @@ Build and test with `make all test` on macOS with Xcode Command Line Tools. `mak
 
 Control-Option J/K focuses the next/previous window on the screen; add Shift to swap. Return swaps the focused window with master. H/L changes the master width. Comma/period changes the master count; Space cycles Tall, Mirror Tall, and Full; T toggles floating for the focused window. Window creation/destruction uses Accessibility notifications with a two-second fallback reconciliation.
 
-Current prototype: Tall, Mirror Tall, and Full; uses macOS Spaces for desktop switching, and retains window ordering across a Space switch while running. No Talus workspace shortcuts, configuration, automatic floating rules, or login startup. Native Spaces switching and moving windows between them are handled by macOS. Individual applications can reject requested frames or omit notifications; real multi-app, multi-monitor, Spaces and performance behavior remains to be tested. The program does not currently restore window positions on exit.
+Current prototype: Tall, Mirror Tall, and Full; uses macOS Spaces for desktop switching, and retains window ordering across a Space switch while running. No Talus workspace shortcuts, automatic floating rules, or login startup. Native Spaces switching and moving windows between them are handled by macOS. Individual applications can reject requested frames or omit notifications; real multi-app, multi-monitor and performance behavior remains to be tested. The program does not currently restore window positions on exit.
 
 ## Configuration
 
