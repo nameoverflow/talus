@@ -176,11 +176,25 @@ final class Manager {
     }
 }
 extension CGRect { var area: CGFloat { isNull ? 0 : width * height } }
+func reportStartupError(title: String, message: String) -> Never {
+    fputs("\(title): \(message)\n", stderr)
+    if Bundle.main.bundlePath.hasSuffix(".app") {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        application.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+    exit(1)
+}
 let defaultConfigURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Talus/config.json")
 let configURL = ProcessInfo.processInfo.environment["TALUS_CONFIG"].map { URL(fileURLWithPath: $0) } ?? defaultConfigURL
 let config: Configuration
 do { config = try Configuration.load(from: configURL) }
-catch { fputs("Talus config error at \(configURL.path): \(error)\n", stderr); exit(1) }
+catch { reportStartupError(title: "Talus configuration error", message: "\(configURL.path)\n\(error)") }
 let manager = Manager(config: config)
 final class StatusMenu: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -203,7 +217,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     @objc func quitApp() { NSApp.terminate(nil) }
 }
 let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-if !AXIsProcessTrustedWithOptions(opts) { fputs("Enable Accessibility permission for this executable, then restart.\n", stderr); exit(1) }
+if !AXIsProcessTrustedWithOptions(opts) { reportStartupError(title: "Accessibility permission needed", message: "Allow Talus in System Settings → Privacy & Security → Accessibility, then reopen Talus.") }
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let statusMenu = StatusMenu()
