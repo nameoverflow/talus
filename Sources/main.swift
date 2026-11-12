@@ -27,7 +27,7 @@ func setFrame(_ e: AXUIElement, _ r: CGRect) {
 func screenRect(_ screen: NSScreen) -> CGRect {
     let r = screen.visibleFrame
     let top = NSScreen.screens.first?.frame.maxY ?? 0
-    return CGRect(x: r.minX, y: top - r.maxY, width: r.width, height: r.height)
+    return accessibilityFrame(visible: r, primaryTop: top)
 }
 final class Manager {
     var windows: [Window] = []; var history: [Window] = []; var floating: [AXUIElement] = []; var ratio = 0.5; var masters = 1; var paused = false; var layoutMode = 0

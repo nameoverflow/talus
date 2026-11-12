@@ -1,8 +1,8 @@
 .PHONY: all clean
 all: build/talus
-build/talus: Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift
+build/talus: Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift Sources/ScreenGeometry.swift
 	mkdir -p build
-	swiftc -O Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
+	swiftc -O Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift Sources/ScreenGeometry.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
 clean:
 	rm -rf build
 test:
@@ -42,7 +42,7 @@ integration-test: all
 	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
 	swiftc Tests/Integration/Probe.swift -o build/integration-probe
 	Tests/Integration/smoke.sh
-test: config-test history-test stack-test
+test: config-test history-test stack-test screen-test
 multi-integration-test: all
 	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
 	swiftc Tests/Integration/MultiProbe.swift -o build/multi-probe
@@ -51,3 +51,7 @@ latency-test: all
 	swiftc Tests/Integration/EventFixture.swift -o build/event-fixture
 	swiftc Tests/Integration/EventProbe.swift -o build/event-probe
 	Tests/Integration/latency.sh
+screen-test:
+	mkdir -p build
+	swiftc Sources/ScreenGeometry.swift Tests/ScreenGeometryTests.swift -o build/screen-tests
+	build/screen-tests
