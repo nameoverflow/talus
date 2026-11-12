@@ -228,7 +228,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
     override init() {
         super.init()
-        item.button?.title = "T"
+        item.button?.image = makeStatusIcon()
+        item.button?.imagePosition = .imageOnly
+        item.button?.toolTip = "Talus"
         let menu = NSMenu()
         menu.delegate = self
         pauseItem.target = self
