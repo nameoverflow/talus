@@ -12,3 +12,8 @@ func tallLayout(_ area: Rect, _ count: Int, _ masters: Int, _ ratio: Double) -> 
     let w = floor(area.w * ratio)
     return split(Rect(x: area.x, y: area.y, w: w, h: area.h), masters) + split(Rect(x: area.x + w, y: area.y, w: area.w - w, h: area.h), count - masters)
 }
+
+func mirrorTallLayout(_ area: Rect, _ count: Int, _ masters: Int, _ ratio: Double) -> [Rect]? {
+    let rotated = Rect(x: area.y, y: area.x, w: area.h, h: area.w)
+    return tallLayout(rotated, count, masters, ratio)?.map { Rect(x: $0.y, y: $0.x, w: $0.h, h: $0.w) }
+}

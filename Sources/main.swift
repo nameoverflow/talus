@@ -29,7 +29,7 @@ func screenRect(_ screen: NSScreen) -> CGRect {
     return CGRect(x: r.minX, y: top - r.maxY, width: r.width, height: r.height)
 }
 final class Manager {
-    var windows: [Window] = []; var history: [Window] = []; var ratio = 0.5; var masters = 1; var paused = false
+    var windows: [Window] = []; var history: [Window] = []; var ratio = 0.5; var masters = 1; var paused = false; var mirrored = false
     var observers: [pid_t: AXObserver] = [:]
     var scheduled = false
     func scheduleRefresh() {
@@ -112,7 +112,9 @@ final class Manager {
         for screen in NSScreen.screens {
             let group = windows.filter { $0.screen == screen }; guard !group.isEmpty else { continue }
             let area = screenRect(screen)
-            guard let rects = tallLayout(Rect(x:area.minX,y:area.minY,w:area.width,h:area.height), group.count, masters, ratio) else { continue }
+            let rect = Rect(x:area.minX,y:area.minY,w:area.width,h:area.height)
+            let rects = mirrored ? mirrorTallLayout(rect, group.count, masters, ratio) : tallLayout(rect, group.count, masters, ratio)
+            guard let rects else { continue }
             for (w,r) in zip(group,rects) { setFrame(w.element, CGRect(x:r.x,y:r.y,width:r.w,height:r.h)) }
         }
     }
@@ -129,7 +131,7 @@ final class Manager {
         case UInt32(kVK_ANSI_L): ratio = min(0.8, ratio + 0.05); tile()
         case UInt32(kVK_ANSI_Comma): masters += 1; tile()
         case UInt32(kVK_ANSI_Period): masters = max(1, masters - 1); tile()
-        case UInt32(kVK_Space): refresh(force:true)
+        case UInt32(kVK_Space): mirrored.toggle(); tile()
         case UInt32(kVK_ANSI_J), UInt32(kVK_ANSI_K):
             guard let i = focusedIndex(), windows.count > 1 else { return }
             let indices = windows.indices.filter { windows[$0].screen == windows[i].screen }; guard let p = indices.firstIndex(of:i), indices.count > 1 else { return }
