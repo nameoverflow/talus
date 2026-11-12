@@ -4,7 +4,7 @@ import Carbon
 
 
 
-struct Window { let element: AXUIElement; let pid: pid_t; let screen: NSScreen }
+struct Window { let id: UUID; let element: AXUIElement; let pid: pid_t; let screen: NSScreen }
 func value(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
     var result: CFTypeRef?
     return AXUIElementCopyAttributeValue(element, attribute, &result) == .success ? result : nil
@@ -30,6 +30,10 @@ func screenRect(_ screen: NSScreen) -> CGRect {
 }
 final class Manager {
     var windows: [Window] = []; var ratio = 0.5; var masters = 1; var paused = false
+    var currentWorkspace = 1
+    var workspaceFor: [UUID: Int] = [:]
+    var parked = Set<UUID>()
+    var restoring: [UUID: Date] = [:]
     var observers: [pid_t: AXObserver] = [:]
     var scheduled = false
     func scheduleRefresh() {
@@ -81,11 +85,18 @@ final class Manager {
                       visible.contains(where: { $0.0 == app.processIdentifier && abs($0.1.minX-f.minX) < 3 && abs($0.1.minY-f.minY) < 3 && abs($0.1.width-f.width) < 3 && abs($0.1.height-f.height) < 3 }),
                       let screen = NSScreen.screens.max(by: { screenRect($0).intersection(f).area < screenRect($1).intersection(f).area }), screenRect(screen).intersects(f) else { continue }
                 if let sub = value(e, kAXSubroleAttribute as CFString) as? String, sub != kAXStandardWindowSubrole as String { continue }
-                found.append(Window(element: e, pid: app.processIdentifier, screen: screen))
+                let id = windows.first(where: { CFEqual($0.element, e) })?.id ?? UUID()
+                if workspaceFor[id] == nil { workspaceFor[id] = currentWorkspace }
+                found.append(Window(id: id, element: e, pid: app.processIdentifier, screen: screen))
             }
         }
-        // Preserve stack order when AX returns windows in a different order.
-        var ordered = windows.compactMap { old in found.first(where: { CFEqual($0.element, old.element) }) }
+        // Keep windows we minimized for inactive workspaces; they are off-screen.
+        let now = Date()
+        for window in found { restoring.removeValue(forKey: window.id) }
+        restoring = restoring.filter { $0.value > now }
+        let retained = windows.filter { (parked.contains($0.id) || restoring[$0.id] != nil) && value($0.element, kAXRoleAttribute as CFString) != nil }
+        let candidates = found + retained.filter { old in !found.contains(where: { $0.id == old.id }) }
+        var ordered = windows.compactMap { old in candidates.first(where: { $0.id == old.id }) }
         for w in found where !ordered.contains(where: { CFEqual($0.element, w.element) }) {
             if let app = NSWorkspace.shared.frontmostApplication,
                let focused = value(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
@@ -95,16 +106,20 @@ final class Manager {
         }
         let changed = ordered.count != windows.count || zip(ordered, windows).contains { !CFEqual($0.element, $1.element) || $0.screen != $1.screen }
         windows = ordered
+        let liveIDs = Set(windows.map(\.id))
+        parked.formIntersection(liveIDs)
+        workspaceFor = workspaceFor.filter { liveIDs.contains($0.key) }
         for window in windows {
             if let observer = observers[window.pid] {
                 AXObserverAddNotification(observer, window.element, kAXUIElementDestroyedNotification as CFString, Unmanaged.passUnretained(self).toOpaque())
+                AXObserverAddNotification(observer, window.element, kAXWindowDeminiaturizedNotification as CFString, Unmanaged.passUnretained(self).toOpaque())
             }
         }
         if changed || force { tile() }
     }
     func tile() {
         for screen in NSScreen.screens {
-            let group = windows.filter { $0.screen == screen }; guard !group.isEmpty else { continue }
+            let group = windows.filter { $0.screen == screen && workspaceFor[$0.id] == currentWorkspace && !parked.contains($0.id) }; guard !group.isEmpty else { continue }
             let area = screenRect(screen)
             guard let rects = tallLayout(Rect(x:area.minX,y:area.minY,w:area.width,h:area.height), group.count, masters, ratio) else { continue }
             for (w,r) in zip(group,rects) { setFrame(w.element, CGRect(x:r.x,y:r.y,width:r.w,height:r.h)) }
@@ -115,7 +130,47 @@ final class Manager {
         return windows.firstIndex { CFEqual($0.element, e) }
     }
     func focus(_ w: Window) { NSRunningApplication(processIdentifier: w.pid)?.activate(); AXUIElementPerformAction(w.element, kAXRaiseAction as CFString); AXUIElementSetAttributeValue(w.element, kAXMainAttribute as CFString, kCFBooleanTrue); AXUIElementSetAttributeValue(w.element, kAXFocusedAttribute as CFString, kCFBooleanTrue) }
+    func setMinimized(_ window: Window, _ minimize: Bool) -> Bool {
+        return AXUIElementSetAttributeValue(window.element, kAXMinimizedAttribute as CFString, minimize ? kCFBooleanTrue : kCFBooleanFalse) == .success
+    }
+    func switchWorkspace(_ target: Int) {
+        guard target != currentWorkspace else { return }
+        let leaving = windows.filter { workspaceFor[$0.id] == currentWorkspace && !parked.contains($0.id) }
+        var changed: [Window] = []
+        for window in leaving {
+            guard setMinimized(window, true) else {
+                for old in changed { _ = setMinimized(old, false); parked.remove(old.id) }
+                fputs("Workspace switch cancelled: a window cannot be minimized.\n", stderr)
+                return
+            }
+            changed.append(window); parked.insert(window.id)
+        }
+        currentWorkspace = target
+        for window in windows where workspaceFor[window.id] == target && parked.contains(window.id) {
+            if setMinimized(window, false) { parked.remove(window.id); restoring[window.id] = Date().addingTimeInterval(3) }
+            else { fputs("Could not restore a workspace window.\n", stderr) }
+        }
+        tile()
+        for delay in [0.2, 0.7] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.refresh(force: true) }
+        }
+        if let window = windows.first(where: { workspaceFor[$0.id] == target && !parked.contains($0.id) }) { focus(window) }
+    }
+    func sendFocused(to target: Int) {
+        guard target != currentWorkspace, let index = focusedIndex() else { return }
+        let window = windows[index]
+        guard setMinimized(window, true) else { fputs("Cannot move window to workspace.\n", stderr); return }
+        parked.insert(window.id); workspaceFor[window.id] = target
+        tile()
+        if let next = windows.first(where: { workspaceFor[$0.id] == currentWorkspace && !parked.contains($0.id) }) { focus(next) }
+    }
+    func restoreParked() {
+        for window in windows where parked.contains(window.id) { _ = setMinimized(window, false) }
+        parked.removeAll()
+    }
     func key(_ code: UInt32, shift: Bool) {
+        let digits: [UInt32: Int] = [UInt32(kVK_ANSI_1):1, UInt32(kVK_ANSI_2):2, UInt32(kVK_ANSI_3):3, UInt32(kVK_ANSI_4):4, UInt32(kVK_ANSI_5):5, UInt32(kVK_ANSI_6):6, UInt32(kVK_ANSI_7):7, UInt32(kVK_ANSI_8):8, UInt32(kVK_ANSI_9):9]
+        if let target = digits[code], !paused { if shift { sendFocused(to:target) } else { switchWorkspace(target) }; return }
         if code == UInt32(kVK_ANSI_P) { paused.toggle(); if !paused { refresh(force:true) }; print(paused ? "Paused" : "Resumed"); return }
         guard !paused else { return }
         switch code {
@@ -126,7 +181,7 @@ final class Manager {
         case UInt32(kVK_Space): refresh(force:true)
         case UInt32(kVK_ANSI_J), UInt32(kVK_ANSI_K):
             guard let i = focusedIndex(), windows.count > 1 else { return }
-            let indices = windows.indices.filter { windows[$0].screen == windows[i].screen }; guard let p = indices.firstIndex(of:i), indices.count > 1 else { return }
+            let indices = windows.indices.filter { windows[$0].screen == windows[i].screen && workspaceFor[windows[$0].id] == currentWorkspace && !parked.contains(windows[$0].id) }; guard let p = indices.firstIndex(of:i), indices.count > 1 else { return }
             let next = indices[(p + (code == UInt32(kVK_ANSI_J) ? 1 : indices.count - 1)) % indices.count]
             if shift {
                 let direction = code == UInt32(kVK_ANSI_J) ? 1 : -1
@@ -139,7 +194,7 @@ final class Manager {
                 tile()
             } else { focus(windows[next]) }
         case UInt32(kVK_Return):
-            guard let i = focusedIndex(), let first = windows.indices.first(where: { windows[$0].screen == windows[i].screen }) else { return }
+            guard let i = focusedIndex(), let first = windows.indices.first(where: { windows[$0].screen == windows[i].screen && workspaceFor[windows[$0].id] == currentWorkspace && !parked.contains(windows[$0].id) }) else { return }
             windows.swapAt(i,first); tile()
         default: break
         }
@@ -158,8 +213,8 @@ let handler: EventHandlerUPP = { _, event, _ in
 var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
 InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, nil)
 var refs: [EventHotKeyRef] = []
-for code in [kVK_ANSI_H,kVK_ANSI_L,kVK_ANSI_J,kVK_ANSI_K,kVK_ANSI_Comma,kVK_ANSI_Period,kVK_Space,kVK_Return,kVK_ANSI_P] {
-    for shifted in ([kVK_ANSI_J,kVK_ANSI_K].contains(code) ? [false,true] : [false]) {
+for code in [kVK_ANSI_H,kVK_ANSI_L,kVK_ANSI_J,kVK_ANSI_K,kVK_ANSI_Comma,kVK_ANSI_Period,kVK_Space,kVK_Return,kVK_ANSI_P,kVK_ANSI_1,kVK_ANSI_2,kVK_ANSI_3,kVK_ANSI_4,kVK_ANSI_5,kVK_ANSI_6,kVK_ANSI_7,kVK_ANSI_8,kVK_ANSI_9] {
+    for shifted in ([kVK_ANSI_J,kVK_ANSI_K,kVK_ANSI_1,kVK_ANSI_2,kVK_ANSI_3,kVK_ANSI_4,kVK_ANSI_5,kVK_ANSI_6,kVK_ANSI_7,kVK_ANSI_8,kVK_ANSI_9].contains(code) ? [false,true] : [false]) {
         var ref: EventHotKeyRef?; let id = UInt32(code) | (shifted ? 0x10000 : 0)
         let status = RegisterEventHotKey(UInt32(code), UInt32(controlKey | optionKey | (shifted ? shiftKey : 0)), EventHotKeyID(signature: 0x4d4f4e44, id: id), GetApplicationEventTarget(), 0, &ref)
         if status != noErr { fputs("Could not register shortcut key \(code): \(status)\n", stderr) }; if let ref { refs.append(ref) }
@@ -174,4 +229,13 @@ let tokens = [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTermi
 }
 // Some applications omit accessibility notifications. Reconcile as a fallback.
 Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in manager.observeApplications(); manager.refresh() }
+signal(SIGINT, SIG_IGN)
+signal(SIGTERM, SIG_IGN)
+let signalSources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler { manager.restoreParked(); exit(0) }
+    source.resume()
+    return source
+}
 app.run()
+manager.restoreParked()
