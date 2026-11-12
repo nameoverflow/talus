@@ -128,7 +128,16 @@ final class Manager {
             guard let i = focusedIndex(), windows.count > 1 else { return }
             let indices = windows.indices.filter { windows[$0].screen == windows[i].screen }; guard let p = indices.firstIndex(of:i), indices.count > 1 else { return }
             let next = indices[(p + (code == UInt32(kVK_ANSI_J) ? 1 : indices.count - 1)) % indices.count]
-            if shift { windows.swapAt(i,next); tile() } else { focus(windows[next]) }
+            if shift {
+                let direction = code == UInt32(kVK_ANSI_J) ? 1 : -1
+                if (direction > 0 && p == indices.count - 1) || (direction < 0 && p == 0) {
+                    var group = indices.map { windows[$0] }
+                    if direction > 0 { group.insert(group.removeLast(), at: 0) }
+                    else { group.append(group.removeFirst()) }
+                    for (index, window) in zip(indices, group) { windows[index] = window }
+                } else { windows.swapAt(i,next) }
+                tile()
+            } else { focus(windows[next]) }
         case UInt32(kVK_Return):
             guard let i = focusedIndex(), let first = windows.indices.first(where: { windows[$0].screen == windows[i].screen }) else { return }
             windows.swapAt(i,first); tile()

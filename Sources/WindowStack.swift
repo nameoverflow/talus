@@ -25,8 +25,9 @@ struct WindowStack<ID: Equatable> {
     }
     mutating func swapNext(_ direction: Int) {
         guard let focused, let i = items.firstIndex(of: focused), items.count > 1 else { return }
-        let target = (i + (direction >= 0 ? 1 : items.count - 1)) % items.count
-        items.swapAt(i, target)
+        if direction >= 0 && i == items.count - 1 { items.insert(items.removeLast(), at: 0) }
+        else if direction < 0 && i == 0 { items.append(items.removeFirst()) }
+        else { items.swapAt(i, i + (direction >= 0 ? 1 : -1)) }
     }
     mutating func swapMaster() {
         guard let focused, let i = items.firstIndex(of: focused) else { return }
