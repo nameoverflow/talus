@@ -29,7 +29,7 @@ func screenRect(_ screen: NSScreen) -> CGRect {
     return CGRect(x: r.minX, y: top - r.maxY, width: r.width, height: r.height)
 }
 final class Manager {
-    var windows: [Window] = []; var ratio = 0.5; var masters = 1; var paused = false
+    var windows: [Window] = []; var history: [Window] = []; var ratio = 0.5; var masters = 1; var paused = false
     var observers: [pid_t: AXObserver] = [:]
     var scheduled = false
     func scheduleRefresh() {
@@ -85,7 +85,7 @@ final class Manager {
             }
         }
         // Preserve stack order when AX returns windows in a different order.
-        var ordered = windows.compactMap { old in found.first(where: { CFEqual($0.element, old.element) }) }
+        var ordered = history.compactMap { old in found.first(where: { CFEqual($0.element, old.element) }) }
         for w in found where !ordered.contains(where: { CFEqual($0.element, w.element) }) {
             if let app = NSWorkspace.shared.frontmostApplication,
                let focused = value(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
@@ -95,12 +95,19 @@ final class Manager {
         }
         let changed = ordered.count != windows.count || zip(ordered, windows).contains { !CFEqual($0.element, $1.element) || $0.screen != $1.screen }
         windows = ordered
+        updateHistory()
         for window in windows {
             if let observer = observers[window.pid] {
                 AXObserverAddNotification(observer, window.element, kAXUIElementDestroyedNotification as CFString, Unmanaged.passUnretained(self).toOpaque())
             }
         }
         if changed || force { tile() }
+    }
+    func updateHistory() {
+        history.removeAll { value($0.element, kAXRoleAttribute as CFString) == nil }
+        for window in windows where !history.contains(where: { CFEqual($0.element, window.element) }) { history.append(window) }
+        let indices = history.indices.filter { index in windows.contains { CFEqual($0.element, history[index].element) } }
+        for (index, window) in zip(indices, windows) { history[index] = window }
     }
     func tile() {
         for screen in NSScreen.screens {
@@ -136,11 +143,11 @@ final class Manager {
                     else { group.append(group.removeFirst()) }
                     for (index, window) in zip(indices, group) { windows[index] = window }
                 } else { windows.swapAt(i,next) }
-                tile()
+                updateHistory(); tile()
             } else { focus(windows[next]) }
         case UInt32(kVK_Return):
             guard let i = focusedIndex(), let first = windows.indices.first(where: { windows[$0].screen == windows[i].screen }) else { return }
-            windows.swapAt(i,first); tile()
+            windows.swapAt(i,first); updateHistory(); tile()
         default: break
         }
     }
