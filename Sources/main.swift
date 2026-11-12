@@ -29,7 +29,7 @@ func screenRect(_ screen: NSScreen) -> CGRect {
     return CGRect(x: r.minX, y: top - r.maxY, width: r.width, height: r.height)
 }
 final class Manager {
-    var windows: [Window] = []; var history: [Window] = []; var ratio = 0.5; var masters = 1; var paused = false; var layoutMode = 0
+    var windows: [Window] = []; var history: [Window] = []; var floating: [AXUIElement] = []; var ratio = 0.5; var masters = 1; var paused = false; var layoutMode = 0
     var observers: [pid_t: AXObserver] = [:]
     var scheduled = false
     func scheduleRefresh() {
@@ -106,11 +106,12 @@ final class Manager {
     }
     func updateHistory() {
         history.removeAll { value($0.element, kAXRoleAttribute as CFString) == nil }
+        floating.removeAll { element in !history.contains { CFEqual($0.element, element) } }
         history = mergeHistory(history, current: windows) { CFEqual($0.element, $1.element) }
     }
     func tile() {
         for screen in NSScreen.screens {
-            let group = windows.filter { $0.screen == screen }; guard !group.isEmpty else { continue }
+            let group = windows.filter { window in window.screen == screen && !floating.contains { CFEqual($0, window.element) } }; guard !group.isEmpty else { continue }
             let area = screenRect(screen)
             let rect = Rect(x:area.minX,y:area.minY,w:area.width,h:area.height)
             let rects: [Rect]?
@@ -134,6 +135,12 @@ final class Manager {
         if code == UInt32(kVK_ANSI_P) { paused.toggle(); if !paused { refresh(force:true) }; print(paused ? "Paused" : "Resumed"); return }
         guard !paused else { return }
         switch code {
+        case UInt32(kVK_ANSI_T):
+            guard let i = focusedIndex() else { return }
+            let element = windows[i].element
+            if let index = floating.firstIndex(where: { CFEqual($0, element) }) { floating.remove(at: index) }
+            else { floating.append(element) }
+            tile()
         case UInt32(kVK_ANSI_H): ratio = max(0.2, ratio - 0.05); tile()
         case UInt32(kVK_ANSI_L): ratio = min(0.8, ratio + 0.05); tile()
         case UInt32(kVK_ANSI_Comma): masters += 1; tile()
@@ -194,7 +201,7 @@ let handler: EventHandlerUPP = { _, event, _ in
 var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
 InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, nil)
 var refs: [EventHotKeyRef] = []
-for code in [kVK_ANSI_H,kVK_ANSI_L,kVK_ANSI_J,kVK_ANSI_K,kVK_ANSI_Comma,kVK_ANSI_Period,kVK_Space,kVK_Return,kVK_ANSI_P] {
+for code in [kVK_ANSI_H,kVK_ANSI_L,kVK_ANSI_J,kVK_ANSI_K,kVK_ANSI_Comma,kVK_ANSI_Period,kVK_Space,kVK_Return,kVK_ANSI_P,kVK_ANSI_T] {
     for shifted in ([kVK_ANSI_J,kVK_ANSI_K].contains(code) ? [false,true] : [false]) {
         var ref: EventHotKeyRef?; let id = UInt32(code) | (shifted ? 0x10000 : 0)
         let status = RegisterEventHotKey(UInt32(code), UInt32(controlKey | optionKey | (shifted ? shiftKey : 0)), EventHotKeyID(signature: 0x4d4f4e44, id: id), GetApplicationEventTarget(), 0, &ref)
