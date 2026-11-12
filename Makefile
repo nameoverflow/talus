@@ -42,3 +42,8 @@ config-test:
 	mkdir -p build
 	swiftc Sources/Configuration.swift Tests/ConfigurationTests.swift -o build/config-tests
 	build/config-tests
+integration-test: all
+	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
+	swiftc Tests/Integration/Probe.swift -o build/integration-probe
+	Tests/Integration/smoke.sh
+test: config-test history-test stack-test workspace-test

@@ -22,3 +22,7 @@ Optional `~/Library/Application Support/Talus/config.json` (restart Talus after 
 ```
 
 Every key is optional. Modifier names are `control`, `option`, and `command`; at least one is required, and Shift is reserved for swap shortcuts. Ratio must be 0.2–0.8 and master count 1–20. `ignoreApps` contains application bundle identifiers. Invalid configuration prevents startup and is reported on standard error. Conflicting hotkeys are reported on standard error; other bindings remain available.
+
+## Verification
+
+`make test` runs the pure layout, configuration, ordering and stack tests. `make integration-test` opens isolated test windows and checks tiling and fixed-size handling; it requires a logged-in macOS desktop and Accessibility permission. The integration test limits Talus to its own fixture process and closes it afterward. `make xmonad-oracle XMONAD_SRC=/path/to/xmonad/src` additionally compares stack wraparound with XMonad and requires GHC.
