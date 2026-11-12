@@ -84,6 +84,11 @@ final class Manager {
                       visible.contains(where: { $0.0 == app.processIdentifier && abs($0.1.minX-f.minX) < 3 && abs($0.1.minY-f.minY) < 3 && abs($0.1.width-f.width) < 3 && abs($0.1.height-f.height) < 3 }),
                       let screen = NSScreen.screens.max(by: { screenRect($0).intersection(f).area < screenRect($1).intersection(f).area }), screenRect(screen).intersects(f) else { continue }
                 if let sub = value(e, kAXSubroleAttribute as CFString) as? String, sub != kAXStandardWindowSubrole as String { continue }
+                if (value(e, kAXModalAttribute as CFString) as? Bool) == true { continue }
+                var canMove = DarwinBoolean(false); var canResize = DarwinBoolean(false)
+                guard AXUIElementIsAttributeSettable(e, kAXPositionAttribute as CFString, &canMove) == .success,
+                      AXUIElementIsAttributeSettable(e, kAXSizeAttribute as CFString, &canResize) == .success,
+                      canMove.boolValue, canResize.boolValue else { continue }
                 found.append(Window(element: e, pid: app.processIdentifier, screen: screen))
             }
         }
