@@ -33,3 +33,8 @@ history-test:
 	mkdir -p build
 	swiftc Sources/WindowHistory.swift Tests/WindowHistoryTests.swift -o build/history-tests
 	build/history-tests
+app: build/talus Resources/Info.plist
+	mkdir -p build/Talus.app/Contents/MacOS
+	cp build/talus build/Talus.app/Contents/MacOS/Talus
+	cp Resources/Info.plist build/Talus.app/Contents/Info.plist
+	codesign --force --sign - build/Talus.app

@@ -162,10 +162,31 @@ final class Manager {
 }
 extension CGRect { var area: CGFloat { isNull ? 0 : width * height } }
 let manager = Manager()
+final class StatusMenu: NSObject, NSMenuDelegate {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
+    override init() {
+        super.init()
+        item.button?.title = "T"
+        let menu = NSMenu()
+        menu.delegate = self
+        pauseItem.target = self
+        menu.addItem(pauseItem)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit Talus", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+        item.menu = menu
+    }
+    func menuWillOpen(_ menu: NSMenu) { pauseItem.title = manager.paused ? "Resume" : "Pause" }
+    @objc func togglePause() { manager.paused.toggle(); if !manager.paused { manager.refresh(force: true) } }
+    @objc func quitApp() { NSApp.terminate(nil) }
+}
 let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
 if !AXIsProcessTrustedWithOptions(opts) { fputs("Enable Accessibility permission for this executable, then restart.\n", stderr); exit(1) }
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+let statusMenu = StatusMenu()
 let handler: EventHandlerUPP = { _, event, _ in
     var hotkey = EventHotKeyID(); GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotkey)
     manager.key(hotkey.id & 0xffff, shift: hotkey.id & 0x10000 != 0); return noErr
