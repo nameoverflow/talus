@@ -29,7 +29,7 @@ func screenRect(_ screen: NSScreen) -> CGRect {
     return CGRect(x: r.minX, y: top - r.maxY, width: r.width, height: r.height)
 }
 final class Manager {
-    var windows: [Window] = []; var history: [Window] = []; var ratio = 0.5; var masters = 1; var paused = false; var mirrored = false
+    var windows: [Window] = []; var history: [Window] = []; var ratio = 0.5; var masters = 1; var paused = false; var layoutMode = 0
     var observers: [pid_t: AXObserver] = [:]
     var scheduled = false
     func scheduleRefresh() {
@@ -113,9 +113,16 @@ final class Manager {
             let group = windows.filter { $0.screen == screen }; guard !group.isEmpty else { continue }
             let area = screenRect(screen)
             let rect = Rect(x:area.minX,y:area.minY,w:area.width,h:area.height)
-            let rects = mirrored ? mirrorTallLayout(rect, group.count, masters, ratio) : tallLayout(rect, group.count, masters, ratio)
+            let rects: [Rect]?
+            switch layoutMode {
+            case 1: rects = mirrorTallLayout(rect, group.count, masters, ratio)
+            case 2: rects = Array(repeating: rect, count: group.count)
+            default: rects = tallLayout(rect, group.count, masters, ratio)
+            }
             guard let rects else { continue }
+            let current = focusedIndex().map { windows[$0] }
             for (w,r) in zip(group,rects) { setFrame(w.element, CGRect(x:r.x,y:r.y,width:r.w,height:r.h)) }
+            if layoutMode == 2, let current, current.screen == screen { focus(current) }
         }
     }
     func focusedIndex() -> Int? {
@@ -131,7 +138,7 @@ final class Manager {
         case UInt32(kVK_ANSI_L): ratio = min(0.8, ratio + 0.05); tile()
         case UInt32(kVK_ANSI_Comma): masters += 1; tile()
         case UInt32(kVK_ANSI_Period): masters = max(1, masters - 1); tile()
-        case UInt32(kVK_Space): mirrored.toggle(); tile()
+        case UInt32(kVK_Space): layoutMode = (layoutMode + 1) % 3; tile()
         case UInt32(kVK_ANSI_J), UInt32(kVK_ANSI_K):
             guard let i = focusedIndex(), windows.count > 1 else { return }
             let indices = windows.indices.filter { windows[$0].screen == windows[i].screen }; guard let p = indices.firstIndex(of:i), indices.count > 1 else { return }
