@@ -1,6 +1,6 @@
 .PHONY: all clean
-all: build/swiftmonad
-build/swiftmonad: Sources/main.swift Sources/Layout.swift
+all: build/talus
+build/talus: Sources/main.swift Sources/Layout.swift
 	mkdir -p build
 	swiftc -O Sources/main.swift Sources/Layout.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
 clean:

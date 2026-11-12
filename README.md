@@ -1,8 +1,8 @@
-# SwiftMonad
+# Talus
 
 Experimental macOS window manager inspired by XMonad. Swift only; no X11. This is not yet a daily-use release.
 
-Build and test with `make all test` on macOS with Xcode Command Line Tools. Run `build/swiftmonad`; macOS requires Accessibility permission. The program will move visible windows. Quit other window managers before starting and save your work. Control-C quits. Control-Option-P pauses/resumes.
+Build and test with `make all test` on macOS with Xcode Command Line Tools. Run `build/talus`; macOS requires Accessibility permission. The program will move visible windows. Quit other window managers before starting and save your work. Control-C quits. Control-Option-P pauses/resumes.
 
 Control-Option J/K focuses the next/previous window on the screen; add Shift to swap. Return swaps the focused window with master. H/L changes the master width. Comma/period changes the master count; Space forces a retile. Window creation/destruction uses Accessibility notifications with a two-second fallback reconciliation.
 

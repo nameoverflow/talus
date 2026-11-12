@@ -73,7 +73,7 @@ final class Manager {
         }
         var found: [Window] = []
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && !app.isHidden {
-            if let testPID = ProcessInfo.processInfo.environment["SWIFTMONAD_TEST_PID"], String(app.processIdentifier) != testPID { continue }
+            if let testPID = ProcessInfo.processInfo.environment["TALUS_TEST_PID"], String(app.processIdentifier) != testPID { continue }
             let ax = AXUIElementCreateApplication(app.processIdentifier)
             guard let elements = value(ax, kAXWindowsAttribute as CFString) as? [AXUIElement] else { continue }
             for e in elements {
