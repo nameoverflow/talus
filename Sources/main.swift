@@ -36,12 +36,18 @@ final class Manager {
     var observers: [pid_t: AXObserver] = [:]
     var scheduled = false
     func scheduleRefresh() {
+        if ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1" { fputs("event \(Date().timeIntervalSince1970)\n", stderr) }
         guard !scheduled else { return }
         scheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self else { return }
             self.scheduled = false
             self.refresh()
+            // AX can announce a window before Core Graphics lists its frame.
+            // Retry briefly so we do not wait for the two-second reconciliation.
+            for delay in [0.15, 0.4] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.refresh() }
+            }
         }
     }
     func observeApplications() {
@@ -107,6 +113,7 @@ final class Manager {
             } else { ordered.append(w) }
         }
         let changed = ordered.count != windows.count || zip(ordered, windows).contains { !CFEqual($0.element, $1.element) || $0.screen != $1.screen }
+        if ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1" { fputs("refresh \(Date().timeIntervalSince1970) windows=\(ordered.count) changed=\(changed)\n", stderr) }
         windows = ordered
         updateHistory()
         for window in windows {

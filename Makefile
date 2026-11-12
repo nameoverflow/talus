@@ -47,3 +47,7 @@ multi-integration-test: all
 	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
 	swiftc Tests/Integration/MultiProbe.swift -o build/multi-probe
 	Tests/Integration/multi.sh
+latency-test: all
+	swiftc Tests/Integration/EventFixture.swift -o build/event-fixture
+	swiftc Tests/Integration/EventProbe.swift -o build/event-probe
+	Tests/Integration/latency.sh
