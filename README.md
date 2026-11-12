@@ -16,12 +16,13 @@ Optional `~/Library/Application Support/Talus/config.json` (restart Talus after 
 {
   "modifiers": ["control", "option"],
   "masterRatio": 0.5,
+  "ratioStep": 0.03,
   "masterCount": 1,
   "ignoreApps": ["com.example.SomeApp"]
 }
 ```
 
-Every key is optional. Modifier names are `control`, `option`, and `command`; at least one is required, and Shift is reserved for swap shortcuts. Ratio must be 0.2–0.8 and master count 1–20. `ignoreApps` contains application bundle identifiers. Invalid configuration prevents startup and is reported on standard error. Conflicting hotkeys are reported on standard error; other bindings remain available.
+Every key is optional. Modifier names are `control`, `option`, and `command`; at least one is required, and Shift is reserved for swap shortcuts. Ratio must be 0.2–0.8, ratio step greater than zero and at most 0.2, and master count 1–20. `ignoreApps` contains application bundle identifiers. Invalid configuration prevents startup and is reported on standard error. Conflicting hotkeys are reported on standard error; other bindings remain available.
 
 ## Verification
 

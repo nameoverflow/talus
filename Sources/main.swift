@@ -31,8 +31,8 @@ func screenRect(_ screen: NSScreen) -> CGRect {
 }
 final class Manager {
     var windows: [Window] = []; var history: [Window] = []; var floating: [AXUIElement] = []; var ratio = 0.5; var masters = 1; var paused = false; var layoutMode = 0
-    let ignoredApps: Set<String>
-    init(config: Configuration) { ratio = config.masterRatio; masters = config.masterCount; ignoredApps = Set(config.ignoreApps) }
+    let ignoredApps: Set<String>; let ratioStep: Double
+    init(config: Configuration) { ratio = config.masterRatio; masters = config.masterCount; ratioStep = config.ratioStep; ignoredApps = Set(config.ignoreApps) }
     var observers: [pid_t: AXObserver] = [:]
     var scheduled = false
     func scheduleRefresh() {
@@ -153,8 +153,8 @@ final class Manager {
             if let index = floating.firstIndex(where: { CFEqual($0, element) }) { floating.remove(at: index) }
             else { floating.append(element) }
             tile()
-        case UInt32(kVK_ANSI_H): ratio = max(0.2, ratio - 0.05); tile()
-        case UInt32(kVK_ANSI_L): ratio = min(0.8, ratio + 0.05); tile()
+        case UInt32(kVK_ANSI_H): ratio = max(0.2, ratio - ratioStep); tile()
+        case UInt32(kVK_ANSI_L): ratio = min(0.8, ratio + ratioStep); tile()
         case UInt32(kVK_ANSI_Comma): masters += 1; tile()
         case UInt32(kVK_ANSI_Period): masters = max(1, masters - 1); tile()
         case UInt32(kVK_Space): layoutMode = (layoutMode + 1) % 3; tile()
