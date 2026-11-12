@@ -25,3 +25,7 @@ xmonad-oracle:
 	build/oracle/haskell > build/oracle/expected
 	build/oracle/swift > build/oracle/actual
 	diff -u build/oracle/expected build/oracle/actual
+workspace-test:
+	mkdir -p build
+	swiftc Sources/WindowStack.swift Sources/Workspaces.swift Tests/WorkspaceTests.swift -o build/workspace-tests
+	build/workspace-tests
