@@ -1,6 +1,7 @@
 import Cocoa
 import ApplicationServices
 import Carbon
+import Darwin
 
 
 
@@ -190,7 +191,13 @@ func reportStartupError(title: String, message: String) -> Never {
     }
     exit(1)
 }
-let defaultConfigURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Talus/config.json")
+let supportDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Talus", isDirectory: true)
+do { try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true) }
+catch { reportStartupError(title: "Talus cannot start", message: "Cannot create \(supportDirectory.path): \(error)") }
+let lockFD = open(supportDirectory.appendingPathComponent("talus.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, mode_t(0o600))
+if lockFD < 0 { reportStartupError(title: "Talus cannot start", message: "Cannot open the application lock file.") }
+if flock(lockFD, LOCK_EX | LOCK_NB) != 0 { reportStartupError(title: "Talus is already running", message: "Use the existing Talus menu bar icon to pause or quit.") }
+let defaultConfigURL = supportDirectory.appendingPathComponent("config.json")
 let configURL = ProcessInfo.processInfo.environment["TALUS_CONFIG"].map { URL(fileURLWithPath: $0) } ?? defaultConfigURL
 let config: Configuration
 do { config = try Configuration.load(from: configURL) }
