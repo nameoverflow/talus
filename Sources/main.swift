@@ -85,8 +85,9 @@ final class Manager {
             }
         }
         // Preserve stack order when AX returns windows in a different order.
-        var ordered = history.compactMap { old in found.first(where: { CFEqual($0.element, old.element) }) }
-        for w in found where !ordered.contains(where: { CFEqual($0.element, w.element) }) {
+        var ordered = orderUsingHistory(found, history: history) { CFEqual($0.element, $1.element) }
+        for w in found where !history.contains(where: { CFEqual($0.element, w.element) }) {
+            ordered.removeAll { CFEqual($0.element, w.element) }
             if let app = NSWorkspace.shared.frontmostApplication,
                let focused = value(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
                let index = ordered.firstIndex(where: { $0.screen == w.screen && CFEqual($0.element, focused) }) {
@@ -105,9 +106,7 @@ final class Manager {
     }
     func updateHistory() {
         history.removeAll { value($0.element, kAXRoleAttribute as CFString) == nil }
-        for window in windows where !history.contains(where: { CFEqual($0.element, window.element) }) { history.append(window) }
-        let indices = history.indices.filter { index in windows.contains { CFEqual($0.element, history[index].element) } }
-        for (index, window) in zip(indices, windows) { history[index] = window }
+        history = mergeHistory(history, current: windows) { CFEqual($0.element, $1.element) }
     }
     func tile() {
         for screen in NSScreen.screens {

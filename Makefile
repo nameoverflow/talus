@@ -1,8 +1,8 @@
 .PHONY: all clean
 all: build/talus
-build/talus: Sources/main.swift Sources/Layout.swift
+build/talus: Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift
 	mkdir -p build
-	swiftc -O Sources/main.swift Sources/Layout.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
+	swiftc -O Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
 clean:
 	rm -rf build
 test:
@@ -29,3 +29,7 @@ workspace-test:
 	mkdir -p build
 	swiftc Sources/WindowStack.swift Sources/Workspaces.swift Tests/WorkspaceTests.swift -o build/workspace-tests
 	build/workspace-tests
+history-test:
+	mkdir -p build
+	swiftc Sources/WindowHistory.swift Tests/WindowHistoryTests.swift -o build/history-tests
+	build/history-tests
