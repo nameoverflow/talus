@@ -76,7 +76,10 @@ final class Manager {
         }
         var found: [Window] = []
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && !app.isHidden {
-            if let testPID = ProcessInfo.processInfo.environment["TALUS_TEST_PID"], String(app.processIdentifier) != testPID { continue }
+            if let selectedPIDs = ProcessInfo.processInfo.environment["TALUS_TEST_PID"] {
+                let allowed = selectedPIDs.split(separator: ",").map(String.init)
+                if !allowed.contains(String(app.processIdentifier)) { continue }
+            }
             if let bundle = app.bundleIdentifier, ignoredApps.contains(bundle) { continue }
             let ax = AXUIElementCreateApplication(app.processIdentifier)
             guard let elements = value(ax, kAXWindowsAttribute as CFString) as? [AXUIElement] else { continue }

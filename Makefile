@@ -43,3 +43,7 @@ integration-test: all
 	swiftc Tests/Integration/Probe.swift -o build/integration-probe
 	Tests/Integration/smoke.sh
 test: config-test history-test stack-test
+multi-integration-test: all
+	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
+	swiftc Tests/Integration/MultiProbe.swift -o build/multi-probe
+	Tests/Integration/multi.sh
