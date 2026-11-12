@@ -1,8 +1,8 @@
 .PHONY: all clean
 all: build/talus
-build/talus: Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift
+build/talus: Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift
 	mkdir -p build
-	swiftc -O Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
+	swiftc -O Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
 clean:
 	rm -rf build
 test:
@@ -38,3 +38,7 @@ app: build/talus Resources/Info.plist
 	cp build/talus build/Talus.app/Contents/MacOS/Talus
 	cp Resources/Info.plist build/Talus.app/Contents/Info.plist
 	codesign --force --sign - build/Talus.app
+config-test:
+	mkdir -p build
+	swiftc Sources/Configuration.swift Tests/ConfigurationTests.swift -o build/config-tests
+	build/config-tests

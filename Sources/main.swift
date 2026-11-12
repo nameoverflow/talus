@@ -30,6 +30,8 @@ func screenRect(_ screen: NSScreen) -> CGRect {
 }
 final class Manager {
     var windows: [Window] = []; var history: [Window] = []; var floating: [AXUIElement] = []; var ratio = 0.5; var masters = 1; var paused = false; var layoutMode = 0
+    let ignoredApps: Set<String>
+    init(config: Configuration) { ratio = config.masterRatio; masters = config.masterCount; ignoredApps = Set(config.ignoreApps) }
     var observers: [pid_t: AXObserver] = [:]
     var scheduled = false
     func scheduleRefresh() {
@@ -74,6 +76,7 @@ final class Manager {
         var found: [Window] = []
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && !app.isHidden {
             if let testPID = ProcessInfo.processInfo.environment["TALUS_TEST_PID"], String(app.processIdentifier) != testPID { continue }
+            if let bundle = app.bundleIdentifier, ignoredApps.contains(bundle) { continue }
             let ax = AXUIElementCreateApplication(app.processIdentifier)
             guard let elements = value(ax, kAXWindowsAttribute as CFString) as? [AXUIElement] else { continue }
             for e in elements {
@@ -168,7 +171,12 @@ final class Manager {
     }
 }
 extension CGRect { var area: CGFloat { isNull ? 0 : width * height } }
-let manager = Manager()
+let defaultConfigURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Talus/config.json")
+let configURL = ProcessInfo.processInfo.environment["TALUS_CONFIG"].map { URL(fileURLWithPath: $0) } ?? defaultConfigURL
+let config: Configuration
+do { config = try Configuration.load(from: configURL) }
+catch { fputs("Talus config error at \(configURL.path): \(error)\n", stderr); exit(1) }
+let manager = Manager(config: config)
 final class StatusMenu: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
@@ -201,14 +209,22 @@ let handler: EventHandlerUPP = { _, event, _ in
 var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
 InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, nil)
 var refs: [EventHotKeyRef] = []
+let modifierBits = config.modifiers.reduce(UInt32(0)) { result, name in
+    switch name {
+    case "control": return result | UInt32(controlKey)
+    case "option": return result | UInt32(optionKey)
+    case "command": return result | UInt32(cmdKey)
+    default: return result
+    }
+}
 for code in [kVK_ANSI_H,kVK_ANSI_L,kVK_ANSI_J,kVK_ANSI_K,kVK_ANSI_Comma,kVK_ANSI_Period,kVK_Space,kVK_Return,kVK_ANSI_P,kVK_ANSI_T] {
     for shifted in ([kVK_ANSI_J,kVK_ANSI_K].contains(code) ? [false,true] : [false]) {
         var ref: EventHotKeyRef?; let id = UInt32(code) | (shifted ? 0x10000 : 0)
-        let status = RegisterEventHotKey(UInt32(code), UInt32(controlKey | optionKey | (shifted ? shiftKey : 0)), EventHotKeyID(signature: 0x4d4f4e44, id: id), GetApplicationEventTarget(), 0, &ref)
+        let status = RegisterEventHotKey(UInt32(code), modifierBits | (shifted ? UInt32(shiftKey) : 0), EventHotKeyID(signature: 0x4d4f4e44, id: id), GetApplicationEventTarget(), 0, &ref)
         if status != noErr { fputs("Could not register shortcut key \(code): \(status)\n", stderr) }; if let ref { refs.append(ref) }
     }
 }
-print("Running. Control-Option-P pauses; Control-C quits.")
+print("Running. \(config.modifiers.joined(separator: "+"))+P pauses; Control-C quits.")
 manager.observeApplications()
 manager.refresh(force:true)
 let workspace = NSWorkspace.shared.notificationCenter
