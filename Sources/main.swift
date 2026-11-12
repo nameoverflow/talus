@@ -86,7 +86,13 @@ final class Manager {
         }
         // Preserve stack order when AX returns windows in a different order.
         var ordered = windows.compactMap { old in found.first(where: { CFEqual($0.element, old.element) }) }
-        for w in found where !ordered.contains(where: { CFEqual($0.element, w.element) }) { ordered.append(w) }
+        for w in found where !ordered.contains(where: { CFEqual($0.element, w.element) }) {
+            if let app = NSWorkspace.shared.frontmostApplication,
+               let focused = value(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
+               let index = ordered.firstIndex(where: { $0.screen == w.screen && CFEqual($0.element, focused) }) {
+                ordered.insert(w, at: index)
+            } else { ordered.append(w) }
+        }
         let changed = ordered.count != windows.count || zip(ordered, windows).contains { !CFEqual($0.element, $1.element) || $0.screen != $1.screen }
         windows = ordered
         for window in windows {
