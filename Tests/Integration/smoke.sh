@@ -6,7 +6,7 @@ manager=''
 test_dir=$(mktemp -d)
 trap 'if [ -n "$manager" ]; then kill "$manager" 2>/dev/null || true; fi; kill "$fixture" 2>/dev/null || true; rm -rf "$test_dir"' EXIT
 sleep 1
-TALUS_TEST_PID="$fixture" TALUS_CONFIG="$test_dir/config.json" build/talus &
+TALUS_TEST_PID="$fixture" TALUS_CONFIG="$test_dir/config.json" "${TALUS_BIN:-build/talus}" &
 manager=$!
 sleep 2
 build/integration-probe "$fixture"
