@@ -10,14 +10,24 @@ while Date() < deadline {
         var v: CFTypeRef?
         if AXUIElementCopyAttributeValue(app,kAXWindowsAttribute as CFString,&v) == .success,
            let windows = v as? [AXUIElement], windows.count == 2, let screen = NSScreen.screens.first {
-            let widths: [CGFloat] = windows.compactMap { w in
-                var raw: CFTypeRef?; var size = CGSize.zero
-                guard AXUIElementCopyAttributeValue(w,kAXSizeAttribute as CFString,&raw) == .success, let raw, CFGetTypeID(raw) == AXValueGetTypeID(), AXValueGetValue(raw as! AXValue,.cgSize,&size) else { return nil }
-                return size.width
+            var frames: [String: CGRect] = [:]
+            for window in windows {
+                var title: CFTypeRef?, pos: CFTypeRef?, raw: CFTypeRef?
+                var point = CGPoint.zero; var size = CGSize.zero
+                guard AXUIElementCopyAttributeValue(window,kAXTitleAttribute as CFString,&title) == .success,
+                      AXUIElementCopyAttributeValue(window,kAXPositionAttribute as CFString,&pos) == .success,
+                      AXUIElementCopyAttributeValue(window,kAXSizeAttribute as CFString,&raw) == .success,
+                      let name = title as? String, let pos, let raw,
+                      CFGetTypeID(pos) == AXValueGetTypeID(), CFGetTypeID(raw) == AXValueGetTypeID(),
+                      AXValueGetValue(pos as! AXValue,.cgPoint,&point), AXValueGetValue(raw as! AXValue,.cgSize,&size) else { continue }
+                frames[name] = CGRect(origin:point,size:size)
             }
-            if widths.count == 2 && widths.allSatisfy({ abs($0-screen.visibleFrame.width/2) < 3 }) {
+            if let first = frames["Event First"], let second = frames["Event Second"],
+               abs(first.width-screen.visibleFrame.width/2) < 3,
+               abs(second.width-screen.visibleFrame.width/2) < 3,
+               second.minX < first.minX {
                 let millis = (Date().timeIntervalSince1970-start)*1000
-                print(String(format:"Window creation to two-window layout: %.0f ms",millis)); exit(0)
+                print(String(format:"Window creation to two-window layout: %.0f ms; new window became master",millis)); exit(0)
             }
         }
     }

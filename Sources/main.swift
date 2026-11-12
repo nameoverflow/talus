@@ -34,6 +34,7 @@ final class Manager {
     let ignoredApps: Set<String>; let ratioStep: Double
     init(config: Configuration) { ratio = config.masterRatio; masters = config.masterCount; ratioStep = config.ratioStep; ignoredApps = Set(config.ignoreApps) }
     var observers: [pid_t: AXObserver] = [:]
+    var lastFocused: AXUIElement?
     var scheduled = false
     func scheduleRefresh() {
         if ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1" { fputs("event \(Date().timeIntervalSince1970)\n", stderr) }
@@ -61,7 +62,9 @@ final class Manager {
             var observer: AXObserver?
             let callback: AXObserverCallback = { _, _, _, context in
                 guard let context else { return }
-                Unmanaged<Manager>.fromOpaque(context).takeUnretainedValue().scheduleRefresh()
+                let manager = Unmanaged<Manager>.fromOpaque(context).takeUnretainedValue()
+                manager.rememberFocus()
+                manager.scheduleRefresh()
             }
             guard AXObserverCreate(pid, callback, &observer) == .success, let observer else { continue }
             let ax = AXUIElementCreateApplication(pid)
@@ -69,6 +72,7 @@ final class Manager {
             let result = AXObserverAddNotification(observer, ax, kAXWindowCreatedNotification as CFString, context)
             if result == .success {
                 observers[pid] = observer
+                AXObserverAddNotification(observer, ax, kAXFocusedWindowChangedNotification as CFString, context)
                 CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
             }
         }
@@ -106,8 +110,7 @@ final class Manager {
         var ordered = orderUsingHistory(found, history: history) { CFEqual($0.element, $1.element) }
         for w in found where !history.contains(where: { CFEqual($0.element, w.element) }) {
             ordered.removeAll { CFEqual($0.element, w.element) }
-            if let app = NSWorkspace.shared.frontmostApplication,
-               let focused = value(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
+            if let focused = lastFocused,
                let index = ordered.firstIndex(where: { $0.screen == w.screen && CFEqual($0.element, focused) }) {
                 ordered.insert(w, at: index)
             } else { ordered.append(w) }
@@ -115,6 +118,7 @@ final class Manager {
         let changed = ordered.count != windows.count || zip(ordered, windows).contains { !CFEqual($0.element, $1.element) || $0.screen != $1.screen }
         if ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1" { fputs("refresh \(Date().timeIntervalSince1970) windows=\(ordered.count) changed=\(changed)\n", stderr) }
         windows = ordered
+        rememberFocus()
         updateHistory()
         for window in windows {
             if let observer = observers[window.pid] {
@@ -145,11 +149,17 @@ final class Manager {
             if layoutMode == 2, let current, current.screen == screen { focus(current) }
         }
     }
+    func rememberFocus() {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              let focused = value(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
+              let window = windows.first(where: { CFEqual($0.element, focused) }) else { return }
+        lastFocused = window.element
+    }
     func focusedIndex() -> Int? {
         guard let app = NSWorkspace.shared.frontmostApplication, let e = value(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString) else { return nil }
         return windows.firstIndex { CFEqual($0.element, e) }
     }
-    func focus(_ w: Window) { NSRunningApplication(processIdentifier: w.pid)?.activate(); AXUIElementPerformAction(w.element, kAXRaiseAction as CFString); AXUIElementSetAttributeValue(w.element, kAXMainAttribute as CFString, kCFBooleanTrue); AXUIElementSetAttributeValue(w.element, kAXFocusedAttribute as CFString, kCFBooleanTrue) }
+    func focus(_ w: Window) { lastFocused = w.element; NSRunningApplication(processIdentifier: w.pid)?.activate(); AXUIElementPerformAction(w.element, kAXRaiseAction as CFString); AXUIElementSetAttributeValue(w.element, kAXMainAttribute as CFString, kCFBooleanTrue); AXUIElementSetAttributeValue(w.element, kAXFocusedAttribute as CFString, kCFBooleanTrue) }
     func key(_ code: UInt32, shift: Bool) {
         if code == UInt32(kVK_ANSI_P) { paused.toggle(); if !paused { refresh(force:true) }; print(paused ? "Paused" : "Resumed"); return }
         guard !paused else { return }
