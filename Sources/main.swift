@@ -277,7 +277,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             button.title = ""; button.image = image; button.imagePosition = .imageOnly
             button.toolTip = "Talus: \(spoken)"
             if ProcessInfo.processInfo.environment["TALUS_TRACE_STATUS"] == "1" {
-                fputs("status: \(spoken) image=\(image.size) appearance=\(button.effectiveAppearance.name.rawValue) dark=\(dark) button=\(button.frame) hidden=\(button.isHidden) window=\(String(describing:button.window?.frame))\n",stderr)
+                fputs("status: \(spoken)\n",stderr)
             }
             cachedParts = parts; cachedDark = dark
         }
