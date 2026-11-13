@@ -29,3 +29,33 @@ Every key is optional. Modifier names are `control`, `option`, and `command`; at
 `make test` runs the pure layout, configuration, ordering and stack tests. `make integration-test` opens isolated test windows and checks tiling and fixed-size handling; it requires a logged-in macOS desktop and Accessibility permission. The integration test limits Talus to its own fixture process and closes it afterward. `make multi-integration-test` checks four windows across two isolated fixture processes; `make latency-test` measures an isolated window creation event to layout. These also open temporary test windows. `make xmonad-oracle XMONAD_SRC=/path/to/xmonad/src` additionally compares stack wraparound with XMonad and requires GHC.
 
 The app icon is generated from vector drawing code in `Scripts/DrawAppIcon.swift`. The menu bar uses the matching monochrome template in `Sources/StatusIcon.swift`, so macOS supplies the appropriate tint.
+
+## Menu-bar status
+
+Talus shows the native Spaces of the focused display in the macOS menu bar:
+`[1] 2•  Tall` means Space 1 is current and Space 2 is a full-screen Space.
+Numbers are positions on that display. The native Space list uses an
+undocumented macOS interface and may stop working after a system update; `?`
+means it is unavailable, rather than guessing. When macOS is configured to use
+separate Spaces per display, this first version shows the focused display's
+list; behavior on real multi-monitor setups remains unverified.
+
+The optional config fields `statusFormat`, `statusTextFile`, and
+`statusStateFile` provide scripting integration. For example:
+
+```json
+{
+  "statusFormat": "{spaces} | {layout} | {title} | {custom}",
+  "statusTextFile": "~/Library/Application Support/Talus/custom.txt",
+  "statusStateFile": "~/Library/Application Support/Talus/status.json"
+}
+```
+
+Available fields are `{spaces}`, `{layout}`, `{title}`, `{count}`, and
+`{custom}`. The custom text file is read at most every two seconds; a program
+may write UTF-8 text there. The optional state file is atomically replaced on
+changes with JSON including Space identifiers, active flags, layout, window
+count, focus title and pause state. It is created with owner-only permissions;
+selecting `statusStateFile` explicitly opts in to writing the active window
+title to disk. Neither file is used unless configured. Restart Talus after
+editing the JSON configuration.

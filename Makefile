@@ -1,8 +1,8 @@
 .PHONY: all clean
 all: build/talus
-build/talus: Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift
+build/talus: Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift
 	mkdir -p build
-	swiftc -O Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
+	swiftc -O Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
 clean:
 	rm -rf build
 test:
@@ -70,3 +70,13 @@ icon-test:
 	swiftc Sources/StatusIcon.swift Tests/StatusIconTests.swift -framework Cocoa -o build/icon-tests
 	build/icon-tests
 test: icon-test
+status-test:
+	mkdir -p build
+	swiftc Sources/Spaces.swift Sources/StatusText.swift Tests/StatusTextTests.swift -framework Cocoa -framework CoreGraphics -o build/status-tests
+	build/status-tests
+test: status-test
+status-export-test:
+	mkdir -p build
+	swiftc Sources/Spaces.swift Sources/StatusExport.swift Tests/StatusExportTests.swift -framework Cocoa -framework CoreGraphics -o build/status-export-tests
+	build/status-export-tests
+test: status-export-test

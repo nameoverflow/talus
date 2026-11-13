@@ -6,12 +6,12 @@ import Darwin
 
 
 struct Window { let element: AXUIElement; let pid: pid_t; let screen: NSScreen }
-func value(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
+func axValue(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
     var result: CFTypeRef?
     return AXUIElementCopyAttributeValue(element, attribute, &result) == .success ? result : nil
 }
 func frame(_ e: AXUIElement) -> CGRect? {
-    guard let p = value(e, kAXPositionAttribute as CFString), let s = value(e, kAXSizeAttribute as CFString), CFGetTypeID(p) == AXValueGetTypeID(), CFGetTypeID(s) == AXValueGetTypeID() else { return nil }
+    guard let p = axValue(e, kAXPositionAttribute as CFString), let s = axValue(e, kAXSizeAttribute as CFString), CFGetTypeID(p) == AXValueGetTypeID(), CFGetTypeID(s) == AXValueGetTypeID() else { return nil }
     var point = CGPoint.zero; var size = CGSize.zero
     guard AXValueGetValue(p as! AXValue, .cgPoint, &point), AXValueGetValue(s as! AXValue, .cgSize, &size) else { return nil }
     return CGRect(origin: point, size: size)
@@ -34,6 +34,7 @@ final class Manager {
     let ignoredApps: Set<String>; let ratioStep: Double
     init(config: Configuration) { ratio = config.masterRatio; masters = config.masterCount; ratioStep = config.ratioStep; ignoredApps = Set(config.ignoreApps) }
     var observers: [pid_t: AXObserver] = [:]
+    var statusChanged: (() -> Void)?
     var lastFocused: AXUIElement?
     var scheduled = false
     func scheduleRefresh() {
@@ -92,13 +93,13 @@ final class Manager {
             }
             if let bundle = app.bundleIdentifier, ignoredApps.contains(bundle) { continue }
             let ax = AXUIElementCreateApplication(app.processIdentifier)
-            guard let elements = value(ax, kAXWindowsAttribute as CFString) as? [AXUIElement] else { continue }
+            guard let elements = axValue(ax, kAXWindowsAttribute as CFString) as? [AXUIElement] else { continue }
             for e in elements {
                 guard let f = frame(e), f.width > 100, f.height > 80,
                       visible.contains(where: { $0.0 == app.processIdentifier && abs($0.1.minX-f.minX) < 3 && abs($0.1.minY-f.minY) < 3 && abs($0.1.width-f.width) < 3 && abs($0.1.height-f.height) < 3 }),
                       let screen = NSScreen.screens.max(by: { screenRect($0).intersection(f).area < screenRect($1).intersection(f).area }), screenRect(screen).intersects(f) else { continue }
-                if let sub = value(e, kAXSubroleAttribute as CFString) as? String, sub != kAXStandardWindowSubrole as String { continue }
-                if (value(e, kAXModalAttribute as CFString) as? Bool) == true { continue }
+                if let sub = axValue(e, kAXSubroleAttribute as CFString) as? String, sub != kAXStandardWindowSubrole as String { continue }
+                if (axValue(e, kAXModalAttribute as CFString) as? Bool) == true { continue }
                 var canMove = DarwinBoolean(false); var canResize = DarwinBoolean(false)
                 guard AXUIElementIsAttributeSettable(e, kAXPositionAttribute as CFString, &canMove) == .success,
                       AXUIElementIsAttributeSettable(e, kAXSizeAttribute as CFString, &canResize) == .success,
@@ -126,9 +127,10 @@ final class Manager {
             }
         }
         if changed || force { tile() }
+        statusChanged?()
     }
     func updateHistory() {
-        history.removeAll { value($0.element, kAXRoleAttribute as CFString) == nil }
+        history.removeAll { axValue($0.element, kAXRoleAttribute as CFString) == nil }
         floating.removeAll { element in !history.contains { CFEqual($0.element, element) } }
         history = mergeHistory(history, current: windows) { CFEqual($0.element, $1.element) }
     }
@@ -151,12 +153,12 @@ final class Manager {
     }
     func rememberFocus() {
         guard let app = NSWorkspace.shared.frontmostApplication,
-              let focused = value(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
+              let focused = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
               let window = windows.first(where: { CFEqual($0.element, focused) }) else { return }
         lastFocused = window.element
     }
     func focusedIndex() -> Int? {
-        guard let app = NSWorkspace.shared.frontmostApplication, let e = value(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString) else { return nil }
+        guard let app = NSWorkspace.shared.frontmostApplication, let e = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString) else { return nil }
         return windows.firstIndex { CFEqual($0.element, e) }
     }
     func focus(_ w: Window) { lastFocused = w.element; NSRunningApplication(processIdentifier: w.pid)?.activate(); AXUIElementPerformAction(w.element, kAXRaiseAction as CFString); AXUIElementSetAttributeValue(w.element, kAXMainAttribute as CFString, kCFBooleanTrue); AXUIElementSetAttributeValue(w.element, kAXFocusedAttribute as CFString, kCFBooleanTrue) }
@@ -226,6 +228,37 @@ let manager = Manager(config: config)
 final class StatusMenu: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
+    let spaces = NativeSpaces()
+    var lastExport: Data?
+    var reportedExportError = false
+    func updateStatus() {
+        let screen = manager.focusedIndex().map { manager.windows[$0].screen } ?? NSScreen.main ?? NSScreen.screens.first
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let frontWindow = frontmost.flatMap { axValue(AXUIElementCreateApplication($0.processIdentifier), kAXFocusedWindowAttribute as CFString) }
+        let title: String
+        if let frontWindow, CFGetTypeID(frontWindow) == AXUIElementGetTypeID() {
+            title = axValue(frontWindow as! AXUIElement, kAXTitleAttribute as CFString) as? String ?? ""
+        } else { title = "" }
+        let names = ["Tall", "Mirror", "Full"]
+        let custom = config.statusTextFile.map(readCustomStatus(at:)) ?? ""
+        let spaceList = spaces.spaces(for: screen)
+        let values = StatusValues(spaces: spaceList, layout: names[manager.layoutMode], title: title, count: manager.windows.count, custom: custom, paused: manager.paused)
+        if let path = config.statusStateFile, !path.isEmpty {
+            let snapshot = StatusExport(spaces: spaceList, layout: values.layout, title: title, count: values.count, paused: values.paused)
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            let destination = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            if let data = try? encoder.encode(snapshot), data != lastExport || !FileManager.default.fileExists(atPath: destination.path) {
+                do {
+                    try writeStatus(data, to: destination)
+                    lastExport = data; reportedExportError = false
+                } catch {
+                    if !reportedExportError { fputs("Talus status export failed: \(error)\n", stderr); reportedExportError = true }
+                }
+            }
+        }
+        item.button?.title = renderStatus(config.statusFormat, values)
+        item.button?.imagePosition = .imageLeading
+    }
     override init() {
         super.init()
         item.button?.image = makeStatusIcon()
@@ -242,7 +275,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         item.menu = menu
     }
     func menuWillOpen(_ menu: NSMenu) { pauseItem.title = manager.paused ? "Resume" : "Pause" }
-    @objc func togglePause() { manager.paused.toggle(); if !manager.paused { manager.refresh(force: true) } }
+    @objc func togglePause() { manager.paused.toggle(); if !manager.paused { manager.refresh(force: true) }; updateStatus() }
     @objc func quitApp() { NSApp.terminate(nil) }
 }
 let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -250,9 +283,11 @@ if !AXIsProcessTrustedWithOptions(opts) { reportStartupError(title: "Accessibili
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let statusMenu = StatusMenu()
+manager.statusChanged = { [weak statusMenu] in statusMenu?.updateStatus() }
+statusMenu.updateStatus()
 let handler: EventHandlerUPP = { _, event, _ in
     var hotkey = EventHotKeyID(); GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotkey)
-    manager.key(hotkey.id & 0xffff, shift: hotkey.id & 0x10000 != 0); return noErr
+    manager.key(hotkey.id & 0xffff, shift: hotkey.id & 0x10000 != 0); statusMenu.updateStatus(); return noErr
 }
 var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
 InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, nil)
@@ -277,8 +312,13 @@ manager.observeApplications()
 manager.refresh(force:true)
 let workspace = NSWorkspace.shared.notificationCenter
 let tokens = [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didHideApplicationNotification, NSWorkspace.didUnhideApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification].map { name in
-    workspace.addObserver(forName: name, object: nil, queue: .main) { _ in manager.observeApplications(); manager.scheduleRefresh() }
+    workspace.addObserver(forName: name, object: nil, queue: .main) { _ in
+        manager.observeApplications(); manager.scheduleRefresh(); statusMenu.updateStatus()
+        if name == NSWorkspace.activeSpaceDidChangeNotification {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { statusMenu.updateStatus() }
+        }
+    }
 }
 // Some applications omit accessibility notifications. Reconcile as a fallback.
-Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in manager.observeApplications(); manager.refresh() }
+Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in manager.observeApplications(); manager.refresh(); statusMenu.updateStatus() }
 app.run()
