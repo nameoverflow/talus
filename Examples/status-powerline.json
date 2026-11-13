@@ -1,0 +1,9 @@
+{
+  "spaceLabels": ["1", "2", "3", "4"],
+  "statusTemplate": "%spaces% <fc=#F0C674>▶ %layout%</fc>  |  %clock%",
+  "workspaceCurrent": "<fc=#191C24,#F0C674> %label%%fullscreen% </fc>",
+  "workspaceOther": "<fc=#D8DEE9,#34414F> %label%%fullscreen% </fc>",
+  "statusCommands": [
+    {"name": "clock", "executable": "/bin/date", "arguments": ["+%H:%M"], "interval": 30}
+  ]
+}

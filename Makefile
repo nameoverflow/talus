@@ -1,8 +1,8 @@
 .PHONY: all clean
 all: build/talus
-build/talus: Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift
+build/talus: Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift
 	mkdir -p build
-	swiftc -O Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
+	swiftc -O Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift -framework Cocoa -framework Carbon -framework ApplicationServices -o $@
 clean:
 	rm -rf build
 test:
@@ -46,7 +46,7 @@ app: build/talus Resources/Info.plist build/Talus.icns
 	codesign --force --sign - build/Talus.app
 config-test:
 	mkdir -p build
-	swiftc Sources/Configuration.swift Tests/ConfigurationTests.swift -o build/config-tests
+	swiftc Sources/Configuration.swift Sources/StatusConfiguration.swift Tests/ConfigurationTests.swift -o build/config-tests
 	build/config-tests
 integration-test: all
 	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
@@ -80,3 +80,19 @@ status-export-test:
 	swiftc Sources/Spaces.swift Sources/StatusExport.swift Tests/StatusExportTests.swift -framework Cocoa -framework CoreGraphics -o build/status-export-tests
 	build/status-export-tests
 test: status-export-test
+rich-status-test:
+	mkdir -p build
+	swiftc Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Tests/StatusRichTests.swift -framework Cocoa -framework CoreGraphics -o build/rich-status-tests
+	build/rich-status-tests
+test: rich-status-test
+status-command-test:
+	mkdir -p build
+	swiftc Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/StatusCommands.swift Tests/StatusCommandTests.swift -o build/status-command-tests
+	build/status-command-tests
+test: status-command-test
+haskell-status-test:
+	mkdir -p build
+	swiftc Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/StatusCommands.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Tests/HaskellStatusIntegration.swift -framework Cocoa -framework CoreGraphics -o build/haskell-status-tests
+	build/haskell-status-tests "$$(command -v runghc)" "$$PWD/Examples/clock.hs"
+status-cleanup-test: all
+	Tests/Integration/command-cleanup.sh

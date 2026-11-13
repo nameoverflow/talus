@@ -24,38 +24,74 @@ Optional `~/Library/Application Support/Talus/config.json` (restart Talus after 
 
 Every key is optional. Modifier names are `control`, `option`, and `command`; at least one is required, and Shift is reserved for swap shortcuts. Ratio must be 0.2–0.8, ratio step greater than zero and at most 0.2, and master count 1–20. `ignoreApps` contains application bundle identifiers. Invalid configuration prevents startup and is reported on standard error. Conflicting hotkeys are reported on standard error; other bindings remain available.
 
-## Verification
-
-`make test` runs the pure layout, configuration, ordering and stack tests. `make integration-test` opens isolated test windows and checks tiling and fixed-size handling; it requires a logged-in macOS desktop and Accessibility permission. The integration test limits Talus to its own fixture process and closes it afterward. `make multi-integration-test` checks four windows across two isolated fixture processes; `make latency-test` measures an isolated window creation event to layout. These also open temporary test windows. `make xmonad-oracle XMONAD_SRC=/path/to/xmonad/src` additionally compares stack wraparound with XMonad and requires GHC.
-
-The app icon is generated from vector drawing code in `Scripts/DrawAppIcon.swift`. The menu bar uses the matching monochrome template in `Sources/StatusIcon.swift`, so macOS supplies the appropriate tint.
-
 ## Menu-bar status
 
-Talus shows the native Spaces of the focused display in the macOS menu bar:
-`[1] 2•  Tall` means Space 1 is current and Space 2 is a full-screen Space.
-Numbers are positions on that display. The native Space list uses an
-undocumented macOS interface and may stop working after a system update; `?`
-means it is unavailable, rather than guessing. When macOS is configured to use
-separate Spaces per display, this first version shows the focused display's
-list; behavior on real multi-monitor setups remains unverified.
+Talus shows native Spaces and layout in the macOS menu bar. Space numbers are
+positions on the focused display, a dot marks a full-screen Space, and `?`
+means the Space list could not be read. This list uses an undocumented macOS
+interface and may stop working after a system update; real multi-monitor
+behavior remains unverified.
 
-The optional config fields `statusFormat`, `statusTextFile`, and
-`statusStateFile` provide scripting integration. For example:
+The optional `~/Library/Application Support/Talus/config.json` defines the
+menu-bar text as a template. For example:
 
 ```json
 {
-  "statusFormat": "{spaces} | {layout} | {title} | {custom}",
-  "statusTextFile": "~/Library/Application Support/Talus/custom.txt",
-  "statusStateFile": "~/Library/Application Support/Talus/status.json"
+  "spaceLabels": ["term", "web", "chat"],
+  "statusShowIcon": true,
+  "statusTemplate": "%spaces%  <fc=#89CFC2>%layout%</fc>  %clock%",
+  "workspaceCurrent": "<fc=#10201E,#89CFC2> %label%%fullscreen% </fc>",
+  "workspaceOther": "%label%%fullscreen%",
+  "statusFonts": ["Menlo-Regular"],
+  "statusCommands": [
+    {"name": "clock", "executable": "/bin/date", "arguments": ["+%H:%M"], "interval": 30, "timeout": 2}
+  ]
 }
 ```
 
-Available fields are `{spaces}`, `{layout}`, `{title}`, `{count}`, and
-`{custom}`. The custom text file is read at most every two seconds; a program
-may write UTF-8 text there. The optional state file is atomically replaced on
-changes with JSON including Space identifiers, active flags, layout, window
-count, focus title and pause state. It is created with owner-only permissions;
-selecting `statusStateFile` explicitly opts in to writing the active window
-title to disk. Neither file is used unless configured. Restart Talus after
-editing the JSON configuration.
+Set `statusShowIcon` to `false` if the text should occupy the entire item.
+The supported substitutions are `%spaces%`, `%layout%`, `%title%`, `%count%`,
+`%custom%`, and `%name%` for a configured command. `%%` emits a literal percent
+sign. Workspace templates accept `%label%`, `%index%`, and `%fullscreen%`.
+`<fc=#RRGGBB>` and `<fc=#RRGGBB,#RRGGBB>` set foreground and foreground plus
+background, with nested `</fc>` tags; common colour names are also accepted.
+`<fn=0>...</fn>` selects the first installed font named in `statusFonts`.
+`statusFontSize` is in points (8–14). Missing fonts fall back to the system font.
+Arbitrary Unicode characters are allowed, including glyphs supplied by installed
+icon fonts. The menu item is capped at 400 points and may clip long output.
+
+Commands are launched asynchronously as an executable and argument array (no
+implicit shell). `interval` and `timeout` are seconds; output is bounded and
+failed or timed-out commands display nothing. A command's output is literal by
+default. Set `"markup": true` on a command you trust to interpret its `<fc>`
+and `<fn>` tags, including output from a Haskell program; see
+`Examples/clock.hs`. To let a program render the whole item, make
+`statusTemplate` just `%mybar%` and define a `mybar` command with `markup: true`.
+The program can read the current state from `TALUS_STATUS_JSON`; an executable
+example using Python's standard library is in `Examples/status.py`.
+Set `"onChange": true` to rerun it on Space, layout,
+focus, count, or pause changes. Each run receives `TALUS_STATUS_JSON` with the
+current status, so programs can compute their own string. The optional
+`statusStateFile` also writes that JSON atomically with owner-only permissions;
+setting it opts in to writing the focused window title to disk.
+
+The older `statusFormat` and `statusTextFile` fields remain supported when
+`statusTemplate` is omitted. Only the `<fc>` and `<fn>` formatting tags are interpreted; other tags are
+shown as text. Configuration is Talus's own JSON format, not executable Haskell.
+A configured Haskell program may emit the entire menu text and formatting.
+Clicking the item opens the Talus menu; individual Space labels are not clickable.
+
+Two editable example configurations are in `Examples/status-compact.json` and
+`Examples/status-powerline.json`. Restart Talus after changing its configuration.
+
+## Verification
+
+`make test` runs pure tests, including template parsing, command limits, and
+window ordering. `make integration-test`, `make multi-integration-test`, and
+`make latency-test` open isolated test windows; they require a logged-in macOS
+desktop and Accessibility permission. `make haskell-status-test` exercises the Haskell example when `runghc` is installed.
+`make xmonad-oracle XMONAD_SRC=/path/to/xmonad/src`
+compares stack wraparound with XMonad and requires GHC.
+
+The app icon is generated from vector drawing code in `Scripts/DrawAppIcon.swift`.
+The status image draws the same symbol next to the configured text.

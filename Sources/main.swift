@@ -229,8 +229,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
     let spaces = NativeSpaces()
+    let commands = StatusCommands(stateFile:config.statusStateFile)
     var lastExport: Data?
+    var lastState: Data?
     var reportedExportError = false
+    var cachedParts: [StatusPart]?
+    var cachedDark: Bool?
     func updateStatus() {
         let screen = manager.focusedIndex().map { manager.windows[$0].screen } ?? NSScreen.main ?? NSScreen.screens.first
         let frontmost = NSWorkspace.shared.frontmostApplication
@@ -242,25 +246,45 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let names = ["Tall", "Mirror", "Full"]
         let custom = config.statusTextFile.map(readCustomStatus(at:)) ?? ""
         let spaceList = spaces.spaces(for: screen)
-        let values = StatusValues(spaces: spaceList, layout: names[manager.layoutMode], title: title, count: manager.windows.count, custom: custom, paused: manager.paused)
-        if let path = config.statusStateFile, !path.isEmpty {
-            let snapshot = StatusExport(spaces: spaceList, layout: values.layout, title: title, count: values.count, paused: values.paused)
-            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-            let destination = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-            if let data = try? encoder.encode(snapshot), data != lastExport || !FileManager.default.fileExists(atPath: destination.path) {
-                do {
-                    try writeStatus(data, to: destination)
-                    lastExport = data; reportedExportError = false
-                } catch {
-                    if !reportedExportError { fputs("Talus status export failed: \(error)\n", stderr); reportedExportError = true }
+        let values = StatusValues(spaces: spaceList, layout: names[manager.layoutMode], title: title, count: manager.windows.count, custom: custom, paused: manager.paused, spaceLabels: config.spaceLabels)
+        let snapshot = StatusExport(spaces: spaceList, layout: values.layout, title: String(title.prefix(512)), count: values.count, paused: values.paused)
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        if let data = try? encoder.encode(snapshot) {
+            commands.stateJSON = String(data:data,encoding:.utf8)
+            if data != lastState { lastState = data; commands.stateChanged(config.statusCommands) }
+            if let path = config.statusStateFile, !path.isEmpty {
+                let destination = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+                if data != lastExport || !FileManager.default.fileExists(atPath: destination.path) {
+                    do {
+                        try writeStatus(data, to: destination)
+                        lastExport = data; reportedExportError = false
+                    } catch {
+                        if !reportedExportError { fputs("Talus status export failed: \(error)\n", stderr); reportedExportError = true }
+                    }
                 }
             }
         }
-        item.button?.title = renderStatus(config.statusFormat, values)
-        item.button?.imagePosition = .imageLeading
+        let parts = templateStatusParts(config:config,values:values) { [weak self] index in
+            guard let self, config.statusCommands.indices.contains(index) else { return "" }
+            return self.commands.value(index:index,block:config.statusCommands[index])
+        }
+        let spoken = parts.map { $0.isCurrent ? "[\($0.text)]" : $0.text }.joined()
+        guard let button = item.button else { return }
+        let dark = button.effectiveAppearance.bestMatch(from:[.darkAqua,.aqua]) == .darkAqua
+        if parts != cachedParts || dark != cachedDark {
+            let image = configuredStatusImage(parts:parts,dark:dark,showIcon:config.statusShowIcon)
+            image.accessibilityDescription = "Talus: \(spoken)"
+            button.title = ""; button.image = image; button.imagePosition = .imageOnly
+            button.toolTip = "Talus: \(spoken)"
+            if ProcessInfo.processInfo.environment["TALUS_TRACE_STATUS"] == "1" {
+                fputs("status: \(spoken) image=\(image.size) appearance=\(button.effectiveAppearance.name.rawValue) dark=\(dark) button=\(button.frame) hidden=\(button.isHidden) window=\(String(describing:button.window?.frame))\n",stderr)
+            }
+            cachedParts = parts; cachedDark = dark
+        }
     }
     override init() {
         super.init()
+        commands.onChange = { [weak self] in self?.updateStatus() }
         item.button?.image = makeStatusIcon()
         item.button?.imagePosition = .imageOnly
         item.button?.toolTip = "Talus"
@@ -276,7 +300,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
     func menuWillOpen(_ menu: NSMenu) { pauseItem.title = manager.paused ? "Resume" : "Pause" }
     @objc func togglePause() { manager.paused.toggle(); if !manager.paused { manager.refresh(force: true) }; updateStatus() }
-    @objc func quitApp() { NSApp.terminate(nil) }
+    @objc func quitApp() { commands.stopAll(); NSApp.terminate(nil) }
 }
 let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
 if !AXIsProcessTrustedWithOptions(opts) { reportStartupError(title: "Accessibility permission needed", message: "Allow Talus in System Settings → Privacy & Security → Accessibility, then reopen Talus.") }
@@ -321,4 +345,11 @@ let tokens = [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTermi
 }
 // Some applications omit accessibility notifications. Reconcile as a fallback.
 Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in manager.observeApplications(); manager.refresh(); statusMenu.updateStatus() }
+signal(SIGINT,SIG_IGN); signal(SIGTERM,SIG_IGN)
+let stopSignals = [SIGINT,SIGTERM].map { number -> DispatchSourceSignal in
+    let source = DispatchSource.makeSignalSource(signal:number,queue:.main)
+    source.setEventHandler { statusMenu.commands.stopAll(); exit(0) }
+    source.resume(); return source
+}
 app.run()
+statusMenu.commands.stopAll()

@@ -4,10 +4,15 @@ import Foundation
     let d = JSONDecoder()
     let empty = try d.decode(Configuration.self, from: Data("{}".utf8)); try empty.validate()
     precondition(empty.modifiers == ["control", "option"] && empty.masterRatio == 0.5 && empty.ratioStep == 0.03 && empty.masterCount == 1)
-    precondition(empty.statusFormat == "{spaces}  {layout}" && empty.statusTextFile == nil && empty.statusStateFile == nil)
+    precondition(empty.statusFormat == "{spaces}  {layout}" && empty.statusTemplate == nil && empty.statusShowIcon && empty.statusCommands.isEmpty)
+    let withoutIcon = try d.decode(Configuration.self, from:Data("{\"statusShowIcon\":false}".utf8)); try withoutIcon.validate()
+    precondition(!withoutIcon.statusShowIcon)
+    for path in ["Examples/status-compact.json", "Examples/status-powerline.json"] {
+        _ = try Configuration.load(from:URL(fileURLWithPath:path))
+    }
     let custom = try d.decode(Configuration.self, from: Data("{\"modifiers\":[\"command\"],\"masterRatio\":0.6,\"masterCount\":2,\"ignoreApps\":[\"com.example.app\"]}".utf8)); try custom.validate()
     precondition(custom.modifiers == ["command"] && custom.ignoreApps == ["com.example.app"])
-    for json in ["{\"modifiers\":[]}", "{\"modifiers\":[\"shift\"]}", "{\"masterRatio\":0.9}", "{\"masterCount\":0}", "{\"ratioStep\":0}"] {
+    for json in ["{\"modifiers\":[]}", "{\"modifiers\":[\"shift\"]}", "{\"masterRatio\":0.9}", "{\"masterCount\":0}", "{\"ratioStep\":0}", "{\"statusCommands\":[{\"name\":\"spaces\",\"executable\":\"/bin/echo\"}]}", "{\"statusCommands\":[{\"name\":\"a\",\"executable\":\"echo\"}]}"] {
         let config = try d.decode(Configuration.self, from: Data(json.utf8))
         do { try config.validate(); fatalError("invalid config was accepted") } catch { }
     }

@@ -7,12 +7,14 @@ struct StatusValues {
     let count: Int
     let custom: String
     let paused: Bool
+    var spaceLabels: [String] = []
 }
 
 func renderStatus(_ format: String, _ values: StatusValues) -> String {
     let spaces = values.spaces.map { entries in
         entries.enumerated().map { index, item in
-            let number = String(index + 1) + (item.isFullscreen ? "•" : "")
+            let label = index < values.spaceLabels.count ? values.spaceLabels[index] : String(index + 1)
+            let number = label + (item.isFullscreen ? "•" : "")
             return item.isCurrent ? "[\(number)]" : number
         }.joined(separator: " ")
     } ?? "?"
