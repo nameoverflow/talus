@@ -1,0 +1,21 @@
+# ~/.talus.toml — 青绿胶囊高亮风格示例
+
+modifiers = ["option"]
+
+[layout]
+master_ratio = 0.5
+ratio_step = 0.03
+master_count = 1
+
+[status]
+show_icon = true
+space_labels = ["dev", "web", "chat", "doc"]
+template = "%spaces%  <fc=#89CFC2>%layout%</fc>  %clock%"
+workspace_current = "<fc=#10201E,#89CFC2> %label%%fullscreen% </fc>"
+workspace_other = "<fc=#CBD5D6>%label%%fullscreen%</fc>"
+
+[[status.commands]]
+name = "clock"
+executable = "/bin/date"
+arguments = ["+%H:%M"]
+interval = 30

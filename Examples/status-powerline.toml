@@ -1,0 +1,21 @@
+# ~/.talus.toml — 暖金分段 Powerline 风格示例
+
+modifiers = ["control", "option"]
+
+[layout]
+master_ratio = 0.5
+ratio_step = 0.03
+master_count = 1
+
+[status]
+show_icon = true
+space_labels = ["1", "2", "3", "4"]
+template = "%spaces% <fc=#F0C674>▶ %layout%</fc>  |  %clock%"
+workspace_current = "<fc=#191C24,#F0C674> %label%%fullscreen% </fc>"
+workspace_other = "<fc=#D8DEE9,#34414F> %label%%fullscreen% </fc>"
+
+[[status.commands]]
+name = "clock"
+executable = "/bin/date"
+arguments = ["+%H:%M"]
+interval = 30
