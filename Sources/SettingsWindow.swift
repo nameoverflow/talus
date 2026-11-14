@@ -570,7 +570,7 @@ struct SettingsRootView: View {
 
             Divider()
 
-            ScrollView {
+            ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 14) {
                     switch model.selectedTab {
                     case .layout:
@@ -583,6 +583,8 @@ struct SettingsRootView: View {
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .containerRelativeFrame(.horizontal, alignment: .leading)
             }
 
             Divider()
@@ -632,7 +634,59 @@ struct SettingsRootView: View {
             .padding(.vertical, 10)
             .background(.bar)
         }
-        .frame(minWidth: 590, idealWidth: 620, minHeight: 560, idealHeight: 644)
+        .frame(minWidth: 600, idealWidth: 640, minHeight: 560, idealHeight: 660)
+    }
+}
+
+private struct FlowLayout: Layout {
+    var horizontalSpacing: CGFloat = 6
+    var verticalSpacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        arrange(maxWidth: proposal.width ?? .infinity, subviews: subviews).size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let arranged = arrange(maxWidth: bounds.width, subviews: subviews)
+        for (index, subview) in subviews.enumerated() {
+            let frame = arranged.frames[index]
+            subview.place(
+                at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(frame.size)
+            )
+        }
+    }
+
+    private func arrange(maxWidth: CGFloat, subviews: Subviews) -> (size: CGSize, frames: [CGRect]) {
+        guard !subviews.isEmpty else { return (.zero, []) }
+        let limit = maxWidth > 0 ? maxWidth : .infinity
+        var frames: [CGRect] = []
+        frames.reserveCapacity(subviews.count)
+
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var usedWidth: CGFloat = 0
+
+        for subview in subviews {
+            var itemSize = subview.sizeThatFits(.unspecified)
+            if limit.isFinite && itemSize.width > limit {
+                itemSize = subview.sizeThatFits(ProposedViewSize(width: limit, height: nil))
+                itemSize.width = min(itemSize.width, limit)
+            }
+            if x > 0 && x + itemSize.width > limit {
+                x = 0
+                y += rowHeight + verticalSpacing
+                rowHeight = 0
+            }
+            frames.append(CGRect(origin: CGPoint(x: x, y: y), size: itemSize))
+            usedWidth = max(usedWidth, x + itemSize.width)
+            x += itemSize.width + horizontalSpacing
+            rowHeight = max(rowHeight, itemSize.height)
+        }
+
+        return (CGSize(width: usedWidth, height: y + rowHeight), frames)
     }
 }
 
@@ -1079,10 +1133,13 @@ private struct AppRulesView: View {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(info.name)
                                     .font(.system(size: 12.5, weight: .medium))
+                                    .lineLimit(1)
                                 if info.name != info.bundleID {
                                     Text(info.bundleID)
                                         .font(.system(size: 11, design: .monospaced))
                                         .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
                                 }
                             }
                             Spacer()
@@ -1179,7 +1236,7 @@ private struct AppRulesView: View {
                     Text("尚未添加忽略应用")
                         .font(.system(size: 12.5, weight: .medium))
                         .foregroundStyle(.secondary)
-                    Text("所有可调整尺寸的标准窗口都会自动参与平铺；对话框和固定尺寸面板默认已自动跳过。")
+                    Text("所有可调整尺寸的标准窗口都会自动参与平铺；对话框已自动跳过，固定尺寸窗口在虚拟工作区中以原尺寸浮动跟随。")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.tertiary)
                         .multilineTextAlignment(.center)
@@ -1201,10 +1258,13 @@ private struct AppRulesView: View {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(info.name)
                                     .font(.system(size: 12.5, weight: .medium))
+                                    .lineLimit(1)
                                 if info.name != info.bundleID {
                                     Text(info.bundleID)
                                         .font(.system(size: 11, design: .monospaced))
                                         .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
                                 }
                             }
                             Spacer()
@@ -1299,9 +1359,9 @@ private struct MenuBarSettingsView: View {
                 ? "使用 Talus 实际矢量渲染器绘制（深色编号为有窗口的工作区，浅淡编号为空闲工作区）"
                 : "使用 Talus 实际矢量渲染器绘制（示例含 3 个桌面空间，第 3 个为全屏空间 •）"
         ) {
-            HStack(spacing: 12) {
-                MenuBarPreviewPill(label: "深色菜单栏", dark: true, image: model.previewImage(dark: true))
-                MenuBarPreviewPill(label: "浅色菜单栏", dark: false, image: model.previewImage(dark: false))
+            VStack(spacing: 8) {
+                MenuBarPreviewPill(label: "深色", dark: true, image: model.previewImage(dark: true))
+                MenuBarPreviewPill(label: "浅色", dark: false, image: model.previewImage(dark: false))
             }
         }
 
@@ -1314,15 +1374,16 @@ private struct MenuBarSettingsView: View {
                 }
 
             VStack(alignment: .leading, spacing: 6) {
-                HStack {
+                HStack(spacing: 4) {
                     Text("工作区名称")
                         .font(.system(size: 12.5, weight: .medium))
                     Text("（按顺序对应桌面 1、2、3…，留空则显示数字编号）")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
 
-                HStack(spacing: 6) {
+                FlowLayout(horizontalSpacing: 6, verticalSpacing: 6) {
                     ForEach(Array(model.spaceLabels.enumerated()), id: \.offset) { idx, label in
                         HStack(spacing: 4) {
                             Text("\(idx + 1):")
@@ -1330,6 +1391,7 @@ private struct MenuBarSettingsView: View {
                                 .foregroundStyle(.secondary)
                             Text(label)
                                 .font(.system(size: 12, weight: .medium))
+                                .lineLimit(1)
                             Button {
                                 model.spaceLabels.remove(at: idx)
                                 model.notifyChanged(immediate: true)
@@ -1353,7 +1415,7 @@ private struct MenuBarSettingsView: View {
                             TextField("桌面 \(model.spaceLabels.count + 1) 名称，回车添加", text: $model.newSpaceLabel)
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(size: 12))
-                                .frame(width: 155)
+                                .frame(width: 158)
                                 .onSubmit { appendSpaceLabel() }
                             if !model.newSpaceLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                 Button("添加") { appendSpaceLabel() }
@@ -1409,10 +1471,11 @@ private struct MenuBarSettingsView: View {
                         .font(.system(size: 12, design: .monospaced))
                         .onChange(of: model.customTemplate) { _, _ in model.notifyChanged() }
 
-                    HStack(spacing: 6) {
+                    FlowLayout(horizontalSpacing: 6, verticalSpacing: 6) {
                         Text("插入变量:")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
+                            .padding(.vertical, 2)
                         ForEach([
                             ("%spaces%", "工作区"),
                             ("%layout%", "布局"),
@@ -1604,17 +1667,21 @@ private struct MenuBarPreviewPill: View {
     let image: NSImage
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        HStack(spacing: 10) {
             Text(label)
-                .font(.system(size: 11))
+                .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(.secondary)
-            HStack {
-                Image(nsImage: image)
-                    .interpolation(.high)
-                Spacer(minLength: 0)
+                .frame(width: 34, alignment: .leading)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 0) {
+                    Image(nsImage: image)
+                        .interpolation(.high)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 30)
             }
-            .padding(.horizontal, 12)
-            .frame(height: 28)
+            .frame(height: 30)
             .frame(maxWidth: .infinity)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -1756,7 +1823,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         win.title = "Talus 设置"
         win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         win.collectionBehavior = [.moveToActiveSpace]
-        win.setContentSize(NSSize(width: 620, height: 644))
+        win.minSize = NSSize(width: 600, height: 560)
+        win.setContentSize(NSSize(width: 640, height: 660))
         win.center()
         win.isReleasedWhenClosed = false
         win.delegate = self

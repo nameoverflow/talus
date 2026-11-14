@@ -20,6 +20,7 @@ struct Window {
     let pid: pid_t
     let bundleID: String?
     let screen: NSScreen
+    let isResizable: Bool
     var key: AXWindowKey { AXWindowKey(element: element) }
 }
 
@@ -114,6 +115,10 @@ final class Manager {
 
     var isVirtualMode: Bool { workspaceMode == "virtual" }
 
+    func isFloating(_ w: Window) -> Bool {
+        !w.isResizable || floating.contains(w.key)
+    }
+
     var currentLayoutMode: Int {
         get { isVirtualMode ? virtualEngine.activeLayout.layoutMode : nativeLayoutMode }
         set {
@@ -184,19 +189,7 @@ final class Manager {
             virtualSeeded = false
         } else if !wasVirtual && willBeVirtual {
             workspaceMode = "virtual"
-            let currentKeys = windows.map(\.key)
-            let focusedKey = lastFocused.map(AXWindowKey.init)
-            if !currentKeys.isEmpty {
-                let lookup = windowByKey
-                virtualEngine.seedFromCurrentDesktop(
-                    currentKeys,
-                    focused: focusedKey,
-                    assignedWorkspace: { [weak self] key in
-                        self?.assignedWorkspace(for: lookup[key]?.bundleID)
-                    }
-                )
-                virtualSeeded = true
-            }
+            virtualSeeded = false
         } else {
             workspaceMode = config.workspaceMode
             if willBeVirtual && virtualSeeded {
@@ -369,6 +362,14 @@ final class Manager {
         )
     }
 
+    private func centeredOrigin(windowSize: CGSize, on screen: NSScreen) -> CGPoint {
+        let area = screenRect(screen)
+        return CGPoint(
+            x: max(area.minX, area.minX + ((area.width - windowSize.width) / 2).rounded()),
+            y: max(area.minY, area.minY + ((area.height - windowSize.height) / 2).rounded())
+        )
+    }
+
     func restoreAllParkedWindows() {
         guard AXIsProcessTrusted() else {
             parkedKeys.removeAll()
@@ -381,11 +382,21 @@ final class Manager {
             }
         }
         for key in keysToRestore {
-            let screen = windowByKey[key]?.screen ?? homeScreens[key] ?? NSScreen.main ?? NSScreen.screens.first
+            let win = windowByKey[key]
+            let screen = win?.screen ?? homeScreens[key] ?? NSScreen.main ?? NSScreen.screens.first
+            let resizable = win?.isResizable ?? true
             if let saved = savedFrames[key] {
-                setFrame(key.element, saved)
+                if resizable {
+                    setFrame(key.element, saved)
+                } else {
+                    setPosition(key.element, saved.origin)
+                }
             } else if let screen, let f = frame(key.element) {
-                setFrame(key.element, centeredFrame(size: f.size, on: screen))
+                if resizable {
+                    setFrame(key.element, centeredFrame(size: f.size, on: screen))
+                } else {
+                    setPosition(key.element, centeredOrigin(windowSize: f.size, on: screen))
+                }
             }
         }
         parkedKeys.removeAll()
@@ -462,24 +473,37 @@ final class Manager {
                 if (axValue(e, kAXModalAttribute as CFString) as? Bool) == true { continue }
                 var canMove = DarwinBoolean(false); var canResize = DarwinBoolean(false)
                 guard AXUIElementIsAttributeSettable(e, kAXPositionAttribute as CFString, &canMove) == .success,
-                      AXUIElementIsAttributeSettable(e, kAXSizeAttribute as CFString, &canResize) == .success,
-                      canMove.boolValue, canResize.boolValue
+                      canMove.boolValue
                 else { continue }
+                let isResizable = (AXUIElementIsAttributeSettable(e, kAXSizeAttribute as CFString, &canResize) == .success && canResize.boolValue)
+                if !isVirtualMode && !isResizable { continue }
 
                 let parkedNow = isParkedWindowFrame(f, screen: fullScreenRect(screen))
                 // Crash-recovery: if a window was stranded at a 1px corner from an earlier session, rescue it
                 if parkedNow && !parkedKeys.contains(key) {
-                    let rescued = savedFrames[key] ?? centeredFrame(size: f.size, on: screen)
-                    setFrame(e, rescued)
-                    f = rescued
+                    if isResizable {
+                        let rescued = savedFrames[key] ?? centeredFrame(size: f.size, on: screen)
+                        setFrame(e, rescued)
+                        f = rescued
+                    } else {
+                        let origin = savedFrames[key]?.origin ?? centeredOrigin(windowSize: f.size, on: screen)
+                        setPosition(e, origin)
+                        f.origin = origin
+                    }
                 } else if !parkedNow {
                     homeScreens[key] = screen
-                    if savedFrames[key] == nil || floating.contains(key) {
+                    if savedFrames[key] == nil || floating.contains(key) || !isResizable {
                         savedFrames[key] = f
                     }
                 }
 
-                let win = Window(element: e, pid: app.processIdentifier, bundleID: app.bundleIdentifier, screen: screen)
+                let win = Window(
+                    element: e,
+                    pid: app.processIdentifier,
+                    bundleID: app.bundleIdentifier,
+                    screen: screen,
+                    isResizable: isResizable
+                )
                 found.append(win)
                 nextMap[key] = win
             }
@@ -543,7 +567,7 @@ final class Manager {
 
             let nextActiveWindows = virtualEngine.activeWindows.compactMap { nextMap[$0] }
             let activeChanged = nextActiveWindows.count != windows.count || zip(nextActiveWindows, windows).contains {
-                !CFEqual($0.element, $1.element) || $0.screen != $1.screen
+                !CFEqual($0.element, $1.element) || $0.screen != $1.screen || $0.isResizable != $1.isResizable
             }
 
             windows = nextActiveWindows
@@ -616,22 +640,28 @@ final class Manager {
         let ratio = currentRatio
         let masters = currentMasters
 
-        // 1. Unpark any floating windows belonging to the active workspace
+        // 1. Unpark any floating (or fixed-size) windows belonging to the active workspace
         if isVirtualMode {
-            for w in windows where floating.contains(w.key) {
+            for w in windows where isFloating(w) {
                 let fullAX = fullScreenRect(w.screen)
                 if parkedKeys.contains(w.key) || (frame(w.element).map { isParkedWindowFrame($0, screen: fullAX) } ?? false) {
-                    let restored = savedFrames[w.key] ?? centeredFrame(size: frame(w.element)?.size ?? CGSize(width: 800, height: 600), on: w.screen)
-                    setFrame(w.element, restored)
+                    if w.isResizable {
+                        let restored = savedFrames[w.key] ?? centeredFrame(size: frame(w.element)?.size ?? CGSize(width: 800, height: 600), on: w.screen)
+                        setFrame(w.element, restored)
+                    } else {
+                        let currentSize = frame(w.element)?.size ?? savedFrames[w.key]?.size ?? CGSize(width: 800, height: 600)
+                        let origin = savedFrames[w.key]?.origin ?? centeredOrigin(windowSize: currentSize, on: w.screen)
+                        setPosition(w.element, origin)
+                    }
                     parkedKeys.remove(w.key)
                 }
             }
         }
 
-        // 2. Tile non-floating windows on each display
+        // 2. Tile resizable non-floating windows on each display
         for screen in screens {
             let group = windows.filter { window in
-                window.screen == screen && !floating.contains(window.key)
+                window.screen == screen && !isFloating(window)
             }
             guard !group.isEmpty else { continue }
             let area = screenRect(screen)
@@ -658,7 +688,7 @@ final class Manager {
                 guard let w = windowByKey[key], let f = frame(w.element) else { continue }
                 let fullAX = fullScreenRect(w.screen)
                 if !isParkedWindowFrame(f, screen: fullAX) {
-                    if floating.contains(key) || savedFrames[key] == nil {
+                    if !w.isResizable || floating.contains(key) || savedFrames[key] == nil {
                         savedFrames[key] = f
                     }
                     let origin = parkedWindowOrigin(windowSize: f.size, screen: fullAX, allScreens: allFullRects)
@@ -791,7 +821,7 @@ final class Manager {
 
         switch code {
         case UInt32(kVK_ANSI_T):
-            guard let i = focusedIndex() else { return }
+            guard let i = focusedIndex(), windows[i].isResizable else { return }
             let win = windows[i]
             if floating.contains(win.key) {
                 if let current = frame(win.element), !isParkedWindowFrame(current, screen: fullScreenRect(win.screen)) {
@@ -824,9 +854,9 @@ final class Manager {
         case UInt32(kVK_ANSI_J), UInt32(kVK_ANSI_K):
             guard let i = focusedIndex(), windows.count > 1 else { return }
             if shift {
-                // Swap operates on tiled (non-floating) windows on the focused display
+                // Swap operates on tiled (resizable, non-floating) windows on the focused display
                 let indices = windows.indices.filter {
-                    windows[$0].screen == windows[i].screen && !floating.contains(windows[$0].key)
+                    windows[$0].screen == windows[i].screen && !isFloating(windows[$0])
                 }
                 guard let p = indices.firstIndex(of: i), indices.count > 1 else { return }
                 let next = indices[(p + (code == UInt32(kVK_ANSI_J) ? 1 : indices.count - 1)) % indices.count]
@@ -851,9 +881,9 @@ final class Manager {
             }
         case UInt32(kVK_Return):
             guard let i = focusedIndex(),
-                  !floating.contains(windows[i].key),
+                  !isFloating(windows[i]),
                   let first = windows.indices.first(where: {
-                      windows[$0].screen == windows[i].screen && !floating.contains(windows[$0].key)
+                      windows[$0].screen == windows[i].screen && !isFloating(windows[$0])
                   }),
                   first != i
             else { return }

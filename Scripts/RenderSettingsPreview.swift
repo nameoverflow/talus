@@ -20,6 +20,7 @@ import SwiftUI
         [workspaces]
         mode = "virtual"
         count = 5
+        labels = ["终端", "网页", "代码", "聊天", "杂项"]
 
         [layout]
         master_ratio = 0.52
@@ -30,15 +31,15 @@ import SwiftUI
         ignore_apps = ["com.apple.systempreferences", "com.apple.calculator"]
 
         [rules.app_workspaces]
-        "com.apple.Terminal" = 1
-        "com.apple.Safari" = 2
+        "com.apple.Terminal" = "终端"
+        "com.apple.Safari" = "网页"
+        "com.tencent.xinWeChat" = "聊天"
 
         [status]
         show_icon = true
-        space_labels = ["终端", "网页", "聊天"]
         template = "%spaces%  <fc=#0D9488>%layout%</fc> · %count%"
-        workspace_current = "<fc=#FFFFFF,#0F766E> %label%%fullscreen% </fc>"
-        workspace_other = " %label%%fullscreen% "
+        workspace_current = "<fc=#FFFFFF,#0F766E> %index%:%label%%fullscreen% </fc>"
+        workspace_other = " %index%:%label%%fullscreen% "
         """
         let config = try Configuration.decodeTOML(sampleTOML)
         let fakeDotfile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".talus.toml")
@@ -56,8 +57,8 @@ import SwiftUI
                         .environment(\.colorScheme, isDark ? .dark : .light)
                 }
 
-                let width: CGFloat = 636
-                let height: CGFloat = 696
+                let width: CGFloat = 656
+                let height: CGFloat = 712
                 let win = NSWindow(
                     contentRect: NSRect(x: 0, y: 0, width: width, height: height),
                     styleMask: [.borderless],
