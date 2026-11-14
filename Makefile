@@ -1,4 +1,6 @@
-.PHONY: all clean
+.PHONY: all clean app dist install setup-cert
+CERT_NAME ?= Talus Local Code Signing
+CODESIGN_IDENTITY ?= auto
 all: build/talus
 APP_SOURCES = Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/SettingsWindow.swift
 build/talus: $(APP_SOURCES)
@@ -39,12 +41,33 @@ build/Talus.icns: Scripts/DrawAppIcon.swift
 	  sips -z $$size $$size build/icon-master.png --out build/Talus.iconset/icon_$${name}.png >/dev/null; \
 	done
 	iconutil -c icns build/Talus.iconset -o $@
+setup-cert:
+	sh Scripts/setup-local-cert.sh "$(CERT_NAME)"
 app: build/talus Resources/Info.plist build/Talus.icns
 	mkdir -p build/Talus.app/Contents/MacOS build/Talus.app/Contents/Resources
 	cp build/talus build/Talus.app/Contents/MacOS/Talus
 	cp Resources/Info.plist build/Talus.app/Contents/Info.plist
 	cp build/Talus.icns build/Talus.app/Contents/Resources/Talus.icns
-	codesign --force --sign - build/Talus.app
+	@id="$$(sh Scripts/resolve-codesign-identity.sh "$(CODESIGN_IDENTITY)" "$(CERT_NAME)")"; \
+	echo "Signing build/Talus.app with identity: $$id"; \
+	codesign --force --sign "$$id" build/Talus.app
+install: app
+	pkill -TERM -x Talus || true
+	sleep 0.6
+	rm -rf /Applications/Talus.app
+	cp -R build/Talus.app /Applications/Talus.app
+	open -g /Applications/Talus.app
+dist: build/talus Resources/Info.plist build/Talus.icns
+	rm -rf build/dist build/Talus-macos.zip
+	mkdir -p build/dist/Talus.app/Contents/MacOS build/dist/Talus.app/Contents/Resources
+	cp build/talus build/dist/Talus.app/Contents/MacOS/Talus
+	cp Resources/Info.plist build/dist/Talus.app/Contents/Info.plist
+	cp build/Talus.icns build/dist/Talus.app/Contents/Resources/Talus.icns
+	@id="$$(sh Scripts/resolve-codesign-identity.sh dist "$(CERT_NAME)")"; \
+	echo "Signing distributable build/dist/Talus.app with identity: $$id"; \
+	codesign --force --sign "$$id" build/dist/Talus.app
+	ditto -c -k --keepParent build/dist/Talus.app build/Talus-macos.zip
+	@echo "Built distributable archive: build/Talus-macos.zip"
 toml-test:
 	mkdir -p build
 	swiftc Sources/TOML.swift Tests/TOMLTests.swift -o build/toml-tests
