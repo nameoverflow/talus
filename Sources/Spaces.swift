@@ -6,6 +6,14 @@ struct SpaceEntry: Equatable, Codable {
     let id: UInt64
     let isCurrent: Bool
     let isFullscreen: Bool
+    var windowCount: Int? = nil
+
+    init(id: UInt64, isCurrent: Bool, isFullscreen: Bool, windowCount: Int? = nil) {
+        self.id = id
+        self.isCurrent = isCurrent
+        self.isFullscreen = isFullscreen
+        self.windowCount = windowCount
+    }
 }
 
 /// SkyLight has no public equivalent for enumerating native Mission Control

@@ -6,7 +6,7 @@ Build and test with `make all test` on macOS with Xcode Command Line Tools. `mak
 
 Control-Option J/K focuses the next/previous window on the screen; add Shift to swap. Return swaps the focused window with master. H/L changes the master width. Comma/period changes the master count; Space cycles Tall, Mirror Tall, and Full; T toggles floating for the focused window. Window creation/destruction uses Accessibility notifications with a two-second fallback reconciliation.
 
-Current prototype: Tall, Mirror Tall, and Full; uses macOS Spaces for desktop switching, and retains window ordering across a Space switch while running. No Talus workspace shortcuts, automatic window-title floating rules, or login startup. Native Spaces switching and moving windows between them are handled by macOS. Individual applications can reject requested frames or omit notifications; real multi-app, multi-monitor and performance behavior remains to be tested. The program does not currently restore window positions on exit.
+Current features: Tall, Mirror Tall, and Full layouts; switchable **native Spaces** (`mode = "native"`) or **Talus virtual workspaces** (`mode = "virtual"`, `count = 1..9`) with instant `<Mod>+1..9` workspace switching, `<Mod>+Shift+1..9` window throwing, independent per-workspace layout state, and automatic restoration of parked windows on quit or mode switch.
 
 ## Configuration (TOML Dotfile & Graphical Settings UI)
 
@@ -23,6 +23,10 @@ Example `~/.talus.toml`:
 
 ```toml
 modifiers = ["option"]
+
+[workspaces]
+mode = "virtual"
+count = 5
 
 [layout]
 master_ratio = 0.5

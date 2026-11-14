@@ -40,7 +40,8 @@ func configuredStatusImage(parts: [StatusPart], dark: Bool, showIcon: Bool = tru
             guard x < width else { break }
             let part = parts[index], style = part.style, w = metrics[index]
             let background = statusColor(style?.background)
-            let foreground = statusColor(style?.foreground) ?? defaultInk.withAlphaComponent(0.85)
+            let defaultAlpha: CGFloat = (style?.dimmed == true) ? 0.36 : 0.88
+            let foreground = statusColor(style?.foreground) ?? defaultInk.withAlphaComponent(defaultAlpha)
             if let background {
                 background.setFill()
                 NSBezierPath(rect:NSRect(x:x,y:1.5,width:w,height:15)).fill()

@@ -26,6 +26,10 @@ import Foundation
         let tomlInput = """
         modifiers = ["option"]
 
+        [workspaces]
+        mode = "virtual"
+        count = 6
+
         [layout]
         master_ratio = 0.6
         ratio_step = 0.05
@@ -55,6 +59,7 @@ import Foundation
         let parsedTOML = try Configuration.decodeTOML(tomlInput)
         try parsedTOML.validate()
         precondition(parsedTOML.modifiers == ["option"])
+        precondition(parsedTOML.workspaceMode == "virtual" && parsedTOML.workspaceCount == 6)
         precondition(parsedTOML.masterRatio == 0.6 && parsedTOML.ratioStep == 0.05 && parsedTOML.masterCount == 2)
         precondition(parsedTOML.ignoreApps == ["com.apple.systempreferences"])
         precondition(!parsedTOML.statusShowIcon && parsedTOML.spaceLabels == ["终端", "网页", "聊天"])
@@ -112,7 +117,18 @@ import Foundation
 
         let custom = try d.decode(Configuration.self, from: Data("{\"modifiers\":[\"command\"],\"masterRatio\":0.6,\"masterCount\":2,\"ignoreApps\":[\"com.example.app\"]}".utf8)); try custom.validate()
         precondition(custom.modifiers == ["command"] && custom.ignoreApps == ["com.example.app"])
-        for json in ["{\"modifiers\":[]}", "{\"modifiers\":[\"shift\"]}", "{\"masterRatio\":0.9}", "{\"masterCount\":0}", "{\"ratioStep\":0}", "{\"statusCommands\":[{\"name\":\"spaces\",\"executable\":\"/bin/echo\"}]}", "{\"statusCommands\":[{\"name\":\"a\",\"executable\":\"echo\"}]}"] {
+        for json in [
+            "{\"modifiers\":[]}",
+            "{\"modifiers\":[\"shift\"]}",
+            "{\"workspaceMode\":\"hybrid\"}",
+            "{\"workspaceCount\":0}",
+            "{\"workspaceCount\":10}",
+            "{\"masterRatio\":0.9}",
+            "{\"masterCount\":0}",
+            "{\"ratioStep\":0}",
+            "{\"statusCommands\":[{\"name\":\"spaces\",\"executable\":\"/bin/echo\"}]}",
+            "{\"statusCommands\":[{\"name\":\"a\",\"executable\":\"echo\"}]}"
+        ] {
             let config = try d.decode(Configuration.self, from: Data(json.utf8))
             do { try config.validate(); fatalError("invalid config was accepted") } catch { }
         }

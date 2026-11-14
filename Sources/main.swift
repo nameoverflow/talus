@@ -3,7 +3,30 @@ import ApplicationServices
 import Carbon
 import Darwin
 
-struct Window { let element: AXUIElement; let pid: pid_t; let screen: NSScreen }
+struct AXWindowKey: Hashable {
+    let element: AXUIElement
+
+    static func == (lhs: AXWindowKey, rhs: AXWindowKey) -> Bool {
+        CFEqual(lhs.element, rhs.element)
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(CFHash(element))
+    }
+}
+
+struct Window {
+    let element: AXUIElement
+    let pid: pid_t
+    let screen: NSScreen
+    var key: AXWindowKey { AXWindowKey(element: element) }
+}
+
+let workspaceDigitKeyCodes: [Int] = [
+    kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3,
+    kVK_ANSI_4, kVK_ANSI_5, kVK_ANSI_6,
+    kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9,
+]
 
 func axValue(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
     var result: CFTypeRef?
@@ -32,8 +55,21 @@ func setFrame(_ e: AXUIElement, _ r: CGRect) {
     }
 }
 
+func setPosition(_ e: AXUIElement, _ origin: CGPoint) {
+    var p = origin
+    if let position = AXValueCreate(.cgPoint, &p) {
+        AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, position)
+    }
+}
+
 func screenRect(_ screen: NSScreen) -> CGRect {
     let r = screen.visibleFrame
+    let top = NSScreen.screens.first?.frame.maxY ?? 0
+    return accessibilityFrame(visible: r, primaryTop: top)
+}
+
+func fullScreenRect(_ screen: NSScreen) -> CGRect {
+    let r = screen.frame
     let top = NSScreen.screens.first?.frame.maxY ?? 0
     return accessibilityFrame(visible: r, primaryTop: top)
 }
@@ -41,27 +77,92 @@ func screenRect(_ screen: NSScreen) -> CGRect {
 final class Manager {
     var windows: [Window] = []
     var history: [Window] = []
-    var floating: [AXUIElement] = []
-    var ratio = 0.5
-    var masters = 1
+    var floating: Set<AXWindowKey> = []
+    var savedFrames: [AXWindowKey: CGRect] = [:]
+    var homeScreens: [AXWindowKey: NSScreen] = [:]
+    var parkedKeys: Set<AXWindowKey> = []
+    var windowByKey: [AXWindowKey: Window] = [:]
+
+    var workspaceMode: String
+    let virtualEngine: VirtualWorkspaceEngine<AXWindowKey>
+    private var virtualSeeded = false
+    var suppressExternalFocusUntil: Date = .distantPast
+
+    private var nativeRatio: Double
+    private var nativeMasters: Int
+    private var nativeLayoutMode = 0
+
     var paused = false
-    var layoutMode = 0
     var ignoredApps: Set<String>
     var ratioStep: Double
     let ownPID = ProcessInfo.processInfo.processIdentifier
 
+    var isVirtualMode: Bool { workspaceMode == "virtual" }
+
+    var currentLayoutMode: Int {
+        get { isVirtualMode ? virtualEngine.activeLayout.layoutMode : nativeLayoutMode }
+        set {
+            if isVirtualMode { virtualEngine.activeLayout.layoutMode = newValue }
+            else { nativeLayoutMode = newValue }
+        }
+    }
+
+    var currentRatio: Double {
+        get { isVirtualMode ? virtualEngine.activeLayout.ratio : nativeRatio }
+        set {
+            if isVirtualMode { virtualEngine.activeLayout.ratio = newValue }
+            else { nativeRatio = newValue }
+        }
+    }
+
+    var currentMasters: Int {
+        get { isVirtualMode ? virtualEngine.activeLayout.masters : nativeMasters }
+        set {
+            if isVirtualMode { virtualEngine.activeLayout.masters = newValue }
+            else { nativeMasters = newValue }
+        }
+    }
+
     init(config: Configuration) {
-        ratio = config.masterRatio
-        masters = config.masterCount
+        workspaceMode = config.workspaceMode
+        nativeRatio = config.masterRatio
+        nativeMasters = config.masterCount
         ratioStep = config.ratioStep
         ignoredApps = Set(config.ignoreApps)
+        virtualEngine = VirtualWorkspaceEngine(
+            count: config.workspaceCount,
+            defaultRatio: config.masterRatio,
+            defaultMasters: config.masterCount
+        )
     }
 
     func apply(config: Configuration) {
-        ratio = config.masterRatio
-        masters = config.masterCount
+        let wasVirtual = isVirtualMode
+        let willBeVirtual = (config.workspaceMode == "virtual")
+
+        nativeRatio = config.masterRatio
+        nativeMasters = config.masterCount
         ratioStep = config.ratioStep
         ignoredApps = Set(config.ignoreApps)
+        virtualEngine.updateDefaults(ratio: config.masterRatio, masters: config.masterCount)
+        virtualEngine.resizeCount(to: config.workspaceCount)
+
+        if wasVirtual && !willBeVirtual {
+            restoreAllParkedWindows()
+            workspaceMode = "native"
+            virtualSeeded = false
+        } else if !wasVirtual && willBeVirtual {
+            workspaceMode = "virtual"
+            let currentKeys = windows.map(\.key)
+            let focusedKey = lastFocused.map(AXWindowKey.init)
+            if !currentKeys.isEmpty {
+                virtualEngine.seedFromCurrentDesktop(currentKeys, focused: focusedKey)
+                virtualSeeded = true
+            }
+        } else {
+            workspaceMode = config.workspaceMode
+        }
+
         if AXIsProcessTrusted() {
             refresh(force: true)
         }
@@ -104,10 +205,14 @@ final class Manager {
         for application in applications where observers[application.processIdentifier] == nil {
             let pid = application.processIdentifier
             var observer: AXObserver?
-            let callback: AXObserverCallback = { _, _, _, context in
+            let callback: AXObserverCallback = { _, _, notification, context in
                 guard let context else { return }
                 let manager = Unmanaged<Manager>.fromOpaque(context).takeUnretainedValue()
-                manager.rememberFocus()
+                if notification as String == kAXFocusedWindowChangedNotification as String {
+                    manager.handleAXFocusNotification()
+                } else {
+                    manager.rememberFocus()
+                }
                 manager.scheduleRefresh()
             }
             guard AXObserverCreate(pid, callback, &observer) == .success, let observer else { continue }
@@ -122,8 +227,104 @@ final class Manager {
         }
     }
 
+    private func currentFrontmostAXWindow() -> AXWindowKey? {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != ownPID,
+              let focused = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
+              CFGetTypeID(focused) == AXUIElementGetTypeID()
+        else { return nil }
+        return AXWindowKey(element: focused as! AXUIElement)
+    }
+
+    func handleAXFocusNotification() {
+        guard isVirtualMode, !paused, Date() >= suppressExternalFocusUntil else {
+            rememberFocus()
+            return
+        }
+        if let frontKey = currentFrontmostAXWindow(),
+           virtualEngine.handleExternalFocus(frontKey) != nil {
+            lastFocused = frontKey.element
+            windows = virtualEngine.activeWindows.compactMap { windowByKey[$0] }
+            tile()
+            if let win = windowByKey[frontKey] {
+                focus(win)
+            }
+            statusChanged?()
+            return
+        }
+        rememberFocus()
+    }
+
+    func handleApplicationActivated(_ app: NSRunningApplication) {
+        guard isVirtualMode, !paused, AXIsProcessTrusted(),
+              app.processIdentifier != ownPID,
+              Date() >= suppressExternalFocusUntil
+        else { return }
+
+        let targetKey: AXWindowKey?
+        if let axFocused = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
+           CFGetTypeID(axFocused) == AXUIElementGetTypeID() {
+            targetKey = AXWindowKey(element: axFocused as! AXUIElement)
+        } else {
+            // Fallback: if app has a tracked window on an inactive workspace and none on active
+            let appKeys = virtualEngine.allWindows.filter { windowByKey[$0]?.pid == app.processIdentifier }
+            if !appKeys.contains(where: { virtualEngine.activeWindows.contains($0) }) {
+                targetKey = appKeys.first
+            } else {
+                targetKey = nil
+            }
+        }
+
+        if let targetKey, virtualEngine.handleExternalFocus(targetKey) != nil {
+            lastFocused = targetKey.element
+            windows = virtualEngine.activeWindows.compactMap { windowByKey[$0] }
+            tile()
+            if let win = windowByKey[targetKey] {
+                focus(win)
+            }
+            statusChanged?()
+        }
+    }
+
+    private func centeredFrame(size: CGSize, on screen: NSScreen) -> CGRect {
+        let area = screenRect(screen)
+        let w = min(max(240, size.width), area.width * 0.9)
+        let h = min(max(180, size.height), area.height * 0.9)
+        return CGRect(
+            x: area.minX + ((area.width - w) / 2).rounded(),
+            y: area.minY + ((area.height - h) / 2).rounded(),
+            width: w,
+            height: h
+        )
+    }
+
+    func restoreAllParkedWindows() {
+        guard AXIsProcessTrusted() else {
+            parkedKeys.removeAll()
+            return
+        }
+        var keysToRestore = parkedKeys
+        for (key, win) in windowByKey {
+            if let f = frame(win.element), isParkedWindowFrame(f, screen: fullScreenRect(win.screen)) {
+                keysToRestore.insert(key)
+            }
+        }
+        for key in keysToRestore {
+            let screen = windowByKey[key]?.screen ?? homeScreens[key] ?? NSScreen.main ?? NSScreen.screens.first
+            if let saved = savedFrames[key] {
+                setFrame(key.element, saved)
+            } else if let screen, let f = frame(key.element) {
+                setFrame(key.element, centeredFrame(size: f.size, on: screen))
+            }
+        }
+        parkedKeys.removeAll()
+    }
+
     func refresh(force: Bool = false) {
         guard !paused, AXIsProcessTrusted() else { return }
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return }
+
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         let visible = list.filter {
             ($0[kCGWindowLayer as String] as? Int) == 0 && ($0[kCGWindowAlpha as String] as? Double ?? 1) > 0
@@ -135,7 +336,10 @@ final class Manager {
             else { return nil }
             return (pid, rect)
         }
+
         var found: [Window] = []
+        var nextMap: [AXWindowKey: Window] = [:]
+
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && !app.isHidden {
             if app.processIdentifier == ownPID { continue }
             if let selectedPIDs = ProcessInfo.processInfo.environment["TALUS_TEST_PID"] {
@@ -146,14 +350,22 @@ final class Manager {
             let ax = AXUIElementCreateApplication(app.processIdentifier)
             guard let elements = axValue(ax, kAXWindowsAttribute as CFString) as? [AXUIElement] else { continue }
             for e in elements {
-                guard let f = frame(e), f.width > 100, f.height > 80,
+                guard var f = frame(e), f.width > 100, f.height > 80,
                       visible.contains(where: {
                           $0.0 == app.processIdentifier && abs($0.1.minX - f.minX) < 3 && abs($0.1.minY - f.minY) < 3
                               && abs($0.1.width - f.width) < 3 && abs($0.1.height - f.height) < 3
-                      }),
-                      let screen = NSScreen.screens.max(by: { screenRect($0).intersection(f).area < screenRect($1).intersection(f).area }),
-                      screenRect(screen).intersects(f)
+                      })
                 else { continue }
+
+                let key = AXWindowKey(element: e)
+                let resolvedScreen: NSScreen?
+                if let home = homeScreens[key], screens.contains(home), isParkedWindowFrame(f, screen: fullScreenRect(home)) {
+                    resolvedScreen = home
+                } else {
+                    resolvedScreen = screens.max(by: { fullScreenRect($0).intersection(f).area < fullScreenRect($1).intersection(f).area })
+                }
+                guard let screen = resolvedScreen, fullScreenRect(screen).intersects(f) else { continue }
+
                 if let sub = axValue(e, kAXSubroleAttribute as CFString) as? String, sub != kAXStandardWindowSubrole as String { continue }
                 if (axValue(e, kAXModalAttribute as CFString) as? Bool) == true { continue }
                 var canMove = DarwinBoolean(false); var canResize = DarwinBoolean(false)
@@ -161,10 +373,82 @@ final class Manager {
                       AXUIElementIsAttributeSettable(e, kAXSizeAttribute as CFString, &canResize) == .success,
                       canMove.boolValue, canResize.boolValue
                 else { continue }
-                found.append(Window(element: e, pid: app.processIdentifier, screen: screen))
+
+                let parkedNow = isParkedWindowFrame(f, screen: fullScreenRect(screen))
+                // Crash-recovery: if a window was stranded at a 1px corner from an earlier session, rescue it
+                if parkedNow && !parkedKeys.contains(key) {
+                    let rescued = savedFrames[key] ?? centeredFrame(size: f.size, on: screen)
+                    setFrame(e, rescued)
+                    f = rescued
+                } else if !parkedNow {
+                    homeScreens[key] = screen
+                    if savedFrames[key] == nil || floating.contains(key) {
+                        savedFrames[key] = f
+                    }
+                }
+
+                let win = Window(element: e, pid: app.processIdentifier, screen: screen)
+                found.append(win)
+                nextMap[key] = win
             }
         }
-        // Preserve stack order when AX returns windows in a different order.
+
+        windowByKey = nextMap
+
+        for win in found {
+            if let observer = observers[win.pid] {
+                AXObserverAddNotification(
+                    observer,
+                    win.element,
+                    kAXUIElementDestroyedNotification as CFString,
+                    Unmanaged.passUnretained(self).toOpaque()
+                )
+            }
+        }
+
+        if isVirtualMode {
+            let frontKey = Date() >= suppressExternalFocusUntil ? currentFrontmostAXWindow() : nil
+            if !virtualSeeded {
+                var orderedSeed = orderUsingHistory(found, history: history) { CFEqual($0.element, $1.element) }
+                for w in found where !orderedSeed.contains(where: { CFEqual($0.element, w.element) }) {
+                    orderedSeed.append(w)
+                }
+                virtualEngine.seedFromCurrentDesktop(orderedSeed.map(\.key), focused: frontKey)
+                virtualSeeded = true
+            }
+
+            let switchedExternally = frontKey.flatMap { virtualEngine.handleExternalFocus($0) } != nil
+            let stacksChanged = virtualEngine.reconcile(
+                discovered: found.map(\.key),
+                currentlyFocused: frontKey,
+                canInsertBeforeFocus: { [nextMap] newKey, anchorKey in
+                    nextMap[newKey]?.screen == nextMap[anchorKey]?.screen
+                }
+            )
+
+            let nextActiveWindows = virtualEngine.activeWindows.compactMap { nextMap[$0] }
+            let activeChanged = nextActiveWindows.count != windows.count || zip(nextActiveWindows, windows).contains {
+                !CFEqual($0.element, $1.element) || $0.screen != $1.screen
+            }
+
+            windows = nextActiveWindows
+            if let focused = virtualEngine.activeFocused {
+                lastFocused = focused.element
+            }
+            updateHistory(aliveKeys: Set(nextMap.keys))
+
+            if ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1" {
+                fputs("refresh(virtual) ws=\(virtualEngine.active + 1) active=\(windows.count) total=\(found.count) changed=\(stacksChanged || activeChanged)\n", stderr)
+            }
+
+            if stacksChanged || activeChanged || switchedExternally || force {
+                tile()
+            }
+            statusChanged?()
+            return
+        }
+
+        // Native Spaces mode: preserve stack order when AX returns windows in a different order.
         var ordered = orderUsingHistory(found, history: history) { CFEqual($0.element, $1.element) }
         for w in found where !history.contains(where: { CFEqual($0.element, w.element) }) {
             ordered.removeAll { CFEqual($0.element, w.element) }
@@ -181,64 +465,183 @@ final class Manager {
         }
         windows = ordered
         rememberFocus()
-        updateHistory()
-        for window in windows {
-            if let observer = observers[window.pid] {
-                AXObserverAddNotification(observer, window.element, kAXUIElementDestroyedNotification as CFString, Unmanaged.passUnretained(self).toOpaque())
-            }
-        }
+        updateHistory(aliveKeys: nil)
         if changed || force { tile() }
         statusChanged?()
     }
 
-    func updateHistory() {
+    func updateHistory(aliveKeys: Set<AXWindowKey>?) {
         history.removeAll { axValue($0.element, kAXRoleAttribute as CFString) == nil }
-        floating.removeAll { element in !history.contains { CFEqual($0.element, element) } }
         history = mergeHistory(history, current: windows) { CFEqual($0.element, $1.element) }
+        let knownAlive: Set<AXWindowKey>
+        if let aliveKeys {
+            knownAlive = aliveKeys.union(history.map(\.key))
+        } else {
+            knownAlive = Set(history.map(\.key))
+        }
+        floating = floating.filter { knownAlive.contains($0) }
+        savedFrames = savedFrames.filter { knownAlive.contains($0.key) }
+        homeScreens = homeScreens.filter { knownAlive.contains($0.key) }
+        parkedKeys = parkedKeys.filter { knownAlive.contains($0) }
     }
 
     func tile() {
-        for screen in NSScreen.screens {
+        let screens = NSScreen.screens
+        let mode = currentLayoutMode
+        let ratio = currentRatio
+        let masters = currentMasters
+
+        // 1. Unpark any floating windows belonging to the active workspace
+        if isVirtualMode {
+            for w in windows where floating.contains(w.key) {
+                let fullAX = fullScreenRect(w.screen)
+                if parkedKeys.contains(w.key) || (frame(w.element).map { isParkedWindowFrame($0, screen: fullAX) } ?? false) {
+                    let restored = savedFrames[w.key] ?? centeredFrame(size: frame(w.element)?.size ?? CGSize(width: 800, height: 600), on: w.screen)
+                    setFrame(w.element, restored)
+                    parkedKeys.remove(w.key)
+                }
+            }
+        }
+
+        // 2. Tile non-floating windows on each display
+        for screen in screens {
             let group = windows.filter { window in
-                window.screen == screen && !floating.contains { CFEqual($0, window.element) }
+                window.screen == screen && !floating.contains(window.key)
             }
             guard !group.isEmpty else { continue }
             let area = screenRect(screen)
             let rect = Rect(x: area.minX, y: area.minY, w: area.width, h: area.height)
             let rects: [Rect]?
-            switch layoutMode {
+            switch mode {
             case 1: rects = mirrorTallLayout(rect, group.count, masters, ratio)
             case 2: rects = Array(repeating: rect, count: group.count)
             default: rects = tallLayout(rect, group.count, masters, ratio)
             }
             guard let rects else { continue }
             let current = focusedIndex().map { windows[$0] }
-            for (w, r) in zip(group, rects) { setFrame(w.element, CGRect(x: r.x, y: r.y, width: r.w, height: r.h)) }
-            if layoutMode == 2, let current, current.screen == screen { focus(current) }
+            for (w, r) in zip(group, rects) {
+                setFrame(w.element, CGRect(x: r.x, y: r.y, width: r.w, height: r.h))
+                parkedKeys.remove(w.key)
+            }
+            if mode == 2, let current, current.screen == screen { focus(current) }
+        }
+
+        // 3. Park windows belonging to inactive virtual workspaces at 1px corner
+        if isVirtualMode {
+            let allFullRects = screens.map(fullScreenRect)
+            for key in virtualEngine.inactiveWindows {
+                guard let w = windowByKey[key], let f = frame(w.element) else { continue }
+                let fullAX = fullScreenRect(w.screen)
+                if !isParkedWindowFrame(f, screen: fullAX) {
+                    if floating.contains(key) || savedFrames[key] == nil {
+                        savedFrames[key] = f
+                    }
+                    let origin = parkedWindowOrigin(windowSize: f.size, screen: fullAX, allScreens: allFullRects)
+                    setPosition(w.element, origin)
+                }
+                parkedKeys.insert(key)
+            }
         }
     }
 
     func rememberFocus() {
         guard let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != ownPID,
               let focused = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
               let window = windows.first(where: { CFEqual($0.element, focused) })
         else { return }
         lastFocused = window.element
+        if isVirtualMode {
+            virtualEngine.setActiveFocus(window.key)
+        }
     }
 
     func focusedIndex() -> Int? {
-        guard let app = NSWorkspace.shared.frontmostApplication,
-              let e = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString)
-        else { return nil }
-        return windows.firstIndex { CFEqual($0.element, e) }
+        if let app = NSWorkspace.shared.frontmostApplication,
+           app.processIdentifier != ownPID,
+           let e = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
+           let idx = windows.firstIndex(where: { CFEqual($0.element, e) }) {
+            return idx
+        }
+        if isVirtualMode, let remembered = virtualEngine.activeFocused {
+            return windows.firstIndex { $0.key == remembered }
+        }
+        return nil
     }
 
     func focus(_ w: Window) {
         lastFocused = w.element
+        if isVirtualMode {
+            virtualEngine.setActiveFocus(w.key)
+        }
         NSRunningApplication(processIdentifier: w.pid)?.activate()
         AXUIElementPerformAction(w.element, kAXRaiseAction as CFString)
         AXUIElementSetAttributeValue(w.element, kAXMainAttribute as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(w.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    }
+
+    private func relinquishFocusForEmptyWorkspace() {
+        lastFocused = nil
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func switchWorkspace(_ index: Int) {
+        guard isVirtualMode, !paused, AXIsProcessTrusted() else { return }
+        guard (0..<virtualEngine.count).contains(index) else { return }
+        rememberFocus()
+        suppressExternalFocusUntil = Date().addingTimeInterval(0.45)
+
+        let changed = virtualEngine.switchTo(index)
+        if changed {
+            windows = virtualEngine.activeWindows.compactMap { windowByKey[$0] }
+            tile()
+        }
+        if let targetKey = virtualEngine.activeFocused, let targetWin = windowByKey[targetKey] {
+            focus(targetWin)
+        } else if windows.isEmpty {
+            relinquishFocusForEmptyWorkspace()
+        }
+        statusChanged?()
+    }
+
+    func moveWindowToWorkspace(_ index: Int) {
+        guard isVirtualMode, !paused, AXIsProcessTrusted() else { return }
+        guard (0..<virtualEngine.count).contains(index) else { return }
+        guard let i = focusedIndex() else { return }
+        let moving = windows[i]
+        suppressExternalFocusUntil = Date().addingTimeInterval(0.45)
+
+        let outcome = virtualEngine.moveWindow(moving.key, to: index)
+        guard outcome.moved else { return }
+
+        windows = virtualEngine.activeWindows.compactMap { windowByKey[$0] }
+        tile()
+
+        if let nextKey = outcome.nextFocusOnActive, let nextWin = windowByKey[nextKey] {
+            focus(nextWin)
+        } else {
+            relinquishFocusForEmptyWorkspace()
+        }
+        statusChanged?()
+    }
+
+    func virtualSpaceEntries() -> [SpaceEntry] {
+        (0..<virtualEngine.count).map { idx in
+            let count = virtualEngine.windowCount(in: idx)
+            let isFull = virtualEngine.layouts[idx].layoutMode == 2 && count > 0
+            return SpaceEntry(
+                id: UInt64(idx + 1),
+                isCurrent: idx == virtualEngine.active,
+                isFullscreen: isFull,
+                windowCount: count
+            )
+        }
+    }
+
+    private func syncActiveVirtualStackFromWindows() {
+        if isVirtualMode {
+            virtualEngine.replaceActiveStack(windows.map(\.key))
+        }
     }
 
     func key(_ code: UInt32, shift: Bool) {
@@ -249,36 +652,88 @@ final class Manager {
             return
         }
         guard !paused, AXIsProcessTrusted() else { return }
+
+        if isVirtualMode, let digitIndex = workspaceDigitKeyCodes.firstIndex(of: Int(code)), digitIndex < virtualEngine.count {
+            if shift {
+                moveWindowToWorkspace(digitIndex)
+            } else {
+                switchWorkspace(digitIndex)
+            }
+            return
+        }
+
         switch code {
         case UInt32(kVK_ANSI_T):
             guard let i = focusedIndex() else { return }
-            let element = windows[i].element
-            if let index = floating.firstIndex(where: { CFEqual($0, element) }) { floating.remove(at: index) }
-            else { floating.append(element) }
+            let win = windows[i]
+            if floating.contains(win.key) {
+                if let current = frame(win.element), !isParkedWindowFrame(current, screen: fullScreenRect(win.screen)) {
+                    savedFrames[win.key] = current
+                }
+                floating.remove(win.key)
+                tile()
+            } else {
+                floating.insert(win.key)
+                tile()
+                let restored = savedFrames[win.key] ?? centeredFrame(size: CGSize(width: 860, height: 600), on: win.screen)
+                setFrame(win.element, restored)
+                focus(win)
+            }
+        case UInt32(kVK_ANSI_H):
+            currentRatio = max(0.2, currentRatio - ratioStep)
             tile()
-        case UInt32(kVK_ANSI_H): ratio = max(0.2, ratio - ratioStep); tile()
-        case UInt32(kVK_ANSI_L): ratio = min(0.8, ratio + ratioStep); tile()
-        case UInt32(kVK_ANSI_Comma): masters += 1; tile()
-        case UInt32(kVK_ANSI_Period): masters = max(1, masters - 1); tile()
-        case UInt32(kVK_Space): layoutMode = (layoutMode + 1) % 3; tile()
+        case UInt32(kVK_ANSI_L):
+            currentRatio = min(0.8, currentRatio + ratioStep)
+            tile()
+        case UInt32(kVK_ANSI_Comma):
+            currentMasters += 1
+            tile()
+        case UInt32(kVK_ANSI_Period):
+            currentMasters = max(1, currentMasters - 1)
+            tile()
+        case UInt32(kVK_Space):
+            currentLayoutMode = (currentLayoutMode + 1) % 3
+            tile()
         case UInt32(kVK_ANSI_J), UInt32(kVK_ANSI_K):
             guard let i = focusedIndex(), windows.count > 1 else { return }
-            let indices = windows.indices.filter { windows[$0].screen == windows[i].screen }
-            guard let p = indices.firstIndex(of: i), indices.count > 1 else { return }
-            let next = indices[(p + (code == UInt32(kVK_ANSI_J) ? 1 : indices.count - 1)) % indices.count]
             if shift {
+                // Swap operates on tiled (non-floating) windows on the focused display
+                let indices = windows.indices.filter {
+                    windows[$0].screen == windows[i].screen && !floating.contains(windows[$0].key)
+                }
+                guard let p = indices.firstIndex(of: i), indices.count > 1 else { return }
+                let next = indices[(p + (code == UInt32(kVK_ANSI_J) ? 1 : indices.count - 1)) % indices.count]
                 let direction = code == UInt32(kVK_ANSI_J) ? 1 : -1
                 if (direction > 0 && p == indices.count - 1) || (direction < 0 && p == 0) {
                     var group = indices.map { windows[$0] }
                     if direction > 0 { group.insert(group.removeLast(), at: 0) }
                     else { group.append(group.removeFirst()) }
                     for (index, window) in zip(indices, group) { windows[index] = window }
-                } else { windows.swapAt(i, next) }
-                updateHistory(); tile()
-            } else { focus(windows[next]) }
+                } else {
+                    windows.swapAt(i, next)
+                }
+                syncActiveVirtualStackFromWindows()
+                updateHistory(aliveKeys: isVirtualMode ? Set(windowByKey.keys) : nil)
+                tile()
+            } else {
+                let indices = windows.indices.filter { windows[$0].screen == windows[i].screen }
+                guard let p = indices.firstIndex(of: i), indices.count > 1 else { return }
+                let next = indices[(p + (code == UInt32(kVK_ANSI_J) ? 1 : indices.count - 1)) % indices.count]
+                focus(windows[next])
+                if currentLayoutMode == 2 { tile() }
+            }
         case UInt32(kVK_Return):
-            guard let i = focusedIndex(), let first = windows.indices.first(where: { windows[$0].screen == windows[i].screen }) else { return }
-            windows.swapAt(i, first); updateHistory(); tile()
+            guard let i = focusedIndex(),
+                  !floating.contains(windows[i].key),
+                  let first = windows.indices.first(where: {
+                      windows[$0].screen == windows[i].screen && !floating.contains(windows[$0].key)
+                  }),
+                  first != i
+            else { return }
+            windows.swapAt(i, first)
+            syncActiveVirtualStackFromWindows()
+            updateHistory(aliveKeys: isVirtualMode ? Set(windowByKey.keys) : nil)
+            tile()
         default: break
         }
     }
@@ -289,7 +744,7 @@ extension CGRect { var area: CGFloat { isNull ? 0 : width * height } }
 final class HotkeyRegistry {
     private var refs: [EventHotKeyRef] = []
 
-    func apply(modifiers: [String]) {
+    func apply(modifiers: [String], workspaceMode: String, workspaceCount: Int) {
         for ref in refs { UnregisterEventHotKey(ref) }
         refs.removeAll()
         let modifierBits = modifiers.reduce(UInt32(0)) { result, name in
@@ -300,23 +755,34 @@ final class HotkeyRegistry {
             default: return result
             }
         }
-        let codes = [kVK_ANSI_H, kVK_ANSI_L, kVK_ANSI_J, kVK_ANSI_K, kVK_ANSI_Comma, kVK_ANSI_Period, kVK_Space, kVK_Return, kVK_ANSI_P, kVK_ANSI_T]
-        for code in codes {
+        let baseCodes = [kVK_ANSI_H, kVK_ANSI_L, kVK_ANSI_J, kVK_ANSI_K, kVK_ANSI_Comma, kVK_ANSI_Period, kVK_Space, kVK_Return, kVK_ANSI_P, kVK_ANSI_T]
+        for code in baseCodes {
             for shifted in ([kVK_ANSI_J, kVK_ANSI_K].contains(code) ? [false, true] : [false]) {
-                var ref: EventHotKeyRef?
-                let id = UInt32(code) | (shifted ? 0x10000 : 0)
-                let status = RegisterEventHotKey(
-                    UInt32(code),
-                    modifierBits | (shifted ? UInt32(shiftKey) : 0),
-                    EventHotKeyID(signature: 0x4d4f4e44, id: id),
-                    GetApplicationEventTarget(),
-                    0,
-                    &ref
-                )
-                if status != noErr { fputs("Could not register shortcut key \(code): \(status)\n", stderr) }
-                if let ref { refs.append(ref) }
+                registerKey(code: code, modifierBits: modifierBits, shifted: shifted)
             }
         }
+        if workspaceMode == "virtual" {
+            let clamped = min(9, max(1, workspaceCount))
+            for code in workspaceDigitKeyCodes.prefix(clamped) {
+                registerKey(code: code, modifierBits: modifierBits, shifted: false)
+                registerKey(code: code, modifierBits: modifierBits, shifted: true)
+            }
+        }
+    }
+
+    private func registerKey(code: Int, modifierBits: UInt32, shifted: Bool) {
+        var ref: EventHotKeyRef?
+        let id = UInt32(code) | (shifted ? 0x10000 : 0)
+        let status = RegisterEventHotKey(
+            UInt32(code),
+            modifierBits | (shifted ? UInt32(shiftKey) : 0),
+            EventHotKeyID(signature: 0x4d4f4e44, id: id),
+            GetApplicationEventTarget(),
+            0,
+            &ref
+        )
+        if status != noErr { fputs("Could not register shortcut key \(code): \(status)\n", stderr) }
+        if let ref { refs.append(ref) }
     }
 }
 
@@ -372,19 +838,23 @@ let supportDirectory = FileManager.default.homeDirectoryForCurrentUser.appending
 do { try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true) }
 catch { reportStartupError(title: "Talus cannot start", message: "Cannot create \(supportDirectory.path): \(error)") }
 
-let lockFD = open(supportDirectory.appendingPathComponent("talus.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, mode_t(0o600))
-if lockFD < 0 { reportStartupError(title: "Talus cannot start", message: "Cannot open the application lock file.") }
-if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
-    if openSettingsOnLaunch || Bundle.main.bundlePath.hasSuffix(".app") {
-        DistributedNotificationCenter.default().postNotificationName(
-            NSNotification.Name("local.talus.openSettings"),
-            object: nil,
-            userInfo: nil,
-            deliverImmediately: true
-        )
-        exit(0)
+let isAutomatedTest = ProcessInfo.processInfo.environment["TALUS_TEST_PID"] != nil
+var lockFD: Int32 = -1
+if !isAutomatedTest {
+    lockFD = open(supportDirectory.appendingPathComponent("talus.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, mode_t(0o600))
+    if lockFD < 0 { reportStartupError(title: "Talus cannot start", message: "Cannot open the application lock file.") }
+    if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
+        if openSettingsOnLaunch || Bundle.main.bundlePath.hasSuffix(".app") {
+            DistributedNotificationCenter.default().postNotificationName(
+                NSNotification.Name("local.talus.openSettings"),
+                object: nil,
+                userInfo: nil,
+                deliverImmediately: true
+            )
+            exit(0)
+        }
+        reportStartupError(title: "Talus is already running", message: "Use the existing Talus menu bar icon to pause, configure, or quit.")
     }
-    reportStartupError(title: "Talus is already running", message: "Use the existing Talus menu bar icon to pause, configure, or quit.")
 }
 
 let manager = Manager(config: currentConfig)
@@ -402,6 +872,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let axWarningItem = NSMenuItem(title: "⚠️ 授予辅助功能权限…", action: #selector(openAccessibilitySettings), keyEquivalent: "")
     let axSeparator = NSMenuItem.separator()
+    var workspaceMenuItems: [NSMenuItem] = []
+    let workspaceSeparator = NSMenuItem.separator()
     let pauseItem = NSMenuItem(title: "暂停平铺", action: #selector(togglePause), keyEquivalent: "")
     let settingsItem = NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ",")
     let openFileItem = NSMenuItem(title: "打开配置文件…", action: #selector(openConfigFile), keyEquivalent: "")
@@ -433,6 +905,17 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         axWarningItem.target = self
         menu.addItem(axWarningItem)
         menu.addItem(axSeparator)
+
+        for idx in 0..<9 {
+            let wsItem = NSMenuItem(title: "工作区 \(idx + 1)", action: #selector(selectVirtualWorkspace(_:)), keyEquivalent: "")
+            wsItem.tag = idx
+            wsItem.target = self
+            wsItem.isHidden = true
+            workspaceMenuItems.append(wsItem)
+            menu.addItem(wsItem)
+        }
+        workspaceSeparator.isHidden = true
+        menu.addItem(workspaceSeparator)
 
         pauseItem.target = self
         menu.addItem(pauseItem)
@@ -482,10 +965,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
         let names = ["Tall", "Mirror", "Full"]
         let custom = config.statusTextFile.map(readCustomStatus(at:)) ?? ""
-        let spaceList = spaces.spaces(for: screen)
+        let spaceList = manager.isVirtualMode ? manager.virtualSpaceEntries() : spaces.spaces(for: screen)
         let values = StatusValues(
             spaces: spaceList,
-            layout: names[manager.layoutMode],
+            layout: names[manager.currentLayoutMode],
             title: title,
             count: manager.windows.count,
             custom: custom,
@@ -536,10 +1019,35 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let trusted = AXIsProcessTrusted()
         axWarningItem.isHidden = trusted
         axSeparator.isHidden = trusted
+
+        if manager.isVirtualMode {
+            let count = manager.virtualEngine.count
+            for (idx, wsItem) in workspaceMenuItems.enumerated() {
+                if idx < count {
+                    let customLabel = idx < config.spaceLabels.count ? " · \(config.spaceLabels[idx])" : ""
+                    let winCount = manager.virtualEngine.windowCount(in: idx)
+                    let suffix = winCount > 0 ? "  (\(winCount))" : ""
+                    wsItem.title = "工作区 \(idx + 1)\(customLabel)\(suffix)"
+                    wsItem.state = (idx == manager.virtualEngine.active) ? .on : .off
+                    wsItem.isHidden = false
+                } else {
+                    wsItem.isHidden = true
+                }
+            }
+            workspaceSeparator.isHidden = false
+        } else {
+            for wsItem in workspaceMenuItems { wsItem.isHidden = true }
+            workspaceSeparator.isHidden = true
+        }
+
         pauseItem.title = manager.paused ? "恢复平铺" : "暂停平铺"
         openFileItem.title = "打开配置文件 (\(abbreviatedPath(currentResolution.saveURL)))"
     }
 
+    @objc func selectVirtualWorkspace(_ sender: NSMenuItem) {
+        manager.switchWorkspace(sender.tag)
+        updateStatus()
+    }
     @objc func openAccessibilitySettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
@@ -549,10 +1057,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     @objc func showSettings() { onOpenSettings?() }
     @objc func openConfigFile() { onOpenConfigFile?() }
     @objc func reloadConfigNow() { onReloadConfig?() }
-    @objc func quitApp() { settingsController?.viewModel.flushPendingSave(); commands.stopAll(); NSApp.terminate(nil) }
+    @objc func quitApp() {
+        settingsController?.viewModel.flushPendingSave()
+        manager.restoreAllParkedWindows()
+        commands.stopAll()
+        NSApp.terminate(nil)
+    }
 }
 
-let isAutomatedTest = ProcessInfo.processInfo.environment["TALUS_TEST_PID"] != nil
 let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: !isAutomatedTest] as CFDictionary
 var wasTrusted = AXIsProcessTrustedWithOptions(opts)
 if isAutomatedTest && !wasTrusted {
@@ -567,13 +1079,29 @@ app.setActivationPolicy(.accessory)
 let statusMenu = StatusMenu(config: currentConfig)
 manager.statusChanged = { [weak statusMenu] in statusMenu?.updateStatus() }
 
+NotificationCenter.default.addObserver(
+    forName: NSApplication.willTerminateNotification,
+    object: nil,
+    queue: .main
+) { _ in
+    settingsController?.viewModel.flushPendingSave()
+    manager.restoreAllParkedWindows()
+    statusMenu.commands.stopAll()
+}
+
 func applyLiveConfiguration(_ updated: Configuration, resolution: ConfigResolution) {
-    let modifiersChanged = updated.modifiers != currentConfig.modifiers
+    let hotkeysNeedUpdate = updated.modifiers != currentConfig.modifiers
+        || updated.workspaceMode != currentConfig.workspaceMode
+        || updated.workspaceCount != currentConfig.workspaceCount
     currentConfig = updated
     currentResolution = resolution
     manager.apply(config: updated)
-    if modifiersChanged {
-        hotkeys.apply(modifiers: updated.modifiers)
+    if hotkeysNeedUpdate && (!isAutomatedTest || ProcessInfo.processInfo.environment["TALUS_TEST_HOTKEYS"] == "1") {
+        hotkeys.apply(
+            modifiers: updated.modifiers,
+            workspaceMode: updated.workspaceMode,
+            workspaceCount: updated.workspaceCount
+        )
     }
     statusMenu.apply(config: updated)
 }
@@ -662,9 +1190,15 @@ let handler: EventHandlerUPP = { _, event, _ in
 }
 var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
 InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, nil)
-hotkeys.apply(modifiers: currentConfig.modifiers)
+if !isAutomatedTest || ProcessInfo.processInfo.environment["TALUS_TEST_HOTKEYS"] == "1" {
+    hotkeys.apply(
+        modifiers: currentConfig.modifiers,
+        workspaceMode: currentConfig.workspaceMode,
+        workspaceCount: currentConfig.workspaceCount
+    )
+}
 
-print("Running. \(currentConfig.modifiers.joined(separator: "+"))+P pauses; Control-C quits.")
+print("Running (\(currentConfig.workspaceMode) mode). \(currentConfig.modifiers.joined(separator: "+"))+P pauses; Control-C quits.")
 if wasTrusted {
     manager.observeApplications()
     manager.refresh(force: true)
@@ -686,6 +1220,16 @@ let tokens = [
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { statusMenu.updateStatus() }
         }
     }
+}
+let activationToken = workspace.addObserver(
+    forName: NSWorkspace.didActivateApplicationNotification,
+    object: nil,
+    queue: .main
+) { note in
+    if let activated = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+        manager.handleApplicationActivated(activated)
+    }
+    statusMenu.updateStatus()
 }
 
 // Reconcile windows, Accessibility grant changes, and external dotfile edits.
@@ -713,6 +1257,7 @@ let stopSignals = [SIGINT, SIGTERM].map { number -> DispatchSourceSignal in
     let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
     source.setEventHandler {
         settingsController?.viewModel.flushPendingSave()
+        manager.restoreAllParkedWindows()
         statusMenu.commands.stopAll()
         exit(0)
     }
@@ -721,4 +1266,5 @@ let stopSignals = [SIGINT, SIGTERM].map { number -> DispatchSourceSignal in
 }
 
 app.run()
+manager.restoreAllParkedWindows()
 statusMenu.commands.stopAll()

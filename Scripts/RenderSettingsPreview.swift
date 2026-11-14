@@ -17,8 +17,12 @@ import SwiftUI
         let sampleTOML = """
         modifiers = ["option"]
 
+        [workspaces]
+        mode = "virtual"
+        count = 5
+
         [layout]
-        master_ratio = 0.55
+        master_ratio = 0.52
         ratio_step = 0.03
         master_count = 1
 
@@ -28,16 +32,9 @@ import SwiftUI
         [status]
         show_icon = true
         space_labels = ["终端", "网页", "聊天"]
-        template = "%spaces%  <fc=#89CFC2>%layout%</fc>  %clock%"
-        workspace_current = "<fc=#10201E,#89CFC2> %label%%fullscreen% </fc>"
-        workspace_other = "%label%%fullscreen%"
-
-        [[status.commands]]
-        name = "clock"
-        executable = "/bin/date"
-        arguments = ["+%H:%M"]
-        interval = 30
-        timeout = 2
+        template = "%spaces%  <fc=#0D9488>%layout%</fc> · %count%"
+        workspace_current = "<fc=#FFFFFF,#0F766E> %label%%fullscreen% </fc>"
+        workspace_other = " %label%%fullscreen% "
         """
         let config = try Configuration.decodeTOML(sampleTOML)
         let fakeDotfile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".talus.toml")
@@ -56,7 +53,7 @@ import SwiftUI
                 }
 
                 let width: CGFloat = 636
-                let height: CGFloat = tab == .menubar ? 630 : 596
+                let height: CGFloat = 696
                 let win = NSWindow(
                     contentRect: NSRect(x: 0, y: 0, width: width, height: height),
                     styleMask: [.borderless],

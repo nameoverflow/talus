@@ -20,6 +20,8 @@ import Foundation
         precondition(vm.modifiers == ["option"])
 
         // Immediate save writes valid TOML dotfile
+        vm.workspaceMode = "virtual"
+        vm.workspaceCount = 6
         vm.masterRatioPercent = 58
         vm.spaceLabels = ["终端", "网页"]
         vm.addIgnoredApp("com.apple.systempreferences")
@@ -27,6 +29,7 @@ import Foundation
 
         let saved = try Configuration.load(from: saveURL)
         precondition(saved.modifiers == ["option"])
+        precondition(saved.workspaceMode == "virtual" && saved.workspaceCount == 6)
         precondition(abs(saved.masterRatio - 0.58) < 0.001)
         precondition(saved.spaceLabels == ["终端", "网页"])
         precondition(saved.ignoreApps == ["com.apple.systempreferences"])

@@ -28,6 +28,8 @@ struct IgnoredAppDisplay: Identifiable, Equatable {
 final class SettingsViewModel: ObservableObject {
     @Published var selectedTab: SettingsTab = .layout
     @Published var modifiers: [String]
+    @Published var workspaceMode: String
+    @Published var workspaceCount: Int
     @Published var masterRatioPercent: Double
     @Published var ratioStepPercent: Double
     @Published var masterCount: Int
@@ -84,6 +86,8 @@ final class SettingsViewModel: ObservableObject {
         self.saveURL = resolution.saveURL
         self.migratedFromJSON = resolution.migratedFromJSON
         self.modifiers = config.modifiers
+        self.workspaceMode = config.workspaceMode
+        self.workspaceCount = config.workspaceCount
         self.masterRatioPercent = (config.masterRatio * 100).rounded()
         self.ratioStepPercent = (config.ratioStep * 1000).rounded() / 10
         self.masterCount = config.masterCount
@@ -152,6 +156,8 @@ final class SettingsViewModel: ObservableObject {
         saveURL = resolution.saveURL
         migratedFromJSON = resolution.migratedFromJSON
         modifiers = config.modifiers
+        workspaceMode = config.workspaceMode
+        workspaceCount = config.workspaceCount
         masterRatioPercent = (config.masterRatio * 100).rounded()
         ratioStepPercent = (config.ratioStep * 1000).rounded() / 10
         masterCount = config.masterCount
@@ -194,6 +200,8 @@ final class SettingsViewModel: ObservableObject {
         var config = Configuration()
         let orderedMods = ["control", "option", "command"].filter { modifiers.contains($0) }
         config.modifiers = orderedMods.isEmpty ? ["option"] : orderedMods
+        config.workspaceMode = (workspaceMode == "virtual") ? "virtual" : "native"
+        config.workspaceCount = min(9, max(1, workspaceCount))
         config.masterRatio = min(0.8, max(0.2, (masterRatioPercent.rounded() / 100.0)))
         config.ratioStep = min(0.2, max(0.01, ((ratioStepPercent * 10).rounded() / 1000.0)))
         config.masterCount = min(20, max(1, masterCount))
@@ -351,16 +359,24 @@ final class SettingsViewModel: ObservableObject {
 
     func previewImage(dark: Bool) -> NSImage {
         let candidate = buildConfiguration()
-        let sampleSpaces = [
-            SpaceEntry(id: 1, isCurrent: true, isFullscreen: false),
-            SpaceEntry(id: 2, isCurrent: false, isFullscreen: false),
-            SpaceEntry(id: 3, isCurrent: false, isFullscreen: true),
-        ]
+        let sampleSpaces: [SpaceEntry]
+        if candidate.workspaceMode == "virtual" {
+            sampleSpaces = (0..<candidate.workspaceCount).map { idx in
+                let winCount = idx == 0 ? 2 : (idx == 1 ? 1 : 0)
+                return SpaceEntry(id: UInt64(idx + 1), isCurrent: idx == 0, isFullscreen: false, windowCount: winCount)
+            }
+        } else {
+            sampleSpaces = [
+                SpaceEntry(id: 1, isCurrent: true, isFullscreen: false),
+                SpaceEntry(id: 2, isCurrent: false, isFullscreen: false),
+                SpaceEntry(id: 3, isCurrent: false, isFullscreen: true),
+            ]
+        }
         let sampleValues = StatusValues(
             spaces: sampleSpaces,
             layout: "Tall",
             title: "Terminal",
-            count: 3,
+            count: candidate.workspaceMode == "virtual" ? 2 : 3,
             custom: "就绪",
             paused: false,
             spaceLabels: candidate.spaceLabels
@@ -408,6 +424,8 @@ final class SettingsViewModel: ObservableObject {
         if let cfgErr = error as? ConfigError {
             switch cfgErr {
             case .invalidModifiers: return "请至少选择一个快捷键修饰键"
+            case .invalidWorkspaceMode: return "工作区模式必须为原生空间或虚拟工作区"
+            case .invalidWorkspaceCount: return "虚拟工作区数量需在 1 到 9 之间"
             case .invalidRatio: return "主窗口占比需在 20% 到 80% 之间"
             case .invalidStep: return "每次调整步长需在 1% 到 20% 之间"
             case .invalidCount: return "主区窗口数需在 1 到 20 之间"
@@ -569,7 +587,7 @@ struct SettingsRootView: View {
             .padding(.vertical, 10)
             .background(.bar)
         }
-        .frame(minWidth: 590, idealWidth: 620, minHeight: 520, idealHeight: 560)
+        .frame(minWidth: 590, idealWidth: 620, minHeight: 560, idealHeight: 644)
     }
 }
 
@@ -609,6 +627,43 @@ private struct ShortcutsAndLayoutView: View {
 
     var body: some View {
         SectionCard(
+            title: "工作区模式",
+            subtitle: model.workspaceMode == "virtual"
+                ? "由 Talus 接管多工作区：支持快捷键无动画瞬切与一键移窗（退出时自动恢复所有窗口）。"
+                : "跟随 macOS 原生桌面空间（Mission Control），由系统快捷键或触控板滑动切换。"
+        ) {
+            HStack(spacing: 12) {
+                Picker("", selection: $model.workspaceMode) {
+                    Text("macOS 原生空间").tag("native")
+                    Text("Talus 虚拟工作区").tag("virtual")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 268)
+                .onChange(of: model.workspaceMode) { _, _ in
+                    model.notifyChanged(immediate: true)
+                }
+
+                Spacer()
+
+                if model.workspaceMode == "virtual" {
+                    HStack(spacing: 6) {
+                        Text("预设数量")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.secondary)
+                        Stepper(value: $model.workspaceCount, in: 1...9) {
+                            Text("\(model.workspaceCount) 个")
+                                .font(.system(size: 12.5, weight: .medium, design: .monospaced))
+                        }
+                        .onChange(of: model.workspaceCount) { _, _ in
+                            model.notifyChanged(immediate: true)
+                        }
+                    }
+                }
+            }
+        }
+
+        SectionCard(
             title: "快捷键修饰键",
             subtitle: "点选修饰键组合（也可一键切换常用方案）；至少保留一个修饰键。"
         ) {
@@ -636,6 +691,14 @@ private struct ShortcutsAndLayoutView: View {
 
             let prefix = model.modifierSymbolPrefix
             VStack(spacing: 6) {
+                if model.workspaceMode == "virtual" {
+                    let switchKeys = model.workspaceCount == 1 ? "\(prefix)1" : "\(prefix)1–\(model.workspaceCount)"
+                    let moveKeys = model.workspaceCount == 1 ? "\(prefix)⇧1" : "\(prefix)⇧1–\(model.workspaceCount)"
+                    HStack(spacing: 16) {
+                        ShortcutRow(keys: switchKeys, action: "瞬时切换工作区")
+                        ShortcutRow(keys: moveKeys, action: "将焦点窗口移至工作区")
+                    }
+                }
                 HStack(spacing: 16) {
                     ShortcutRow(keys: "\(prefix)J / \(prefix)K", action: "切换焦点窗口")
                     ShortcutRow(keys: "\(prefix)⇧J / \(prefix)⇧K", action: "移动交换窗口")
@@ -995,7 +1058,12 @@ private struct MenuBarSettingsView: View {
 
     var body: some View {
         // 1. Live actual renderer preview
-        SectionCard(title: "实时菜单栏预览", subtitle: "使用 Talus 实际矢量渲染器绘制（示例含 3 个桌面空间，第 3 个为全屏空间 •）") {
+        SectionCard(
+            title: "实时菜单栏预览",
+            subtitle: model.workspaceMode == "virtual"
+                ? "使用 Talus 实际矢量渲染器绘制（深色编号为有窗口的工作区，浅淡编号为空闲工作区）"
+                : "使用 Talus 实际矢量渲染器绘制（示例含 3 个桌面空间，第 3 个为全屏空间 •）"
+        ) {
             HStack(spacing: 12) {
                 MenuBarPreviewPill(label: "深色菜单栏", dark: true, image: model.previewImage(dark: true))
                 MenuBarPreviewPill(label: "浅色菜单栏", dark: false, image: model.previewImage(dark: false))
@@ -1453,7 +1521,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         win.title = "Talus 设置"
         win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         win.collectionBehavior = [.moveToActiveSpace]
-        win.setContentSize(NSSize(width: 620, height: 560))
+        win.setContentSize(NSSize(width: 620, height: 644))
         win.center()
         win.isReleasedWhenClosed = false
         win.delegate = self

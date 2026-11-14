@@ -75,9 +75,19 @@ func templateStatusParts(config: Configuration, values: StatusValues, commandOut
         for (index, entry) in entries.enumerated() {
             if index > 0 { output += literal(" ",inherited) }
             let label = index < values.spaceLabels.count ? values.spaceLabels[index] : String(index+1)
-            let fields = ["label":label,"index":String(index+1),"fullscreen":entry.isFullscreen ? "•" : ""]
+            let isOccupied = (entry.windowCount ?? 0) > 0
+            let fields = [
+                "label": label,
+                "index": String(index+1),
+                "fullscreen": entry.isFullscreen ? "•" : "",
+                "occupied": (!entry.isCurrent && isOccupied) ? "•" : "",
+            ]
             let workspaceTemplate = entry.isCurrent ? config.workspaceCurrent : config.workspaceOther
-            output += parseStatusMarkup(workspaceTemplate,fonts:config.statusFonts,fontSize:config.statusFontSize,initial:inherited,current:entry.isCurrent) { token, style in
+            var entryStyle = inherited ?? StatusSegmentStyle()
+            if !entry.isCurrent && entry.windowCount == 0 {
+                entryStyle.dimmed = true
+            }
+            output += parseStatusMarkup(workspaceTemplate,fonts:config.statusFonts,fontSize:config.statusFontSize,initial:entryStyle,current:entry.isCurrent) { token, style in
                 fields[token].map { literal($0,style,entry.isCurrent) }
             }
         }

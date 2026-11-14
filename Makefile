@@ -1,6 +1,6 @@
 .PHONY: all clean
 all: build/talus
-APP_SOURCES = Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/SettingsWindow.swift
+APP_SOURCES = Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/SettingsWindow.swift
 build/talus: $(APP_SOURCES)
 	mkdir -p build
 	swiftc -O $(APP_SOURCES) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework Carbon -framework ApplicationServices -o $@
@@ -61,7 +61,11 @@ integration-test: all
 	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
 	swiftc Tests/Integration/Probe.swift -o build/integration-probe
 	Tests/Integration/smoke.sh
-test: toml-test config-test settings-ui-test history-test stack-test screen-test
+virtual-workspace-test:
+	mkdir -p build
+	swiftc Sources/VirtualWorkspaces.swift Tests/VirtualWorkspaceTests.swift -o build/virtual-workspace-tests
+	build/virtual-workspace-tests
+test: toml-test config-test settings-ui-test virtual-workspace-test history-test stack-test screen-test
 multi-integration-test: all
 	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
 	swiftc Tests/Integration/MultiProbe.swift -o build/multi-probe

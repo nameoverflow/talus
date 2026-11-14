@@ -8,6 +8,8 @@ struct ConfigResolution: Equatable {
 
 struct Configuration: Codable, Equatable {
     var modifiers: [String] = ["control", "option"]
+    var workspaceMode: String = "native"
+    var workspaceCount: Int = 5
     var masterRatio: Double = 0.5
     var ratioStep: Double = 0.03
     var masterCount: Int = 1
@@ -25,7 +27,8 @@ struct Configuration: Codable, Equatable {
     var statusStateFile: String?
 
     private enum CodingKeys: String, CodingKey {
-        case modifiers, masterRatio, ratioStep, masterCount, ignoreApps
+        case modifiers, workspaceMode, workspaceCount
+        case masterRatio, ratioStep, masterCount, ignoreApps
         case statusFormat, statusTextFile, statusStateFile, statusTemplate
         case statusShowIcon, workspaceCurrent, workspaceOther, statusFonts
         case statusFontSize, statusCommands, spaceLabels
@@ -36,6 +39,8 @@ struct Configuration: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         modifiers = try values.decodeIfPresent([String].self, forKey: .modifiers) ?? modifiers
+        workspaceMode = try values.decodeIfPresent(String.self, forKey: .workspaceMode) ?? workspaceMode
+        workspaceCount = try values.decodeIfPresent(Int.self, forKey: .workspaceCount) ?? workspaceCount
         masterRatio = try values.decodeIfPresent(Double.self, forKey: .masterRatio) ?? masterRatio
         ratioStep = try values.decodeIfPresent(Double.self, forKey: .ratioStep) ?? ratioStep
         masterCount = try values.decodeIfPresent(Int.self, forKey: .masterCount) ?? masterCount
@@ -57,6 +62,12 @@ struct Configuration: Codable, Equatable {
         let allowed = Set(["control", "option", "command"])
         guard !modifiers.isEmpty, Set(modifiers).count == modifiers.count, Set(modifiers).isSubset(of: allowed) else {
             throw ConfigError.invalidModifiers
+        }
+        guard workspaceMode == "native" || workspaceMode == "virtual" else {
+            throw ConfigError.invalidWorkspaceMode
+        }
+        guard (1...9).contains(workspaceCount) else {
+            throw ConfigError.invalidWorkspaceCount
         }
         guard masterRatio >= 0.2 && masterRatio <= 0.8 else { throw ConfigError.invalidRatio }
         guard ratioStep > 0 && ratioStep <= 0.2 else { throw ConfigError.invalidStep }
@@ -241,6 +252,12 @@ struct Configuration: Codable, Equatable {
             case "modifiers":
                 try claim("modifiers", keyLabel: key)
                 config.modifiers = try requireStringArray(value, key: key)
+            case "workspace_mode", "workspaceMode":
+                try claim("workspaceMode", keyLabel: key)
+                config.workspaceMode = try requireString(value, key: key)
+            case "workspace_count", "workspaceCount":
+                try claim("workspaceCount", keyLabel: key)
+                config.workspaceCount = try requireInt(value, key: key)
             case "master_ratio", "masterRatio":
                 try claim("masterRatio", keyLabel: key)
                 config.masterRatio = try requireDouble(value, key: key)
@@ -296,6 +313,24 @@ struct Configuration: Codable, Equatable {
                         config.modifiers = try requireStringArray(sv, key: "\(key).\(sk)")
                     default:
                         throw ConfigParseError("unknown key '\(key).\(sk)'")
+                    }
+                }
+
+            case "workspaces":
+                guard let sub = value.tableValue else { throw ConfigParseError("'workspaces' must be a table") }
+                for (sk, sv) in sub {
+                    switch sk {
+                    case "mode", "workspace_mode", "workspaceMode":
+                        try claim("workspaceMode", keyLabel: "workspaces.\(sk)")
+                        config.workspaceMode = try requireString(sv, key: "workspaces.\(sk)")
+                    case "count", "workspace_count", "workspaceCount":
+                        try claim("workspaceCount", keyLabel: "workspaces.\(sk)")
+                        config.workspaceCount = try requireInt(sv, key: "workspaces.\(sk)")
+                    case "labels", "space_labels", "spaceLabels":
+                        try claim("spaceLabels", keyLabel: "workspaces.\(sk)")
+                        config.spaceLabels = try requireStringArray(sv, key: "workspaces.\(sk)")
+                    default:
+                        throw ConfigParseError("unknown key 'workspaces.\(sk)'")
                     }
                 }
 
@@ -383,6 +418,12 @@ struct Configuration: Codable, Equatable {
         var lines: [String] = []
         lines.append("# Talus configuration (~/.talus.toml)")
         lines.append("modifiers = \(TOMLWriter.stringArray(modifiers))")
+        if workspaceMode != defaults.workspaceMode || workspaceCount != defaults.workspaceCount {
+            lines.append("")
+            lines.append("[workspaces]")
+            lines.append("mode = \(TOMLWriter.quote(workspaceMode))")
+            lines.append("count = \(workspaceCount)")
+        }
         lines.append("")
         lines.append("[layout]")
         lines.append("master_ratio = \(TOMLWriter.formatFloat(masterRatio))")
@@ -460,6 +501,8 @@ struct ConfigParseError: Error, CustomStringConvertible {
 
 enum ConfigError: String, Error, CustomStringConvertible {
     case invalidModifiers = "modifiers must be distinct control, option or command names"
+    case invalidWorkspaceMode = "workspaceMode must be 'native' or 'virtual'"
+    case invalidWorkspaceCount = "workspaceCount must be between 1 and 9"
     case invalidRatio = "masterRatio must be between 0.2 and 0.8"
     case invalidStep = "ratioStep must be greater than 0 and at most 0.2"
     case invalidStatusCommand = "invalid status command: check name, executable, arguments, interval and timeout"

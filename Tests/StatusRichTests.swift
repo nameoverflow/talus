@@ -38,6 +38,21 @@ import AppKit
     precondition(malformed.map(\.text).joined() == "x<fc=bogus>y</fc>")
     let literal = parseStatusMarkup("100%%",fonts:[],fontSize:11.5)
     precondition(literal.map(\.text).joined() == "100%")
+
+    // Virtual workspace entries: occupied non-current stays full contrast; empty non-current dims
+    var vConfig = Configuration()
+    vConfig.workspaceMode = "virtual"
+    vConfig.workspaceOther = " %label%%occupied% "
+    let vSpaces = [
+        SpaceEntry(id:1, isCurrent:true, isFullscreen:false, windowCount:2),
+        SpaceEntry(id:2, isCurrent:false, isFullscreen:false, windowCount:1),
+        SpaceEntry(id:3, isCurrent:false, isFullscreen:false, windowCount:0),
+    ]
+    let vValues = StatusValues(spaces:vSpaces, layout:"Tall", title:"", count:2, custom:"", paused:false)
+    let vParts = templateStatusParts(config:vConfig, values:vValues)
+    precondition(vParts.first { $0.text.contains("2•") }?.style?.dimmed == false)
+    precondition(vParts.first { $0.text.contains("3") }?.style?.dimmed == true)
+
     print("Status templates, colours, fonts and command markup tests passed")
  }
 }

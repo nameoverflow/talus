@@ -6,6 +6,7 @@ struct StatusSegmentStyle: Equatable {
     var background: String?
     var font: String?
     var fontSize: Double?
+    var dimmed: Bool = false
 }
 
 struct StatusCommand: Codable, Equatable {
@@ -36,7 +37,7 @@ struct StatusCommand: Codable, Equatable {
     }
 
     func validate() throws {
-        let reserved = ["spaces", "layout", "title", "count", "custom", "label", "index", "fullscreen"]
+        let reserved = ["spaces", "layout", "title", "count", "custom", "label", "index", "fullscreen", "occupied"]
         guard name.range(of: "^[A-Za-z][A-Za-z0-9_-]{0,31}$", options: .regularExpression) != nil,
               !reserved.contains(name), executable.hasPrefix("/"), executable.count <= 1024,
               (arguments?.count ?? 0) <= 32, (arguments ?? []).allSatisfy({ $0.count <= 1024 }),
