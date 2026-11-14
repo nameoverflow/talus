@@ -38,6 +38,10 @@ import Foundation
         [rules]
         ignore_apps = ["com.apple.systempreferences"]
 
+        [rules.app_workspaces]
+        "com.apple.Safari" = 2
+        "com.tencent.xinWeChat" = "聊天"
+
         [status]
         show_icon = false
         space_labels = ["终端", "网页", "聊天"]
@@ -62,6 +66,11 @@ import Foundation
         precondition(parsedTOML.workspaceMode == "virtual" && parsedTOML.workspaceCount == 6)
         precondition(parsedTOML.masterRatio == 0.6 && parsedTOML.ratioStep == 0.05 && parsedTOML.masterCount == 2)
         precondition(parsedTOML.ignoreApps == ["com.apple.systempreferences"])
+        precondition(parsedTOML.appWorkspaces["com.apple.Safari"] == .index(2))
+        precondition(parsedTOML.appWorkspaces["com.tencent.xinWeChat"] == .label("聊天"))
+        precondition(parsedTOML.appWorkspaces["com.apple.Safari"]?.resolve(workspaceCount: 6, spaceLabels: parsedTOML.spaceLabels) == 1)
+        precondition(parsedTOML.appWorkspaces["com.tencent.xinWeChat"]?.resolve(workspaceCount: 6, spaceLabels: parsedTOML.spaceLabels) == 2)
+        precondition(WorkspaceTarget.label("unknown").resolve(workspaceCount: 6, spaceLabels: parsedTOML.spaceLabels) == nil)
         precondition(!parsedTOML.statusShowIcon && parsedTOML.spaceLabels == ["终端", "网页", "聊天"])
         precondition(parsedTOML.statusCommands.count == 1 && parsedTOML.statusCommands[0].onChange == true)
 
@@ -123,6 +132,10 @@ import Foundation
             "{\"workspaceMode\":\"hybrid\"}",
             "{\"workspaceCount\":0}",
             "{\"workspaceCount\":10}",
+            "{\"appWorkspaces\":{\"com.apple.Safari\":0}}",
+            "{\"appWorkspaces\":{\"com.apple.Safari\":12}}",
+            "{\"appWorkspaces\":{\"com.apple.Safari\":\"\"}}",
+            "{\"appWorkspaces\":{\"\":2}}",
             "{\"masterRatio\":0.9}",
             "{\"masterCount\":0}",
             "{\"ratioStep\":0}",

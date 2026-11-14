@@ -63,6 +63,39 @@ import Foundation
         precondition(abs(engine.layouts[0].ratio - 0.65) < 0.0001)
         precondition(abs(engine.layouts[1].ratio - 0.60) < 0.0001 && engine.layouts[1].masters == 2)
 
+        // 10. App auto-shift (`doShift`) on seed and on new window creation
+        let routed = VirtualWorkspaceEngine<String>(count: 4, defaultRatio: 0.5, defaultMasters: 1)
+        let rule: (String) -> Int? = { win in
+            if win.hasPrefix("safari:") { return 1 }
+            if win.hasPrefix("chat:") { return 3 }
+            return nil
+        }
+        routed.seedFromCurrentDesktop(["term:1", "safari:1"], focused: "term:1", assignedWorkspace: rule)
+        precondition(routed.active == 0)
+        precondition(routed.activeWindows == ["term:1"])
+        precondition(routed.stacks[1] == ["safari:1"])
+
+        // New chat window appears and briefly reports currentlyFocused == "chat:1":
+        // reconcile routes it to workspace 3, keeps active == 0 & activeFocused == "term:1", and reports autoShiftedOffActive
+        let rec = routed.reconcile(
+            discovered: ["term:1", "safari:1", "chat:1"],
+            currentlyFocused: "chat:1",
+            assignedWorkspace: rule
+        )
+        precondition(rec.changed && rec.autoShiftedOffActive == ["chat:1"])
+        precondition(routed.active == 0 && routed.activeFocused == "term:1")
+        precondition(routed.stacks[3] == ["chat:1"] && routed.focusedByWorkspace[3] == "chat:1")
+
+        // Manual move of "safari:1" to workspace 0 is NOT overridden on subsequent reconcile!
+        _ = routed.moveWindow("safari:1", to: 0)
+        let rec2 = routed.reconcile(
+            discovered: ["term:1", "safari:1", "chat:1"],
+            currentlyFocused: "safari:1",
+            assignedWorkspace: rule
+        )
+        precondition(!rec2.changed && rec2.autoShiftedOffActive.isEmpty)
+        precondition(routed.stacks[0].contains("safari:1"))
+
         print("Virtual workspace engine tests passed")
     }
 }

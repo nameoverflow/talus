@@ -73,18 +73,27 @@ final class VirtualWorkspaceEngine<ID: Hashable> {
         return stacks[workspace].count
     }
 
-    func seedFromCurrentDesktop(_ orderedWindows: [ID], focused: ID?) {
+    func seedFromCurrentDesktop(
+        _ orderedWindows: [ID],
+        focused: ID?,
+        assignedWorkspace: (ID) -> Int? = { _ in nil }
+    ) {
         var seen: Set<ID> = []
         let unique = orderedWindows.filter { seen.insert($0).inserted }
         for idx in 0..<count {
             stacks[idx].removeAll()
         }
         focusedByWorkspace.removeAll()
-        stacks[active] = unique
-        if let focused, unique.contains(focused) {
-            focusedByWorkspace[active] = focused
-        } else if let first = unique.first {
-            focusedByWorkspace[active] = first
+        for id in unique {
+            let ws = assignedWorkspace(id).flatMap { (0..<count).contains($0) ? $0 : nil } ?? active
+            stacks[ws].append(id)
+        }
+        for ws in 0..<count where !stacks[ws].isEmpty {
+            if let focused, stacks[ws].contains(focused) {
+                focusedByWorkspace[ws] = focused
+            } else {
+                focusedByWorkspace[ws] = stacks[ws].first
+            }
         }
     }
 
@@ -135,14 +144,17 @@ final class VirtualWorkspaceEngine<ID: Hashable> {
     /// Reconciles live windows discovered by macOS with workspace stacks:
     /// - Removes closed windows from any workspace, shifting focus to a deterministic neighbor.
     /// - Preserves stack ordering of already-tracked windows.
-    /// - Inserts newly created windows onto `active` at the focused slot (XMonad style).
+    /// - Routes newly created windows matching an app rule directly to their assigned workspace (`doShift`),
+    ///   or inserts them onto `active` at the focused slot (XMonad style).
     @discardableResult
     func reconcile(
         discovered: [ID],
         currentlyFocused: ID?,
+        assignedWorkspace: (ID) -> Int? = { _ in nil },
         canInsertBeforeFocus: (ID, ID) -> Bool = { _, _ in true }
-    ) -> Bool {
+    ) -> (changed: Bool, autoShiftedOffActive: [ID]) {
         let beforeStacks = stacks
+        var autoShifted: [ID] = []
         var uniqueDiscovered: [ID] = []
         var seenDiscovered: Set<ID> = []
         for id in discovered where seenDiscovered.insert(id).inserted {
@@ -189,19 +201,26 @@ final class VirtualWorkspaceEngine<ID: Hashable> {
             focusedByWorkspace[active] = currentlyFocused
         }
 
-        // 3. Insert newly discovered windows onto `active` workspace
+        // 3. Route newly discovered windows either to their rule workspace (`doShift`) or onto `active`
         let anchorFocus = activeFocused
         for id in uniqueDiscovered where !assigned.contains(id) {
             assigned.insert(id)
-            if let anchor = anchorFocus,
-               let anchorIdx = stacks[active].firstIndex(of: anchor),
-               canInsertBeforeFocus(id, anchor) {
-                stacks[active].insert(id, at: anchorIdx)
+            let targetWS = assignedWorkspace(id).flatMap { (0..<count).contains($0) ? $0 : nil } ?? active
+            if targetWS != active {
+                stacks[targetWS].insert(id, at: 0)
+                focusedByWorkspace[targetWS] = id
+                autoShifted.append(id)
             } else {
-                stacks[active].append(id)
-            }
-            if currentlyFocused == id || focusedByWorkspace[active] == nil {
-                focusedByWorkspace[active] = id
+                if let anchor = anchorFocus,
+                   let anchorIdx = stacks[active].firstIndex(of: anchor),
+                   canInsertBeforeFocus(id, anchor) {
+                    stacks[active].insert(id, at: anchorIdx)
+                } else {
+                    stacks[active].append(id)
+                }
+                if currentlyFocused == id || focusedByWorkspace[active] == nil {
+                    focusedByWorkspace[active] = id
+                }
             }
         }
 
@@ -212,7 +231,7 @@ final class VirtualWorkspaceEngine<ID: Hashable> {
             focusedByWorkspace[active] = stacks[active].first
         }
 
-        return stacks != beforeStacks
+        return (stacks != beforeStacks, autoShifted)
     }
 
     @discardableResult

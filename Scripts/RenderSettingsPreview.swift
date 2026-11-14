@@ -27,7 +27,11 @@ import SwiftUI
         master_count = 1
 
         [rules]
-        ignore_apps = ["com.apple.systempreferences", "com.apple.calculator", "com.apple.ActivityMonitor"]
+        ignore_apps = ["com.apple.systempreferences", "com.apple.calculator"]
+
+        [rules.app_workspaces]
+        "com.apple.Terminal" = 1
+        "com.apple.Safari" = 2
 
         [status]
         show_icon = true

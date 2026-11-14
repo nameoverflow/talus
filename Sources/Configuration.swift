@@ -6,6 +6,50 @@ struct ConfigResolution: Equatable {
     let migratedFromJSON: Bool
 }
 
+enum WorkspaceTarget: Codable, Equatable {
+    case index(Int)
+    case label(String)
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let n = try? container.decode(Int.self) {
+            self = .index(n)
+        } else if let s = try? container.decode(String.self) {
+            self = .label(s)
+        } else {
+            throw DecodingError.typeMismatch(
+                WorkspaceTarget.self,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected workspace number (1..9) or label string")
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .index(let n): try container.encode(n)
+        case .label(let s): try container.encode(s)
+        }
+    }
+
+    /// Resolves to 0-based workspace index `0..<workspaceCount`, or nil if unmatched/out of range.
+    func resolve(workspaceCount: Int, spaceLabels: [String]) -> Int? {
+        switch self {
+        case .index(let n):
+            let idx = n - 1
+            return (0..<workspaceCount).contains(idx) ? idx : nil
+        case .label(let name):
+            if let match = spaceLabels.firstIndex(where: { $0 == name }) {
+                return (0..<workspaceCount).contains(match) ? match : nil
+            }
+            if let n = Int(name), (0..<workspaceCount).contains(n - 1) {
+                return n - 1
+            }
+            return nil
+        }
+    }
+}
+
 struct Configuration: Codable, Equatable {
     var modifiers: [String] = ["control", "option"]
     var workspaceMode: String = "native"
@@ -14,6 +58,7 @@ struct Configuration: Codable, Equatable {
     var ratioStep: Double = 0.03
     var masterCount: Int = 1
     var ignoreApps: [String] = []
+    var appWorkspaces: [String: WorkspaceTarget] = [:]
     var statusFormat: String = "{spaces}  {layout}"
     var statusTemplate: String?
     var statusShowIcon: Bool = true
@@ -28,7 +73,7 @@ struct Configuration: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case modifiers, workspaceMode, workspaceCount
-        case masterRatio, ratioStep, masterCount, ignoreApps
+        case masterRatio, ratioStep, masterCount, ignoreApps, appWorkspaces
         case statusFormat, statusTextFile, statusStateFile, statusTemplate
         case statusShowIcon, workspaceCurrent, workspaceOther, statusFonts
         case statusFontSize, statusCommands, spaceLabels
@@ -45,6 +90,7 @@ struct Configuration: Codable, Equatable {
         ratioStep = try values.decodeIfPresent(Double.self, forKey: .ratioStep) ?? ratioStep
         masterCount = try values.decodeIfPresent(Int.self, forKey: .masterCount) ?? masterCount
         ignoreApps = try values.decodeIfPresent([String].self, forKey: .ignoreApps) ?? ignoreApps
+        appWorkspaces = try values.decodeIfPresent([String: WorkspaceTarget].self, forKey: .appWorkspaces) ?? appWorkspaces
         statusFormat = try values.decodeIfPresent(String.self, forKey: .statusFormat) ?? statusFormat
         statusTemplate = try values.decodeIfPresent(String.self, forKey: .statusTemplate)
         statusShowIcon = try values.decodeIfPresent(Bool.self, forKey: .statusShowIcon) ?? statusShowIcon
@@ -68,6 +114,21 @@ struct Configuration: Codable, Equatable {
         }
         guard (1...9).contains(workspaceCount) else {
             throw ConfigError.invalidWorkspaceCount
+        }
+        guard appWorkspaces.count <= 64 else {
+            throw ConfigError.invalidAppWorkspace
+        }
+        for (bundle, target) in appWorkspaces {
+            let trimmed = bundle.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, bundle == trimmed, bundle.count <= 200 else {
+                throw ConfigError.invalidAppWorkspace
+            }
+            switch target {
+            case .index(let n):
+                guard (1...9).contains(n) else { throw ConfigError.invalidAppWorkspace }
+            case .label(let s):
+                guard !s.isEmpty, s.count <= 16 else { throw ConfigError.invalidAppWorkspace }
+            }
         }
         guard masterRatio >= 0.2 && masterRatio <= 0.8 else { throw ConfigError.invalidRatio }
         guard ratioStep > 0 && ratioStep <= 0.2 else { throw ConfigError.invalidStep }
@@ -246,6 +307,22 @@ struct Configuration: Codable, Equatable {
                 try parseCommand(item, prefix: "\(key)[\(idx)]")
             }
         }
+        func parseAppWorkspaces(_ val: TOMLValue, key: String) throws -> [String: WorkspaceTarget] {
+            guard let table = val.tableValue else {
+                throw ConfigParseError("'\(key)' must be a table mapping bundle IDs to workspace number or name")
+            }
+            var out: [String: WorkspaceTarget] = [:]
+            for (bundle, rawTarget) in table {
+                if let n = rawTarget.intValue {
+                    out[bundle] = .index(n)
+                } else if let s = rawTarget.stringValue {
+                    out[bundle] = .label(s)
+                } else {
+                    throw ConfigParseError("'\(key).\(bundle)' must be an integer (1..9) or workspace label string")
+                }
+            }
+            return out
+        }
 
         for (key, value) in root {
             switch key {
@@ -270,6 +347,9 @@ struct Configuration: Codable, Equatable {
             case "ignore_apps", "ignoreApps":
                 try claim("ignoreApps", keyLabel: key)
                 config.ignoreApps = try requireStringArray(value, key: key)
+            case "app_workspaces", "appWorkspaces":
+                try claim("appWorkspaces", keyLabel: key)
+                config.appWorkspaces = try parseAppWorkspaces(value, key: key)
             case "status_format", "statusFormat":
                 try claim("statusFormat", keyLabel: key)
                 config.statusFormat = try requireString(value, key: key)
@@ -359,6 +439,9 @@ struct Configuration: Codable, Equatable {
                     case "ignore_apps", "ignoreApps":
                         try claim("ignoreApps", keyLabel: "rules.\(sk)")
                         config.ignoreApps = try requireStringArray(sv, key: "rules.\(sk)")
+                    case "app_workspaces", "appWorkspaces", "assign", "workspaces":
+                        try claim("appWorkspaces", keyLabel: "rules.\(sk)")
+                        config.appWorkspaces = try parseAppWorkspaces(sv, key: "rules.\(sk)")
                     default:
                         throw ConfigParseError("unknown key 'rules.\(sk)'")
                     }
@@ -418,11 +501,15 @@ struct Configuration: Codable, Equatable {
         var lines: [String] = []
         lines.append("# Talus configuration (~/.talus.toml)")
         lines.append("modifiers = \(TOMLWriter.stringArray(modifiers))")
-        if workspaceMode != defaults.workspaceMode || workspaceCount != defaults.workspaceCount {
+        let hasWorkspacesSection = workspaceMode != defaults.workspaceMode || workspaceCount != defaults.workspaceCount
+        if hasWorkspacesSection {
             lines.append("")
             lines.append("[workspaces]")
             lines.append("mode = \(TOMLWriter.quote(workspaceMode))")
             lines.append("count = \(workspaceCount)")
+            if !spaceLabels.isEmpty {
+                lines.append("labels = \(TOMLWriter.stringArray(spaceLabels))")
+            }
         }
         lines.append("")
         lines.append("[layout]")
@@ -436,10 +523,24 @@ struct Configuration: Codable, Equatable {
             lines.append("ignore_apps = \(TOMLWriter.stringArray(ignoreApps))")
         }
 
+        if !appWorkspaces.isEmpty {
+            lines.append("")
+            lines.append("[rules.app_workspaces]")
+            for bundle in appWorkspaces.keys.sorted() {
+                guard let target = appWorkspaces[bundle] else { continue }
+                switch target {
+                case .index(let n):
+                    lines.append("\(TOMLWriter.quote(bundle)) = \(n)")
+                case .label(let s):
+                    lines.append("\(TOMLWriter.quote(bundle)) = \(TOMLWriter.quote(s))")
+                }
+            }
+        }
+
         lines.append("")
         lines.append("[status]")
         lines.append("show_icon = \(statusShowIcon ? "true" : "false")")
-        if !spaceLabels.isEmpty {
+        if !spaceLabels.isEmpty && !hasWorkspacesSection {
             lines.append("space_labels = \(TOMLWriter.stringArray(spaceLabels))")
         }
         if let template = statusTemplate {
@@ -503,6 +604,7 @@ enum ConfigError: String, Error, CustomStringConvertible {
     case invalidModifiers = "modifiers must be distinct control, option or command names"
     case invalidWorkspaceMode = "workspaceMode must be 'native' or 'virtual'"
     case invalidWorkspaceCount = "workspaceCount must be between 1 and 9"
+    case invalidAppWorkspace = "appWorkspaces entries must map non-empty bundle IDs to workspace 1..9 or a valid label"
     case invalidRatio = "masterRatio must be between 0.2 and 0.8"
     case invalidStep = "ratioStep must be greater than 0 and at most 0.2"
     case invalidStatusCommand = "invalid status command: check name, executable, arguments, interval and timeout"

@@ -38,6 +38,11 @@ final class SettingsViewModel: ObservableObject {
     @Published var manualBundleID: String = ""
     @Published var showManualBundleInput: Bool = false
 
+    @Published var appWorkspaces: [String: WorkspaceTarget]
+    @Published var manualAssignBundleID: String = ""
+    @Published var manualAssignWorkspace: Int = 2
+    @Published var showManualAssignInput: Bool = false
+
     @Published var statusShowIcon: Bool
     @Published var spaceLabels: [String]
     @Published var newSpaceLabel: String = ""
@@ -92,6 +97,7 @@ final class SettingsViewModel: ObservableObject {
         self.ratioStepPercent = (config.ratioStep * 1000).rounded() / 10
         self.masterCount = config.masterCount
         self.ignoreApps = config.ignoreApps
+        self.appWorkspaces = config.appWorkspaces
 
         self.statusShowIcon = config.statusShowIcon
         self.spaceLabels = config.spaceLabels
@@ -162,6 +168,7 @@ final class SettingsViewModel: ObservableObject {
         ratioStepPercent = (config.ratioStep * 1000).rounded() / 10
         masterCount = config.masterCount
         ignoreApps = config.ignoreApps
+        appWorkspaces = config.appWorkspaces
         statusShowIcon = config.statusShowIcon
         spaceLabels = config.spaceLabels
         legacyFormat = config.statusFormat
@@ -206,6 +213,7 @@ final class SettingsViewModel: ObservableObject {
         config.ratioStep = min(0.2, max(0.01, ((ratioStepPercent * 10).rounded() / 1000.0)))
         config.masterCount = min(20, max(1, masterCount))
         config.ignoreApps = ignoreApps
+        config.appWorkspaces = appWorkspaces
 
         config.statusShowIcon = statusShowIcon
         config.spaceLabels = spaceLabels.map { String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(16)) }.filter { !$0.isEmpty }
@@ -324,6 +332,7 @@ final class SettingsViewModel: ObservableObject {
     func addIgnoredApp(_ bundleID: String) {
         let trimmed = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !ignoreApps.contains(trimmed) else { return }
+        appWorkspaces.removeValue(forKey: trimmed)
         ignoreApps.append(trimmed)
         notifyChanged(immediate: true)
     }
@@ -331,6 +340,41 @@ final class SettingsViewModel: ObservableObject {
     func removeIgnoredApp(_ bundleID: String) {
         ignoreApps.removeAll { $0 == bundleID }
         notifyChanged(immediate: true)
+    }
+
+    func setAppWorkspace(_ bundleID: String, workspaceOneBased: Int) {
+        let trimmed = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let clamped = min(9, max(1, workspaceOneBased))
+        ignoreApps.removeAll { $0 == trimmed }
+        if case .label = appWorkspaces[trimmed], clamped - 1 < spaceLabels.count {
+            appWorkspaces[trimmed] = .label(spaceLabels[clamped - 1])
+        } else {
+            appWorkspaces[trimmed] = .index(clamped)
+        }
+        notifyChanged(immediate: true)
+    }
+
+    func removeAppWorkspace(_ bundleID: String) {
+        appWorkspaces.removeValue(forKey: bundleID)
+        notifyChanged(immediate: true)
+    }
+
+    func workspaceOptionTitle(oneBased: Int) -> String {
+        if oneBased - 1 >= 0, oneBased - 1 < spaceLabels.count {
+            return "工作区 \(oneBased) · \(spaceLabels[oneBased - 1])"
+        }
+        return "工作区 \(oneBased)"
+    }
+
+    func resolvedOneBasedWorkspace(for target: WorkspaceTarget) -> Int {
+        if let zeroBased = target.resolve(workspaceCount: 9, spaceLabels: spaceLabels) {
+            return min(max(1, workspaceCount), zeroBased + 1)
+        }
+        if case .index(let n) = target {
+            return min(max(1, workspaceCount), max(1, n))
+        }
+        return min(max(1, workspaceCount), 2)
     }
 
     func applyTemplatePreset(_ preset: String) {
@@ -426,6 +470,7 @@ final class SettingsViewModel: ObservableObject {
             case .invalidModifiers: return "请至少选择一个快捷键修饰键"
             case .invalidWorkspaceMode: return "工作区模式必须为原生空间或虚拟工作区"
             case .invalidWorkspaceCount: return "虚拟工作区数量需在 1 到 9 之间"
+            case .invalidAppWorkspace: return "应用自动归位规则无效：请检查 Bundle ID 与目标工作区（1–9 或有效名称）"
             case .invalidRatio: return "主窗口占比需在 20% 到 80% 之间"
             case .invalidStep: return "每次调整步长需在 1% 到 20% 之间"
             case .invalidCount: return "主区窗口数需在 1 到 20 之间"
@@ -489,7 +534,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var label: String {
         switch self {
         case .layout: return "快捷键与布局"
-        case .rules: return "忽略应用"
+        case .rules: return "应用规则"
         case .menubar: return "菜单栏"
         }
     }
@@ -531,7 +576,7 @@ struct SettingsRootView: View {
                     case .layout:
                         ShortcutsAndLayoutView(model: model)
                     case .rules:
-                        IgnoredAppsView(model: model)
+                        AppRulesView(model: model)
                     case .menubar:
                         MenuBarSettingsView(model: model)
                     }
@@ -894,8 +939,22 @@ private struct TilingPreviewDiagram: View {
     }
 }
 
-private struct IgnoredAppsView: View {
+private struct AppRulesView: View {
     @ObservedObject var model: SettingsViewModel
+
+    private var assignCandidates: [(name: String, bundleID: String)] {
+        let ownBundle = Bundle.main.bundleIdentifier ?? "local.talus.windowmanager"
+        var seen: Set<String> = Set(model.appWorkspaces.keys)
+        seen.insert(ownBundle)
+        var list: [(String, String)] = []
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            guard let bid = app.bundleIdentifier, !seen.contains(bid) else { continue }
+            seen.insert(bid)
+            let name = app.localizedName ?? bid
+            list.append((name, bid))
+        }
+        return list.sorted { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }
+    }
 
     private var runningCandidates: [(name: String, bundleID: String)] {
         let ownBundle = Bundle.main.bundleIdentifier ?? "local.talus.windowmanager"
@@ -913,8 +972,160 @@ private struct IgnoredAppsView: View {
 
     var body: some View {
         SectionCard(
+            title: "应用自动归入工作区",
+            subtitle: model.workspaceMode == "virtual"
+                ? "指定应用启动或新开窗口时，自动扔进目标工作区，焦点留在当前工作区（XMonad doShift）。"
+                : "当前处于 macOS 原生空间模式；开启「Talus 虚拟工作区」后以下自动归位规则自动生效。"
+        ) {
+            if model.workspaceMode != "virtual" {
+                HStack(spacing: 8) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.secondary)
+                    Text("自动归位仅在虚拟工作区模式下生效。")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("开启虚拟工作区") {
+                        model.workspaceMode = "virtual"
+                        model.notifyChanged(immediate: true)
+                    }
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.08))
+                )
+            }
+
+            HStack(spacing: 8) {
+                Menu {
+                    let candidates = assignCandidates
+                    if candidates.isEmpty {
+                        Text("当前没有其他可添加的运行中应用")
+                    } else {
+                        ForEach(candidates, id: \.bundleID) { item in
+                            Button("\(item.name)  (\(item.bundleID))") {
+                                model.setAppWorkspace(item.bundleID, workspaceOneBased: min(2, max(1, model.workspaceCount)))
+                            }
+                        }
+                    }
+                } label: {
+                    Label("从运行中的应用添加", systemImage: "plus.circle.fill")
+                }
+                .fixedSize()
+
+                Button {
+                    pickAssignedApplicationBundle()
+                } label: {
+                    Label("浏览应用程序…", systemImage: "folder")
+                }
+
+                Spacer()
+
+                Button(model.showManualAssignInput ? "收起手动输入" : "手动输入 ID") {
+                    model.showManualAssignInput.toggle()
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            }
+
+            if model.showManualAssignInput {
+                HStack(spacing: 8) {
+                    TextField("例如 com.apple.Safari", text: $model.manualAssignBundleID)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                        .onSubmit { submitManualAssign() }
+                    Picker("", selection: $model.manualAssignWorkspace) {
+                        ForEach(1...max(1, model.workspaceCount), id: \.self) { n in
+                            Text(model.workspaceOptionTitle(oneBased: n)).tag(n)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 148)
+                    Button("添加") { submitManualAssign() }
+                        .disabled(model.manualAssignBundleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+
+            let sortedKeys = model.appWorkspaces.keys.sorted()
+            if sortedKeys.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.tertiary)
+                    Text("尚未设置自动归位规则 — 添加后（如浏览器 → 工作区 2、微信 → 工作区 4），新窗口会自动落入目标工作区。")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 14)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.primary.opacity(0.03))
+                )
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(sortedKeys.enumerated()), id: \.element) { idx, bundleID in
+                        let info = resolveAppDisplay(bundleID: bundleID)
+                        let target = model.appWorkspaces[bundleID] ?? .index(1)
+                        HStack(spacing: 10) {
+                            Image(nsImage: info.icon)
+                                .resizable()
+                                .frame(width: 26, height: 26)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(info.name)
+                                    .font(.system(size: 12.5, weight: .medium))
+                                if info.name != info.bundleID {
+                                    Text(info.bundleID)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Image(systemName: "arrow.right")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                            Picker("", selection: Binding(
+                                get: { model.resolvedOneBasedWorkspace(for: target) },
+                                set: { newWS in model.setAppWorkspace(bundleID, workspaceOneBased: newWS) }
+                            )) {
+                                ForEach(1...max(1, model.workspaceCount), id: \.self) { n in
+                                    Text(model.workspaceOptionTitle(oneBased: n)).tag(n)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(width: 152)
+
+                            Button {
+                                model.removeAppWorkspace(bundleID)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("移除规则")
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        if idx + 1 < sortedKeys.count {
+                            Divider().padding(.leading, 44)
+                        }
+                    }
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.primary.opacity(0.03))
+                )
+            }
+        }
+
+        SectionCard(
             title: "不参与平铺的应用",
-            subtitle: "选中的应用窗口将保持自由尺寸与位置，不会被 Talus 自动缩放排布。"
+            subtitle: "选中的应用窗口将保持自由尺寸与位置，且在切换工作区时保持常驻不被隐藏。"
         ) {
             HStack(spacing: 8) {
                 Menu {
@@ -1017,6 +1228,30 @@ private struct IgnoredAppsView: View {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(Color.primary.opacity(0.03))
                 )
+            }
+        }
+    }
+
+    private func submitManualAssign() {
+        let trimmed = model.manualAssignBundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        model.setAppWorkspace(trimmed, workspaceOneBased: model.manualAssignWorkspace)
+        model.manualAssignBundleID = ""
+    }
+
+    private func pickAssignedApplicationBundle() {
+        let panel = NSOpenPanel()
+        panel.title = "选择自动归入工作区的应用程序"
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        if panel.runModal() == .OK {
+            let defaultTarget = min(2, max(1, model.workspaceCount))
+            for url in panel.urls {
+                if let bid = Bundle(url: url)?.bundleIdentifier {
+                    model.setAppWorkspace(bid, workspaceOneBased: defaultTarget)
+                }
             }
         }
     }

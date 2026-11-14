@@ -27,6 +27,7 @@ modifiers = ["option"]
 [workspaces]
 mode = "virtual"
 count = 5
+labels = ["term", "web", "code", "chat", "misc"]
 
 [layout]
 master_ratio = 0.5
@@ -35,6 +36,10 @@ master_count = 1
 
 [rules]
 ignore_apps = ["com.example.SomeApp"]
+
+[rules.app_workspaces]
+"com.apple.Safari" = "web"
+"com.apple.Terminal" = 1
 ```
 
 Every key is optional. Modifier names are `control`, `option`, and `command`; at least one is required, and Shift is reserved for swap shortcuts. Ratio must be 0.2–0.8, ratio step greater than zero and at most 0.2, and master count 1–20. `ignore_apps` contains application bundle identifiers. Invalid configuration at startup is reported on standard error (or via an alert when launched as an app); invalid edits while running are logged without crashing the running session.

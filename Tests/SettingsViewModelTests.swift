@@ -23,16 +23,25 @@ import Foundation
         vm.workspaceMode = "virtual"
         vm.workspaceCount = 6
         vm.masterRatioPercent = 58
-        vm.spaceLabels = ["终端", "网页"]
+        vm.spaceLabels = ["终端", "网页", "聊天"]
         vm.addIgnoredApp("com.apple.systempreferences")
+        vm.setAppWorkspace("com.apple.Safari", workspaceOneBased: 2)
+        // Mutual exclusion: setting appWorkspace on an ignored app removes it from ignoreApps
+        vm.addIgnoredApp("com.tencent.xinWeChat")
+        precondition(vm.ignoreApps.contains("com.tencent.xinWeChat"))
+        vm.setAppWorkspace("com.tencent.xinWeChat", workspaceOneBased: 3)
+        precondition(!vm.ignoreApps.contains("com.tencent.xinWeChat"))
         vm.notifyChanged(immediate: true)
 
         let saved = try Configuration.load(from: saveURL)
         precondition(saved.modifiers == ["option"])
         precondition(saved.workspaceMode == "virtual" && saved.workspaceCount == 6)
         precondition(abs(saved.masterRatio - 0.58) < 0.001)
-        precondition(saved.spaceLabels == ["终端", "网页"])
+        precondition(saved.spaceLabels == ["终端", "网页", "聊天"])
         precondition(saved.ignoreApps == ["com.apple.systempreferences"])
+        precondition(saved.appWorkspaces["com.apple.Safari"] == .index(2))
+        precondition(saved.appWorkspaces["com.tencent.xinWeChat"] == .index(3))
+        precondition(vm.workspaceOptionTitle(oneBased: 2) == "工作区 2 · 网页")
 
         // 2. Script mode detection & round-trip
         var scriptCfg = Configuration()

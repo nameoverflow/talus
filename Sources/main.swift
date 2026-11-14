@@ -18,6 +18,7 @@ struct AXWindowKey: Hashable {
 struct Window {
     let element: AXUIElement
     let pid: pid_t
+    let bundleID: String?
     let screen: NSScreen
     var key: AXWindowKey { AXWindowKey(element: element) }
 }
@@ -94,6 +95,8 @@ final class Manager {
 
     var paused = false
     var ignoredApps: Set<String>
+    var appWorkspaces: [String: WorkspaceTarget]
+    var spaceLabels: [String]
     var ratioStep: Double
     let ownPID = ProcessInfo.processInfo.processIdentifier
 
@@ -129,6 +132,8 @@ final class Manager {
         nativeMasters = config.masterCount
         ratioStep = config.ratioStep
         ignoredApps = Set(config.ignoreApps)
+        appWorkspaces = config.appWorkspaces
+        spaceLabels = config.spaceLabels
         virtualEngine = VirtualWorkspaceEngine(
             count: config.workspaceCount,
             defaultRatio: config.masterRatio,
@@ -136,14 +141,28 @@ final class Manager {
         )
     }
 
+    func assignedWorkspace(for bundleID: String?) -> Int? {
+        guard let bundleID, let target = appWorkspaces[bundleID] else { return nil }
+        return target.resolve(workspaceCount: virtualEngine.count, spaceLabels: spaceLabels)
+    }
+
     func apply(config: Configuration) {
         let wasVirtual = isVirtualMode
         let willBeVirtual = (config.workspaceMode == "virtual")
+
+        var previousResolved: [String: Int] = [:]
+        for (bundle, target) in appWorkspaces {
+            if let ws = target.resolve(workspaceCount: virtualEngine.count, spaceLabels: spaceLabels) {
+                previousResolved[bundle] = ws
+            }
+        }
 
         nativeRatio = config.masterRatio
         nativeMasters = config.masterCount
         ratioStep = config.ratioStep
         ignoredApps = Set(config.ignoreApps)
+        appWorkspaces = config.appWorkspaces
+        spaceLabels = config.spaceLabels
         virtualEngine.updateDefaults(ratio: config.masterRatio, masters: config.masterCount)
         virtualEngine.resizeCount(to: config.workspaceCount)
 
@@ -156,11 +175,44 @@ final class Manager {
             let currentKeys = windows.map(\.key)
             let focusedKey = lastFocused.map(AXWindowKey.init)
             if !currentKeys.isEmpty {
-                virtualEngine.seedFromCurrentDesktop(currentKeys, focused: focusedKey)
+                let lookup = windowByKey
+                virtualEngine.seedFromCurrentDesktop(
+                    currentKeys,
+                    focused: focusedKey,
+                    assignedWorkspace: { [weak self] key in
+                        self?.assignedWorkspace(for: lookup[key]?.bundleID)
+                    }
+                )
                 virtualSeeded = true
             }
         } else {
             workspaceMode = config.workspaceMode
+            if willBeVirtual && virtualSeeded {
+                var movedAny = false
+                for (bundle, target) in appWorkspaces {
+                    guard let newWS = target.resolve(workspaceCount: virtualEngine.count, spaceLabels: spaceLabels),
+                          previousResolved[bundle] != newWS
+                    else { continue }
+                    let matchingKeys = virtualEngine.allWindows.filter { windowByKey[$0]?.bundleID == bundle }
+                    for key in matchingKeys where virtualEngine.workspace(containing: key) != newWS {
+                        if virtualEngine.moveWindow(key, to: newWS).moved {
+                            movedAny = true
+                        }
+                    }
+                }
+                if movedAny {
+                    suppressExternalFocusUntil = Date().addingTimeInterval(0.5)
+                    windows = virtualEngine.activeWindows.compactMap { windowByKey[$0] }
+                    if AXIsProcessTrusted() {
+                        tile()
+                        if let nextKey = virtualEngine.activeFocused, let nextWin = windowByKey[nextKey] {
+                            focus(nextWin)
+                        } else if windows.isEmpty {
+                            relinquishFocusForEmptyWorkspace()
+                        }
+                    }
+                }
+            }
         }
 
         if AXIsProcessTrusted() {
@@ -387,7 +439,7 @@ final class Manager {
                     }
                 }
 
-                let win = Window(element: e, pid: app.processIdentifier, screen: screen)
+                let win = Window(element: e, pid: app.processIdentifier, bundleID: app.bundleIdentifier, screen: screen)
                 found.append(win)
                 nextMap[key] = win
             }
@@ -413,18 +465,31 @@ final class Manager {
                 for w in found where !orderedSeed.contains(where: { CFEqual($0.element, w.element) }) {
                     orderedSeed.append(w)
                 }
-                virtualEngine.seedFromCurrentDesktop(orderedSeed.map(\.key), focused: frontKey)
+                virtualEngine.seedFromCurrentDesktop(
+                    orderedSeed.map(\.key),
+                    focused: frontKey,
+                    assignedWorkspace: { [nextMap, weak self] key in
+                        self?.assignedWorkspace(for: nextMap[key]?.bundleID)
+                    }
+                )
                 virtualSeeded = true
             }
 
             let switchedExternally = frontKey.flatMap { virtualEngine.handleExternalFocus($0) } != nil
-            let stacksChanged = virtualEngine.reconcile(
+            let rec = virtualEngine.reconcile(
                 discovered: found.map(\.key),
                 currentlyFocused: frontKey,
+                assignedWorkspace: { [nextMap, weak self] key in
+                    self?.assignedWorkspace(for: nextMap[key]?.bundleID)
+                },
                 canInsertBeforeFocus: { [nextMap] newKey, anchorKey in
                     nextMap[newKey]?.screen == nextMap[anchorKey]?.screen
                 }
             )
+            let stacksChanged = rec.changed
+            if !rec.autoShiftedOffActive.isEmpty {
+                suppressExternalFocusUntil = Date().addingTimeInterval(0.65)
+            }
 
             let nextActiveWindows = virtualEngine.activeWindows.compactMap { nextMap[$0] }
             let activeChanged = nextActiveWindows.count != windows.count || zip(nextActiveWindows, windows).contains {
@@ -443,6 +508,16 @@ final class Manager {
 
             if stacksChanged || activeChanged || switchedExternally || force {
                 tile()
+            }
+            if !rec.autoShiftedOffActive.isEmpty {
+                let rawFront = currentFrontmostAXWindow()
+                if rawFront == nil || rec.autoShiftedOffActive.contains(rawFront!) {
+                    if let activeFocus = virtualEngine.activeFocused, let win = nextMap[activeFocus] {
+                        focus(win)
+                    } else if windows.isEmpty {
+                        relinquishFocusForEmptyWorkspace()
+                    }
+                }
             }
             statusChanged?()
             return
