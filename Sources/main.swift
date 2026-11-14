@@ -29,6 +29,18 @@ let workspaceDigitKeyCodes: [Int] = [
     kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9,
 ]
 
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+func isSessionScreenLocked() -> Bool {
+    if ProcessInfo.processInfo.environment["TALUS_TEST_PID"] != nil {
+        return false
+    }
+    let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+    let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+    return isSessionDictionaryLocked(session, frontmostBundleID: frontBundle)
+}
+
 func axValue(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
     var result: CFTypeRef?
     return AXUIElementCopyAttributeValue(element, attribute, &result) == .success ? result : nil
@@ -222,6 +234,7 @@ final class Manager {
 
     var observers: [pid_t: AXObserver] = [:]
     var statusChanged: (() -> Void)?
+    var onStaleSandboxTCCDetected: (() -> Void)?
     var lastFocused: AXUIElement?
     var scheduled = false
 
@@ -244,7 +257,7 @@ final class Manager {
     }
 
     func observeApplications() {
-        guard AXIsProcessTrusted() else { return }
+        guard AXIsProcessTrusted(), !isSessionScreenLocked() else { return }
         let applications = NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular && $0.processIdentifier != ownPID
         }
@@ -280,16 +293,21 @@ final class Manager {
     }
 
     private func currentFrontmostAXWindow() -> AXWindowKey? {
-        guard let app = NSWorkspace.shared.frontmostApplication,
+        guard AXIsProcessTrusted(), !isSessionScreenLocked(),
+              let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != ownPID,
               let focused = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
               CFGetTypeID(focused) == AXUIElementGetTypeID()
         else { return nil }
-        return AXWindowKey(element: focused as! AXUIElement)
+        let el = focused as! AXUIElement
+        if let role = axValue(el, kAXRoleAttribute as CFString) as? String, role != (kAXWindowRole as String) {
+            return nil
+        }
+        return AXWindowKey(element: el)
     }
 
     func handleAXFocusNotification() {
-        guard isVirtualMode, !paused, Date() >= suppressExternalFocusUntil else {
+        guard isVirtualMode, !paused, AXIsProcessTrusted(), !isSessionScreenLocked(), Date() >= suppressExternalFocusUntil else {
             rememberFocus()
             return
         }
@@ -308,14 +326,15 @@ final class Manager {
     }
 
     func handleApplicationActivated(_ app: NSRunningApplication) {
-        guard isVirtualMode, !paused, AXIsProcessTrusted(),
+        guard isVirtualMode, !paused, AXIsProcessTrusted(), !isSessionScreenLocked(),
               app.processIdentifier != ownPID,
               Date() >= suppressExternalFocusUntil
         else { return }
 
         let targetKey: AXWindowKey?
         if let axFocused = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
-           CFGetTypeID(axFocused) == AXUIElementGetTypeID() {
+           CFGetTypeID(axFocused) == AXUIElementGetTypeID(),
+           (axValue(axFocused as! AXUIElement, kAXRoleAttribute as CFString) as? String ?? (kAXWindowRole as String)) == (kAXWindowRole as String) {
             targetKey = AXWindowKey(element: axFocused as! AXUIElement)
         } else {
             // Fallback: if app has a tracked window on an inactive workspace and none on active
@@ -373,24 +392,28 @@ final class Manager {
     }
 
     func refresh(force: Bool = false) {
-        guard !paused, AXIsProcessTrusted() else { return }
+        guard !paused, AXIsProcessTrusted(), !isSessionScreenLocked() else { return }
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return }
 
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        let visible = list.filter {
-            ($0[kCGWindowLayer as String] as? Int) == 0 && ($0[kCGWindowAlpha as String] as? Double ?? 1) > 0
-        }.compactMap { row -> (pid_t, CGRect)? in
+        let visible: [VisibleWindowCandidate] = list.filter {
+            ($0[kCGWindowLayer as String] as? Int) == 0
+                && (($0[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0
+        }.compactMap { row in
             guard let pid = row[kCGWindowOwnerPID as String] as? pid_t,
                   let dict = row[kCGWindowBounds as String] as? [String: Any],
                   let rect = CGRect(dictionaryRepresentation: dict as CFDictionary),
                   rect.width > 100, rect.height > 80
             else { return nil }
-            return (pid, rect)
+            let wid = (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+            return VisibleWindowCandidate(pid: pid, windowID: wid, bounds: rect)
         }
 
         var found: [Window] = []
         var nextMap: [AXWindowKey: Window] = [:]
+        var sawStaleSandboxAPIDisabled = false
+        var eligibleVisibleWindowExists = false
 
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && !app.isHidden {
             if app.processIdentifier == ownPID { continue }
@@ -399,14 +422,31 @@ final class Manager {
                 if !allowed.contains(String(app.processIdentifier)) { continue }
             }
             if let bundle = app.bundleIdentifier, ignoredApps.contains(bundle) { continue }
+            let appHasVisibleCGWindow = visible.contains { $0.pid == app.processIdentifier }
+            if appHasVisibleCGWindow {
+                eligibleVisibleWindowExists = true
+            }
             let ax = AXUIElementCreateApplication(app.processIdentifier)
-            guard let elements = axValue(ax, kAXWindowsAttribute as CFString) as? [AXUIElement] else { continue }
+            var rawWindows: CFTypeRef?
+            let winErr = AXUIElementCopyAttributeValue(ax, kAXWindowsAttribute as CFString, &rawWindows)
+            if winErr == .apiDisabled && appHasVisibleCGWindow {
+                sawStaleSandboxAPIDisabled = true
+            }
+            guard winErr == .success, let elements = rawWindows as? [AXUIElement] else { continue }
             for e in elements {
+                if let role = axValue(e, kAXRoleAttribute as CFString) as? String,
+                   role != (kAXWindowRole as String) {
+                    continue
+                }
+                var axWid: CGWindowID = 0
+                let resolvedWid: UInt32? = (_AXUIElementGetWindow(e, &axWid) == .success && axWid != 0) ? axWid : nil
                 guard var f = frame(e), f.width > 100, f.height > 80,
-                      visible.contains(where: {
-                          $0.0 == app.processIdentifier && abs($0.1.minX - f.minX) < 3 && abs($0.1.minY - f.minY) < 3
-                              && abs($0.1.width - f.width) < 3 && abs($0.1.height - f.height) < 3
-                      })
+                      matchesVisibleWindow(
+                          pid: app.processIdentifier,
+                          axWindowID: resolvedWid,
+                          axFrame: f,
+                          candidates: visible
+                      )
                 else { continue }
 
                 let key = AXWindowKey(element: e)
@@ -445,6 +485,16 @@ final class Manager {
             }
         }
 
+        if sawStaleSandboxAPIDisabled {
+            onStaleSandboxTCCDetected?()
+        }
+
+        // If the session just unlocked and CGWindowList shows eligible windows,
+        // wait until AX exposes them before wiping an established virtual workspace session.
+        if isVirtualMode && found.isEmpty && eligibleVisibleWindowExists && virtualSeeded && !virtualEngine.allWindows.isEmpty {
+            return
+        }
+
         windowByKey = nextMap
 
         for win in found {
@@ -460,7 +510,7 @@ final class Manager {
 
         if isVirtualMode {
             let frontKey = Date() >= suppressExternalFocusUntil ? currentFrontmostAXWindow() : nil
-            if !virtualSeeded {
+            if !virtualSeeded && (!found.isEmpty || !eligibleVisibleWindowExists) {
                 var orderedSeed = orderUsingHistory(found, history: history) { CFEqual($0.element, $1.element) }
                 for w in found where !orderedSeed.contains(where: { CFEqual($0.element, w.element) }) {
                     orderedSeed.append(w)
@@ -620,7 +670,8 @@ final class Manager {
     }
 
     func rememberFocus() {
-        guard let app = NSWorkspace.shared.frontmostApplication,
+        guard AXIsProcessTrusted(), !isSessionScreenLocked(),
+              let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != ownPID,
               let focused = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
               let window = windows.first(where: { CFEqual($0.element, focused) })
@@ -632,7 +683,8 @@ final class Manager {
     }
 
     func focusedIndex() -> Int? {
-        if let app = NSWorkspace.shared.frontmostApplication,
+        if AXIsProcessTrusted(), !isSessionScreenLocked(),
+           let app = NSWorkspace.shared.frontmostApplication,
            app.processIdentifier != ownPID,
            let e = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
            let idx = windows.firstIndex(where: { CFEqual($0.element, e) }) {
@@ -916,7 +968,7 @@ catch { reportStartupError(title: "Talus cannot start", message: "Cannot create 
 let isAutomatedTest = ProcessInfo.processInfo.environment["TALUS_TEST_PID"] != nil
 var lockFD: Int32 = -1
 if !isAutomatedTest {
-    lockFD = open(supportDirectory.appendingPathComponent("talus.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, mode_t(0o600))
+    lockFD = open(supportDirectory.appendingPathComponent("talus.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
     if lockFD < 0 { reportStartupError(title: "Talus cannot start", message: "Cannot open the application lock file.") }
     if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
         if openSettingsOnLaunch || Bundle.main.bundlePath.hasSuffix(".app") {
@@ -1030,8 +1082,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         axSeparator.isHidden = trusted
 
         let screen = manager.focusedIndex().map { manager.windows[$0].screen } ?? NSScreen.main ?? NSScreen.screens.first
-        let frontmost = NSWorkspace.shared.frontmostApplication
-        let frontWindow = trusted ? frontmost.flatMap { axValue(AXUIElementCreateApplication($0.processIdentifier), kAXFocusedWindowAttribute as CFString) } : nil
+        let locked = isSessionScreenLocked()
+        let frontmost = locked ? nil : NSWorkspace.shared.frontmostApplication
+        let frontWindow = (trusted && !locked) ? frontmost.flatMap { axValue(AXUIElementCreateApplication($0.processIdentifier), kAXFocusedWindowAttribute as CFString) } : nil
         let title: String
         if let frontWindow, CFGetTypeID(frontWindow) == AXUIElementGetTypeID() {
             title = axValue(frontWindow as! AXUIElement, kAXTitleAttribute as CFString) as? String ?? ""
@@ -1273,6 +1326,48 @@ if !isAutomatedTest || ProcessInfo.processInfo.environment["TALUS_TEST_HOTKEYS"]
     )
 }
 
+/// Spawns a fresh Talus process (new PID + audit_token, identical binary/CDHash)
+/// after releasing `talus.lock`. Sandboxed macOS apps such as WeChat permanently cache
+/// negative TCC Accessibility checks per client `audit_token`, so re-execing when
+/// Accessibility is newly granted ensures every running app queries `tccd` cleanly.
+func relaunchForFreshTCCSession(reason: String, extraEnv: [String: String] = [:]) -> Never {
+    fputs("Talus relaunching for fresh Accessibility audit token (\(reason))...\n", stderr)
+    settingsController?.viewModel.flushPendingSave()
+    manager.restoreAllParkedWindows()
+    statusMenu.commands.stopAll()
+    if lockFD >= 0 {
+        _ = flock(lockFD, LOCK_UN)
+        _ = close(lockFD)
+        lockFD = -1
+    }
+    let execURL = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+    let proc = Process()
+    proc.executableURL = execURL
+    proc.arguments = CommandLine.arguments.dropFirst().filter {
+        $0 != "--settings" && $0 != "--settings-only" && !$0.hasPrefix("--tab=")
+    }
+    var env = ProcessInfo.processInfo.environment
+    for (k, v) in extraEnv { env[k] = v }
+    proc.environment = env
+    do {
+        try proc.run()
+    } catch {
+        fputs("Talus relaunch failed: \(error)\n", stderr)
+    }
+    _exit(0)
+}
+
+manager.onStaleSandboxTCCDetected = {
+    guard !isAutomatedTest else { return }
+    let now = Int(Date().timeIntervalSince1970)
+    let lastReexec = ProcessInfo.processInfo.environment["TALUS_API_DISABLED_REEXEC_AT"].flatMap(Int.init) ?? 0
+    guard now - lastReexec >= 60 else { return }
+    relaunchForFreshTCCSession(
+        reason: "per-app kAXErrorAPIDisabled while trusted",
+        extraEnv: ["TALUS_API_DISABLED_REEXEC_AT": String(now)]
+    )
+}
+
 print("Running (\(currentConfig.workspaceMode) mode). \(currentConfig.modifiers.joined(separator: "+"))+P pauses; Control-C quits.")
 if wasTrusted {
     manager.observeApplications()
@@ -1286,14 +1381,30 @@ let tokens = [
     NSWorkspace.didHideApplicationNotification,
     NSWorkspace.didUnhideApplicationNotification,
     NSWorkspace.activeSpaceDidChangeNotification,
+    NSWorkspace.screensDidWakeNotification,
 ].map { name in
     workspace.addObserver(forName: name, object: nil, queue: .main) { _ in
         manager.observeApplications()
         manager.scheduleRefresh()
         statusMenu.updateStatus()
-        if name == NSWorkspace.activeSpaceDidChangeNotification {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { statusMenu.updateStatus() }
+        if name == NSWorkspace.activeSpaceDidChangeNotification || name == NSWorkspace.screensDidWakeNotification {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                manager.observeApplications()
+                manager.refresh()
+                statusMenu.updateStatus()
+            }
         }
+    }
+}
+let unlockObserver = DistributedNotificationCenter.default().addObserver(
+    forName: NSNotification.Name("com.apple.screenIsUnlocked"),
+    object: nil,
+    queue: .main
+) { _ in
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+        manager.observeApplications()
+        manager.refresh(force: true)
+        statusMenu.updateStatus()
     }
 }
 let activationToken = workspace.addObserver(
@@ -1311,6 +1422,9 @@ let activationToken = workspace.addObserver(
 Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
     let nowTrusted = AXIsProcessTrusted()
     if nowTrusted && !wasTrusted {
+        if !isAutomatedTest {
+            relaunchForFreshTCCSession(reason: "Accessibility permission granted")
+        }
         wasTrusted = true
         manager.observeApplications()
         manager.refresh(force: true)

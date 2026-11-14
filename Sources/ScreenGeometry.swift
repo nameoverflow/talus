@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 
 /// Convert Cocoa's bottom-left global coordinates into Accessibility's
 /// top-left coordinates. The primary screen's top edge is the AX origin.
@@ -50,4 +51,48 @@ func parkedWindowOrigin(windowSize: CGSize, screen: CGRect, allScreens: [CGRect]
 func isParkedWindowFrame(_ frame: CGRect, screen: CGRect) -> Bool {
     guard screen.intersects(frame) else { return false }
     return frame.minX >= screen.maxX - 3 || frame.maxX <= screen.minX + 3
+}
+
+struct VisibleWindowCandidate {
+    let pid: Int32
+    let windowID: UInt32?
+    let bounds: CGRect
+}
+
+/// Matches an Accessibility window against CoreGraphics on-screen layer-0 windows.
+/// Prefers exact `CGWindowID` equality (immune to Qt/Electron custom frame discrepancies)
+/// and falls back to 3pt frame tolerance when `axWindowID` is unavailable.
+func matchesVisibleWindow(
+    pid: Int32,
+    axWindowID: UInt32?,
+    axFrame: CGRect,
+    candidates: [VisibleWindowCandidate]
+) -> Bool {
+    let validWid = (axWindowID != nil && axWindowID != 0) ? axWindowID : nil
+    return candidates.contains { c in
+        guard c.pid == pid else { return false }
+        if let validWid, c.windowID == validWid {
+            return true
+        }
+        return abs(c.bounds.minX - axFrame.minX) < 3
+            && abs(c.bounds.minY - axFrame.minY) < 3
+            && abs(c.bounds.width - axFrame.width) < 3
+            && abs(c.bounds.height - axFrame.height) < 3
+    }
+}
+
+/// Detects whether the current GUI login session is locked or switched off-console.
+/// While locked, macOS hides app windows from `kAXWindowsAttribute`, so Talus must
+/// freeze virtual workspace state instead of reconciling an empty window list.
+func isSessionDictionaryLocked(_ session: [String: Any]?, frontmostBundleID: String?) -> Bool {
+    if frontmostBundleID == "com.apple.loginwindow" {
+        return true
+    }
+    if let locked = (session?["CGSSessionScreenIsLocked"] as? NSNumber)?.boolValue, locked {
+        return true
+    }
+    if let onConsole = (session?["kCGSSessionOnConsoleKey"] as? NSNumber)?.boolValue, !onConsole {
+        return true
+    }
+    return false
 }

@@ -30,6 +30,38 @@ import CoreGraphics
         precondition(isParkedWindowFrame(leftParked, screen: mainScreen))
         precondition(!rightScreen.intersects(leftParked))
 
+        // CGWindowID match succeeds even when Qt/custom-chrome AX frame differs by >3pt from CGWindowBounds
+        let candidates = [
+            VisibleWindowCandidate(pid: 29852, windowID: 82740, bounds: CGRect(x: 0, y: 34, width: 1710, height: 1073)),
+            VisibleWindowCandidate(pid: 52812, windowID: 83178, bounds: CGRect(x: 0, y: 34, width: 855, height: 1073)),
+        ]
+        precondition(matchesVisibleWindow(
+            pid: 29852,
+            axWindowID: 82740,
+            axFrame: CGRect(x: 8, y: 42, width: 1694, height: 1057),
+            candidates: candidates
+        ))
+        // Fallback frame match when axWindowID is unavailable
+        precondition(matchesVisibleWindow(
+            pid: 52812,
+            axWindowID: nil,
+            axFrame: CGRect(x: 1, y: 35, width: 855, height: 1073),
+            candidates: candidates
+        ))
+        // Rejects minimized / other-Space window whose windowID and frame are absent from on-screen list
+        precondition(!matchesVisibleWindow(
+            pid: 29852,
+            axWindowID: 99999,
+            axFrame: CGRect(x: 100, y: 100, width: 800, height: 600),
+            candidates: candidates
+        ))
+
+        // Session lock detection guards virtual workspace state during screen lock / fast user switching
+        precondition(!isSessionDictionaryLocked(["kCGSSessionOnConsoleKey": 1], frontmostBundleID: "com.mitchellh.ghostty"))
+        precondition(isSessionDictionaryLocked(["CGSSessionScreenIsLocked": 1, "kCGSSessionOnConsoleKey": 1], frontmostBundleID: "com.mitchellh.ghostty"))
+        precondition(isSessionDictionaryLocked(["kCGSSessionOnConsoleKey": 0], frontmostBundleID: nil))
+        precondition(isSessionDictionaryLocked(nil, frontmostBundleID: "com.apple.loginwindow"))
+
         print("Screen coordinate conversion and parking geometry tests passed")
     }
 }
