@@ -34,7 +34,7 @@ private struct SegmentMetrics {
     let font: NSFont
     let symbolImage: NSImage?
     let displayText: String
-    let contentWidth: CGFloat
+    var contentWidth: CGFloat
     var leftPad: CGFloat = 0
     var rightPad: CGFloat = 0
     var totalWidth: CGFloat { contentWidth + leftPad + rightPad }
@@ -49,8 +49,8 @@ private struct ChromeRunKey: Equatable {
 
 private func resolveSymbolImage(name: String, pointSize: CGFloat, current: Bool) -> NSImage? {
     let weight: NSFont.Weight = current ? .semibold : .medium
-    let maxW = pointSize * 1.42
-    let maxH = pointSize * 1.25
+    let maxW = pointSize * 1.33
+    let maxH = pointSize * 1.24
     let probeCfg = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .semibold)
     guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
     let boldSize = base.withSymbolConfiguration(probeCfg)?.size ?? .zero
@@ -86,7 +86,7 @@ func renderConfiguredStatus(
             if let symImg = resolveSymbolImage(name: symName, pointSize: size * 0.98, current: part.isCurrent) {
                 // Use semibold width as invariant floor so active/inactive switching never shifts neighbors
                 let boldW = resolveSymbolImage(name: symName, pointSize: size * 0.98, current: true)?.size.width ?? symImg.size.width
-                let minSlotW = ceil(size * 1.39)
+                let minSlotW = ceil(size * 1.30)
                 let slotW = max(minSlotW, ceil(max(symImg.size.width, boldW)))
                 return SegmentMetrics(part: part, font: font, symbolImage: symImg, displayText: "", contentWidth: slotW)
             }
@@ -127,13 +127,34 @@ func renderConfiguredStatus(
         let lastText = segments[lastIdx].displayText
         let isSymbolOnlyRun = slice.contains { $0.symbolImage != nil }
             && slice.allSatisfy { $0.symbolImage != nil || $0.displayText.trimmingCharacters(in: .whitespaces).isEmpty }
-        let spaceEdgePad: CGFloat = isSymbolOnlyRun ? 0.5 : 2.5
-        let bareEdgePad: CGFloat = isSymbolOnlyRun ? 4.5 : 6.0
-        segments[firstIdx].leftPad = (segments[firstIdx].symbolImage == nil && firstText.hasPrefix(" ")) ? spaceEdgePad : bareEdgePad
-        segments[lastIdx].rightPad = (segments[lastIdx].symbolImage == nil && lastText.hasSuffix(" ")) ? spaceEdgePad : bareEdgePad
+        if isSymbolOnlyRun {
+            if segments[firstIdx].symbolImage == nil && firstText.trimmingCharacters(in: .whitespaces).isEmpty {
+                segments[firstIdx].contentWidth = 0
+            }
+            if segments[lastIdx].symbolImage == nil && lastText.trimmingCharacters(in: .whitespaces).isEmpty {
+                segments[lastIdx].contentWidth = 0
+            }
+            segments[firstIdx].leftPad = 3.5
+            segments[lastIdx].rightPad = 3.5
+        } else {
+            segments[firstIdx].leftPad = (segments[firstIdx].symbolImage == nil && firstText.hasPrefix(" ")) ? 2.5 : 6.0
+            segments[lastIdx].rightPad = (segments[lastIdx].symbolImage == nil && lastText.hasSuffix(" ")) ? 2.5 : 6.0
+        }
     }
 
-    let leading: CGFloat = showIcon ? 22 : 0
+    if segments.contains(where: { $0.part.workspaceIndex != nil && $0.symbolImage != nil }), segments.count >= 3 {
+        for i in 1..<(segments.count - 1) {
+            if segments[i].part.workspaceIndex == nil,
+               segments[i].symbolImage == nil,
+               segments[i].displayText == " ",
+               segments[i - 1].part.workspaceIndex != nil,
+               segments[i + 1].part.workspaceIndex != nil {
+                segments[i].contentWidth = min(segments[i].contentWidth, 2.5)
+            }
+        }
+    }
+
+    let leading: CGFloat = showIcon ? 23 : 0
     let rawWidth = leading + segments.reduce(0) { $0 + $1.totalWidth }
     let width = max(1, min(460, ceil(rawWidth)))
 
@@ -162,9 +183,9 @@ func renderConfiguredStatus(
         let defaultInk = dark ? NSColor.white : NSColor(calibratedWhite: 0.08, alpha: 1)
         defaultInk.withAlphaComponent(0.92).setFill()
         func tile(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) {
-            NSBezierPath(roundedRect: NSRect(x: x, y: y, width: w, height: h), xRadius: 1.4, yRadius: 1.4).fill()
+            NSBezierPath(roundedRect: NSRect(x: x, y: y, width: w, height: h), xRadius: 1.2, yRadius: 1.2).fill()
         }
-        if showIcon { tile(1.5, 2, 7.75, 14); tile(10.5, 9.625, 6, 6.375); tile(10.5, 2, 6, 6.375) }
+        if showIcon { tile(1.5, 3.5, 6.0, 11.0); tile(8.5, 9.5, 4.5, 5.0); tile(8.5, 3.5, 4.5, 5.0) }
 
         // Draw hover pill behind hovered workspace when it has no explicit pill background
         if let hoveredWorkspace,

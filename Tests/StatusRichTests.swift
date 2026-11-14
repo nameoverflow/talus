@@ -102,7 +102,7 @@ import AppKit
     precondition(out0.image.size.width == out2.image.size.width)
     precondition(out0.workspaceRegions == out2.workspaceRegions)
     precondition(Set(out0.workspaceRegions.map { $0.rect.width }).count == 1)
-    precondition((out0.workspaceRegions.first?.rect.width ?? 999) <= 26)
+    precondition((out0.workspaceRegions.first?.rect.width ?? 999) <= 22)
 
     print("Status templates, colours, fonts and command markup tests passed")
  }

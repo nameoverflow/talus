@@ -388,7 +388,7 @@ final class SettingsViewModel: ObservableObject {
     func applyTemplatePreset(_ preset: String) {
         switch preset {
         case "icons":
-            customTemplate = "%spaces%  <fc=#80808066>│</fc>  <fc=#14B8A6>%layout%</fc> · %count%"
+            customTemplate = "%spaces% <fc=#80808066>│</fc>  <fc=#14B8A6>%layout%</fc> · %count%"
             workspaceCurrent = "<fc=#FFFFFF,#0F766E> %icon%%fullscreen% </fc>"
             workspaceOther = " %icon%%fullscreen% "
             if workspaceIcons.isEmpty {
