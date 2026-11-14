@@ -49,9 +49,14 @@ private struct ChromeRunKey: Equatable {
 
 private func resolveSymbolImage(name: String, pointSize: CGFloat, current: Bool) -> NSImage? {
     let weight: NSFont.Weight = current ? .semibold : .medium
-    let symConfig = NSImage.SymbolConfiguration(pointSize: pointSize, weight: weight)
-    return NSImage(systemSymbolName: name, accessibilityDescription: nil)?
-        .withSymbolConfiguration(symConfig)
+    let maxW = pointSize * 1.42
+    let maxH = pointSize * 1.25
+    let probeCfg = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .semibold)
+    guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
+    let boldSize = base.withSymbolConfiguration(probeCfg)?.size ?? .zero
+    let scale = min(1.0, min(maxW / max(1, boldSize.width), maxH / max(1, boldSize.height)))
+    let symConfig = NSImage.SymbolConfiguration(pointSize: pointSize * scale, weight: weight)
+    return base.withSymbolConfiguration(symConfig)
 }
 
 private func drawTintedSymbol(_ symbol: NSImage, in rect: NSRect, color: NSColor) {
@@ -81,7 +86,8 @@ func renderConfiguredStatus(
             if let symImg = resolveSymbolImage(name: symName, pointSize: size * 0.98, current: part.isCurrent) {
                 // Use semibold width as invariant floor so active/inactive switching never shifts neighbors
                 let boldW = resolveSymbolImage(name: symName, pointSize: size * 0.98, current: true)?.size.width ?? symImg.size.width
-                let slotW = max(20, ceil(max(symImg.size.width, boldW)))
+                let minSlotW = ceil(size * 1.39)
+                let slotW = max(minSlotW, ceil(max(symImg.size.width, boldW)))
                 return SegmentMetrics(part: part, font: font, symbolImage: symImg, displayText: "", contentWidth: slotW)
             }
             let textW = ceil((symName as NSString).size(withAttributes: [.font: font]).width)
@@ -119,8 +125,12 @@ func renderConfiguredStatus(
         guard hasVisible, let firstIdx = run.range.first, let lastIdx = run.range.last else { continue }
         let firstText = segments[firstIdx].displayText
         let lastText = segments[lastIdx].displayText
-        segments[firstIdx].leftPad = (segments[firstIdx].symbolImage == nil && firstText.hasPrefix(" ")) ? 2.5 : 6.0
-        segments[lastIdx].rightPad = (segments[lastIdx].symbolImage == nil && lastText.hasSuffix(" ")) ? 2.5 : 6.0
+        let isSymbolOnlyRun = slice.contains { $0.symbolImage != nil }
+            && slice.allSatisfy { $0.symbolImage != nil || $0.displayText.trimmingCharacters(in: .whitespaces).isEmpty }
+        let spaceEdgePad: CGFloat = isSymbolOnlyRun ? 0.5 : 2.5
+        let bareEdgePad: CGFloat = isSymbolOnlyRun ? 4.5 : 6.0
+        segments[firstIdx].leftPad = (segments[firstIdx].symbolImage == nil && firstText.hasPrefix(" ")) ? spaceEdgePad : bareEdgePad
+        segments[lastIdx].rightPad = (segments[lastIdx].symbolImage == nil && lastText.hasSuffix(" ")) ? spaceEdgePad : bareEdgePad
     }
 
     let leading: CGFloat = showIcon ? 22 : 0
