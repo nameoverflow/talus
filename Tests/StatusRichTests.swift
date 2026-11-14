@@ -69,6 +69,22 @@ import AppKit
     let boxImg = configuredStatusImage(parts: boxParts, dark: true)
     precondition(boxImg.size.height == 18 && boxImg.size.width > 30)
 
+    // <sf=...> SF Symbol tags and %icon% workspace icon resolution
+    var iconCfg = Configuration()
+    iconCfg.workspaceMode = "virtual"
+    iconCfg.workspaceIcons = ["terminal", "globe", "chevron.left.forwardslash.chevron.right"]
+    iconCfg.workspaceCurrent = "<fc=#FFFFFF,#0F766E> %icon% </fc>"
+    iconCfg.workspaceOther = " %icon% "
+    let iconValues = StatusValues(spaces: vSpaces, layout: "Tall", title: "", count: 2, custom: "", paused: false, spaceLabels: ["终端", "网页", "代码"], spaceIcons: iconCfg.workspaceIcons)
+    let iconParts = templateStatusParts(config: iconCfg, values: iconValues)
+    precondition(iconParts.compactMap(\.symbolName) == ["terminal", "globe", "chevron.left.forwardslash.chevron.right"])
+    let iconImg = configuredStatusImage(parts: iconParts, dark: true)
+    precondition(iconImg.size.height == 18 && iconImg.size.width > 60)
+
+    let inlineSf = parseStatusMarkup("<sf=terminal> <sf=bogus!!>", fonts: [], fontSize: 11.5)
+    precondition(inlineSf.first?.symbolName == "terminal")
+    precondition(inlineSf.map(\.text).joined().contains("<sf=bogus!!>"))
+
     print("Status templates, colours, fonts and command markup tests passed")
  }
 }

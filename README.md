@@ -74,7 +74,8 @@ timeout = 2
 Set `show_icon = false` if the text should occupy the entire item.
 The supported substitutions are `%spaces%`, `%layout%`, `%title%`, `%count%`,
 `%custom%`, and `%name%` for a configured command. `%%` emits a literal percent
-sign. Workspace templates accept `%label%`, `%index%`, `%occupied%`, and `%fullscreen%`.
+sign. Workspace templates accept `%label%`, `%index%`, `%icon%`, `%occupied%`, and `%fullscreen%`
+(`workspace_icons` supplies SF Symbol names or text icons for `%icon%`, while `<sf=symbol.name>` embeds any macOS SF Symbol inline).
 `<fc=#RRGGBB>`, `<fc=#RRGGBB,#RRGGBB>`, and `<fc=,#RRGGBB>` (adaptive foreground)
 set foreground and rounded-pill background, with nested `</fc>` tags; common colour names are also accepted.
 `<box type=Bottom|Top|Full|HBoth|VBoth width=2 color=#RRGGBB>...</box>` draws xmobar-style underlines or pill borders.

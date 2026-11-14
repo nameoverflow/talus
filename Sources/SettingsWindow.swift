@@ -45,6 +45,7 @@ final class SettingsViewModel: ObservableObject {
 
     @Published var statusShowIcon: Bool
     @Published var spaceLabels: [String]
+    @Published var workspaceIcons: [String]
     @Published var newSpaceLabel: String = ""
     @Published var statusMode: StatusModeChoice
 
@@ -101,6 +102,7 @@ final class SettingsViewModel: ObservableObject {
 
         self.statusShowIcon = config.statusShowIcon
         self.spaceLabels = config.spaceLabels
+        self.workspaceIcons = config.workspaceIcons
         self.legacyFormat = config.statusFormat
         self.workspaceCurrent = config.workspaceCurrent
         self.workspaceOther = config.workspaceOther
@@ -171,6 +173,7 @@ final class SettingsViewModel: ObservableObject {
         appWorkspaces = config.appWorkspaces
         statusShowIcon = config.statusShowIcon
         spaceLabels = config.spaceLabels
+        workspaceIcons = config.workspaceIcons
         legacyFormat = config.statusFormat
         workspaceCurrent = config.workspaceCurrent
         workspaceOther = config.workspaceOther
@@ -217,6 +220,7 @@ final class SettingsViewModel: ObservableObject {
 
         config.statusShowIcon = statusShowIcon
         config.spaceLabels = spaceLabels.map { String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(16)) }.filter { !$0.isEmpty }
+        config.workspaceIcons = workspaceIcons.map { String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64)) }.filter { !$0.isEmpty }
 
         let trimmedFont = primaryFont.trimmingCharacters(in: .whitespacesAndNewlines)
         config.statusFonts = trimmedFont.isEmpty ? [] : ([trimmedFont] + extraFonts)
@@ -379,6 +383,13 @@ final class SettingsViewModel: ObservableObject {
 
     func applyTemplatePreset(_ preset: String) {
         switch preset {
+        case "icons":
+            customTemplate = "%spaces%  <fc=#80808066>│</fc>  <fc=#14B8A6>%layout%</fc> · %count%"
+            workspaceCurrent = "<fc=#FFFFFF,#0F766E> %icon%%fullscreen% </fc>"
+            workspaceOther = " %icon%%fullscreen% "
+            if workspaceIcons.isEmpty {
+                workspaceIcons = ["terminal", "globe", "chevron.left.forwardslash.chevron.right", "bubble.left.and.bubble.right", "square.grid.2x2"]
+            }
         case "compact":
             customTemplate = "%spaces%  <fc=#80808066>│</fc>  <fc=#0D9488>%layout%</fc> · %count%"
             workspaceCurrent = "<fc=#FFFFFF,#0F766E> %index%:%label%%fullscreen% </fc>"
@@ -431,7 +442,8 @@ final class SettingsViewModel: ObservableObject {
             count: candidate.workspaceMode == "virtual" ? 2 : 3,
             custom: "就绪",
             paused: false,
-            spaceLabels: candidate.spaceLabels
+            spaceLabels: candidate.spaceLabels,
+            spaceIcons: candidate.workspaceIcons
         )
         let parts = templateStatusParts(config: candidate, values: sampleValues) { idx in
             guard candidate.statusCommands.indices.contains(idx) else { return "" }
@@ -1466,6 +1478,7 @@ private struct MenuBarSettingsView: View {
                             .font(.system(size: 12, weight: .medium))
                         Spacer()
                         Menu("套用示例预设") {
+                            Button("纯图标工作区（SF Symbols）") { model.applyTemplatePreset("icons") }
                             Button("青绿圆角胶囊") { model.applyTemplatePreset("compact") }
                             Button("xmobar 下划线指示") { model.applyTemplatePreset("underline") }
                             Button("磨砂分组胶囊") { model.applyTemplatePreset("pills") }

@@ -68,6 +68,7 @@ struct Configuration: Codable, Equatable {
     var statusFontSize: Double = 11.5
     var statusCommands: [StatusCommand] = []
     var spaceLabels: [String] = []
+    var workspaceIcons: [String] = []
     var statusTextFile: String?
     var statusStateFile: String?
 
@@ -76,7 +77,7 @@ struct Configuration: Codable, Equatable {
         case masterRatio, ratioStep, masterCount, ignoreApps, appWorkspaces
         case statusFormat, statusTextFile, statusStateFile, statusTemplate
         case statusShowIcon, workspaceCurrent, workspaceOther, statusFonts
-        case statusFontSize, statusCommands, spaceLabels
+        case statusFontSize, statusCommands, spaceLabels, workspaceIcons
     }
 
     init() {}
@@ -100,6 +101,7 @@ struct Configuration: Codable, Equatable {
         statusFontSize = try values.decodeIfPresent(Double.self, forKey: .statusFontSize) ?? statusFontSize
         statusCommands = try values.decodeIfPresent([StatusCommand].self, forKey: .statusCommands) ?? statusCommands
         spaceLabels = try values.decodeIfPresent([String].self, forKey: .spaceLabels) ?? spaceLabels
+        workspaceIcons = try values.decodeIfPresent([String].self, forKey: .workspaceIcons) ?? workspaceIcons
         statusTextFile = try values.decodeIfPresent(String.self, forKey: .statusTextFile)
         statusStateFile = try values.decodeIfPresent(String.self, forKey: .statusStateFile)
     }
@@ -133,6 +135,7 @@ struct Configuration: Codable, Equatable {
         guard masterRatio >= 0.2 && masterRatio <= 0.8 else { throw ConfigError.invalidRatio }
         guard ratioStep > 0 && ratioStep <= 0.2 else { throw ConfigError.invalidStep }
         guard spaceLabels.count <= 32, spaceLabels.allSatisfy({ !$0.isEmpty && $0.count <= 16 }),
+              workspaceIcons.count <= 32, workspaceIcons.allSatisfy({ !$0.isEmpty && $0.count <= 64 }),
               (statusTemplate?.count ?? 0) <= 1024, workspaceCurrent.count <= 512, workspaceOther.count <= 512,
               statusFonts.count <= 16, statusFonts.allSatisfy({ !$0.isEmpty && $0.count <= 100 }),
               (8...14).contains(statusFontSize), statusCommands.count <= 16,
@@ -374,6 +377,9 @@ struct Configuration: Codable, Equatable {
             case "space_labels", "spaceLabels":
                 try claim("spaceLabels", keyLabel: key)
                 config.spaceLabels = try requireStringArray(value, key: key)
+            case "workspace_icons", "workspaceIcons":
+                try claim("workspaceIcons", keyLabel: key)
+                config.workspaceIcons = try requireStringArray(value, key: key)
             case "status_text_file", "statusTextFile":
                 try claim("statusTextFile", keyLabel: key)
                 config.statusTextFile = try requireString(value, key: key)
@@ -457,6 +463,9 @@ struct Configuration: Codable, Equatable {
                     case "space_labels", "spaceLabels":
                         try claim("spaceLabels", keyLabel: "status.\(sk)")
                         config.spaceLabels = try requireStringArray(sv, key: "status.\(sk)")
+                    case "workspace_icons", "workspaceIcons":
+                        try claim("workspaceIcons", keyLabel: "status.\(sk)")
+                        config.workspaceIcons = try requireStringArray(sv, key: "status.\(sk)")
                     case "template", "statusTemplate":
                         try claim("statusTemplate", keyLabel: "status.\(sk)")
                         config.statusTemplate = try requireString(sv, key: "status.\(sk)")
@@ -542,6 +551,9 @@ struct Configuration: Codable, Equatable {
         lines.append("show_icon = \(statusShowIcon ? "true" : "false")")
         if !spaceLabels.isEmpty && !hasWorkspacesSection {
             lines.append("space_labels = \(TOMLWriter.stringArray(spaceLabels))")
+        }
+        if !workspaceIcons.isEmpty {
+            lines.append("workspace_icons = \(TOMLWriter.stringArray(workspaceIcons))")
         }
         if let template = statusTemplate {
             lines.append("template = \(TOMLWriter.quote(template))")

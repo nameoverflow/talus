@@ -85,6 +85,15 @@ func parseStatusMarkup(_ source: String, fonts: [String], fontSize: Double,
             } else if tag == "box" || tag.hasPrefix("box "), let box = parseBoxTag(tag) {
                 flush(); stack.append(("box",style)); style.box = box
                 index = text.index(after:end); continue
+            } else if tag.hasPrefix("sf=") {
+                let sym = String(tag.dropFirst(3))
+                if sym.range(of:"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",options:.regularExpression) != nil {
+                    flush()
+                    if result.count < 512 {
+                        result.append(StatusPart(text:"",style:style,isCurrent:current,workspaceIndex:workspaceIndex,symbolName:sym))
+                    }
+                    index = text.index(after:end); continue
+                }
             }
         }
         if text[index] == "%" {
@@ -130,7 +139,15 @@ func templateStatusParts(config: Configuration, values: StatusValues, commandOut
                 entryStyle.dimmed = true
             }
             output += parseStatusMarkup(workspaceTemplate,fonts:config.statusFonts,fontSize:config.statusFontSize,initial:entryStyle,current:entry.isCurrent,workspaceIndex:index) { token, style in
-                fields[token].map { literal($0,style,entry.isCurrent,index) }
+                if token == "icon" {
+                    let iconSpec = index < values.spaceIcons.count ? values.spaceIcons[index] : ""
+                    if iconSpec.range(of:"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",options:.regularExpression) != nil {
+                        return [StatusPart(text:"",style:style,isCurrent:entry.isCurrent,workspaceIndex:index,symbolName:iconSpec)]
+                    }
+                    let fallback = iconSpec.isEmpty ? label : iconSpec
+                    return literal(fallback,style,entry.isCurrent,index)
+                }
+                return fields[token].map { literal($0,style,entry.isCurrent,index) }
             }
         }
         return output
@@ -152,7 +169,9 @@ func templateStatusParts(config: Configuration, values: StatusValues, commandOut
     }
     var merged: [StatusPart] = []
     for part in raw {
-        if let last = merged.last, last.style == part.style, last.isCurrent == part.isCurrent, last.workspaceIndex == part.workspaceIndex {
+        if let last = merged.last,
+           last.symbolName == nil, part.symbolName == nil,
+           last.style == part.style, last.isCurrent == part.isCurrent, last.workspaceIndex == part.workspaceIndex {
             merged[merged.count-1] = StatusPart(text:last.text + part.text,style:last.style,isCurrent:last.isCurrent,workspaceIndex:last.workspaceIndex)
         } else { merged.append(part) }
     }

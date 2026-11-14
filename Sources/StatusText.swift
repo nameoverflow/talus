@@ -8,6 +8,7 @@ struct StatusValues {
     let custom: String
     let paused: Bool
     var spaceLabels: [String] = []
+    var spaceIcons: [String] = []
 }
 
 func renderStatus(_ format: String, _ values: StatusValues) -> String {

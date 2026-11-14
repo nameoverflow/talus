@@ -1251,7 +1251,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             count: manager.windows.count,
             custom: custom,
             paused: manager.paused,
-            spaceLabels: config.spaceLabels
+            spaceLabels: config.spaceLabels,
+            spaceIcons: config.workspaceIcons
         )
         let snapshot = StatusExport(spaces: spaceList, layout: values.layout, title: String(title.prefix(512)), count: values.count, paused: values.paused)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
@@ -1278,7 +1279,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             guard let self, currentCfg.statusCommands.indices.contains(index) else { return "" }
             return self.commands.value(index: index, block: currentCfg.statusCommands[index])
         }
-        let spoken = parts.map { $0.isCurrent ? "[\($0.text)]" : $0.text }.joined()
+        let spoken = parts.map { part in
+            let token: String
+            if let sym = part.symbolName {
+                if let ws = part.workspaceIndex, ws < currentCfg.spaceLabels.count {
+                    token = currentCfg.spaceLabels[ws]
+                } else {
+                    token = sym
+                }
+            } else {
+                token = part.text
+            }
+            return part.isCurrent ? "[\(token)]" : token
+        }.joined()
         guard let button = item.button else { return }
         let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         if parts != cachedParts || dark != cachedDark || hoveredWorkspace != cachedHover {

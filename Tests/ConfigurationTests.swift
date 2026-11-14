@@ -45,6 +45,7 @@ import Foundation
         [status]
         show_icon = false
         space_labels = ["终端", "网页", "聊天"]
+        workspace_icons = ["terminal", "globe", "chevron.left.forwardslash.chevron.right"]
         template = "%spaces%  <fc=#89CFC2>%layout%</fc>  %clock%"
         workspace_current = "<fc=#10201E,#89CFC2> %label%%fullscreen% </fc>"
         workspace_other = "%label%%fullscreen%"
@@ -72,6 +73,7 @@ import Foundation
         precondition(parsedTOML.appWorkspaces["com.tencent.xinWeChat"]?.resolve(workspaceCount: 6, spaceLabels: parsedTOML.spaceLabels) == 2)
         precondition(WorkspaceTarget.label("unknown").resolve(workspaceCount: 6, spaceLabels: parsedTOML.spaceLabels) == nil)
         precondition(!parsedTOML.statusShowIcon && parsedTOML.spaceLabels == ["终端", "网页", "聊天"])
+        precondition(parsedTOML.workspaceIcons == ["terminal", "globe", "chevron.left.forwardslash.chevron.right"])
         precondition(parsedTOML.statusCommands.count == 1 && parsedTOML.statusCommands[0].onChange == true)
 
         let serialized = parsedTOML.toTOML()
