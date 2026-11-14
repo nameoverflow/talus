@@ -73,11 +73,15 @@ func renderConfiguredStatus(
 ) -> StatusRenderOutput {
     var segments: [SegmentMetrics] = parts.map { part in
         let size = CGFloat(part.style?.fontSize ?? 11.5)
+        let isWhitespaceOnly = part.symbolName == nil && part.text.trimmingCharacters(in: .whitespaces).isEmpty
+        let effectiveWeight: NSFont.Weight = (part.isCurrent && !isWhitespaceOnly) ? .semibold : .medium
         let font = part.style?.font.flatMap { NSFont(name: $0, size: size) }
-            ?? NSFont.monospacedDigitSystemFont(ofSize: size, weight: part.isCurrent ? .semibold : .medium)
+            ?? NSFont.monospacedDigitSystemFont(ofSize: size, weight: effectiveWeight)
         if let symName = part.symbolName {
             if let symImg = resolveSymbolImage(name: symName, pointSize: size * 0.98, current: part.isCurrent) {
-                let slotW = max(16, ceil(symImg.size.width))
+                // Use semibold width as invariant floor so active/inactive switching never shifts neighbors
+                let boldW = resolveSymbolImage(name: symName, pointSize: size * 0.98, current: true)?.size.width ?? symImg.size.width
+                let slotW = max(20, ceil(max(symImg.size.width, boldW)))
                 return SegmentMetrics(part: part, font: font, symbolImage: symImg, displayText: "", contentWidth: slotW)
             }
             let textW = ceil((symName as NSString).size(withAttributes: [.font: font]).width)
@@ -87,6 +91,10 @@ func renderConfiguredStatus(
         return SegmentMetrics(part: part, font: font, symbolImage: nil, displayText: part.text, contentWidth: textW)
     }
 
+    let anyWorkspaceHasPillChrome = segments.contains {
+        $0.part.workspaceIndex != nil && ($0.part.style?.background != nil || $0.part.style?.box?.type == .full)
+    }
+
     // Group consecutive segments sharing identical background/box/workspace into unified pill runs
     var runs: [(range: Range<Int>, key: ChromeRunKey)] = []
     var idx = 0
@@ -94,7 +102,7 @@ func renderConfiguredStatus(
         let style = segments[idx].part.style
         let key = ChromeRunKey(background: style?.background, box: style?.box, workspaceIndex: segments[idx].part.workspaceIndex)
         var end = idx + 1
-        if key.hasChrome {
+        if key.hasChrome || (anyWorkspaceHasPillChrome && key.workspaceIndex != nil) {
             while end < segments.count {
                 let nextStyle = segments[end].part.style
                 let nextKey = ChromeRunKey(background: nextStyle?.background, box: nextStyle?.box, workspaceIndex: segments[end].part.workspaceIndex)
@@ -105,7 +113,7 @@ func renderConfiguredStatus(
         idx = end
     }
 
-    for run in runs where run.key.background != nil || run.key.box?.type == .full {
+    for run in runs where run.key.background != nil || run.key.box?.type == .full || (anyWorkspaceHasPillChrome && run.key.workspaceIndex != nil) {
         let slice = segments[run.range]
         let hasVisible = slice.contains { $0.symbolImage != nil || !$0.displayText.trimmingCharacters(in: .whitespaces).isEmpty }
         guard hasVisible, let firstIdx = run.range.first, let lastIdx = run.range.last else { continue }
@@ -155,10 +163,11 @@ func renderConfiguredStatus(
                 $0.part.workspaceIndex == hoveredWorkspace && $0.part.style?.background != nil
             }
             if !hasOwnBg {
+                let padX: CGFloat = anyWorkspaceHasPillChrome ? 0 : 1
                 let hoverRect = NSRect(
-                    x: max(0, region.rect.minX - 1),
+                    x: max(0, region.rect.minX - padX),
                     y: 1,
-                    width: min(width - max(0, region.rect.minX - 1), region.rect.width + 2),
+                    width: min(width - max(0, region.rect.minX - padX), region.rect.width + padX * 2),
                     height: 16
                 )
                 let hoverColor = dark

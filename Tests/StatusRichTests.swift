@@ -85,6 +85,24 @@ import AppKit
     precondition(inlineSf.first?.symbolName == "terminal")
     precondition(inlineSf.map(\.text).joined().contains("<sf=bogus!!>"))
 
+    // Switching active workspace between icon workspaces keeps identical total width and slot widths
+    var fullIconCfg = Configuration()
+    fullIconCfg.workspaceMode = "virtual"
+    fullIconCfg.workspaceIcons = ["terminal", "globe", "chevron.left.forwardslash.chevron.right", "bubble.left.and.bubble.right", "square.grid.2x2"]
+    fullIconCfg.statusTemplate = "%spaces%  %layout% · %count%"
+    fullIconCfg.workspaceCurrent = "<fc=#FFFFFF,#0F766E> %icon%%fullscreen% </fc>"
+    fullIconCfg.workspaceOther = " %icon%%fullscreen% "
+    func renderWithActive(_ activeIdx: Int) -> StatusRenderOutput {
+        let spaces = (0..<5).map { SpaceEntry(id: UInt64($0 + 1), isCurrent: $0 == activeIdx, isFullscreen: false, windowCount: 1) }
+        let vals = StatusValues(spaces: spaces, layout: "Tall", title: "", count: 1, custom: "", paused: false, spaceLabels: ["1","2","3","4","5"], spaceIcons: fullIconCfg.workspaceIcons)
+        return renderConfiguredStatus(parts: templateStatusParts(config: fullIconCfg, values: vals), dark: true)
+    }
+    let out0 = renderWithActive(0)
+    let out2 = renderWithActive(2)
+    precondition(out0.image.size.width == out2.image.size.width)
+    precondition(out0.workspaceRegions == out2.workspaceRegions)
+    precondition(Set(out0.workspaceRegions.map { $0.rect.width }).count == 1)
+
     print("Status templates, colours, fonts and command markup tests passed")
  }
 }
