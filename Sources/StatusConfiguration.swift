@@ -1,5 +1,20 @@
 import Foundation
 
+enum StatusBoxType: String, Equatable {
+    case full = "Full"
+    case bottom = "Bottom"
+    case top = "Top"
+    case hBoth = "HBoth"
+    case vBoth = "VBoth"
+}
+
+struct StatusBoxStyle: Equatable {
+    var type: StatusBoxType = .full
+    var width: Double = 2
+    var color: String?
+    var radius: Double?
+}
+
 /// Internal rendering style produced by the markup parser.
 struct StatusSegmentStyle: Equatable {
     var foreground: String?
@@ -7,6 +22,7 @@ struct StatusSegmentStyle: Equatable {
     var font: String?
     var fontSize: Double?
     var dimmed: Bool = false
+    var box: StatusBoxStyle?
 }
 
 struct StatusCommand: Codable, Equatable {

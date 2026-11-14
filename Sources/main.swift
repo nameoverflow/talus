@@ -1025,8 +1025,16 @@ var watchedConfigPath = currentResolution.loadURL.path
 var watchedConfigMTime = fileModificationDate(currentResolution.loadURL)
 var lastReportedReloadMTime: Date?
 
+private final class StatusHoverResponder: NSResponder {
+    var onMoved: ((NSEvent) -> Void)?
+    var onExited: (() -> Void)?
+    override func mouseMoved(with event: NSEvent) { onMoved?(event) }
+    override func mouseExited(with event: NSEvent) { onExited?() }
+}
+
 final class StatusMenu: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let menu = NSMenu()
     let axWarningItem = NSMenuItem(title: "⚠️ 授予辅助功能权限…", action: #selector(openAccessibilitySettings), keyEquivalent: "")
     let axSeparator = NSMenuItem.separator()
     var workspaceMenuItems: [NSMenuItem] = []
@@ -1043,6 +1051,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     var reportedExportError = false
     var cachedParts: [StatusPart]?
     var cachedDark: Bool?
+    var cachedHover: Int?
+    var lastSpokenStatus = ""
+    var workspaceHitRects: [StatusWorkspaceHitRegion] = []
+    var hoveredWorkspace: Int?
+    private let hoverResponder = StatusHoverResponder()
+    private var trackingArea: NSTrackingArea?
     var onOpenSettings: (() -> Void)?
     var onOpenConfigFile: (() -> Void)?
     var onReloadConfig: (() -> Void)?
@@ -1052,11 +1066,16 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         self.commands = StatusCommands(stateFile: config.statusStateFile)
         super.init()
         commands.onChange = { [weak self] in self?.updateStatus() }
-        item.button?.image = makeStatusIcon()
-        item.button?.imagePosition = .imageOnly
-        item.button?.toolTip = "Talus"
+        if let button = item.button {
+            button.image = makeStatusIcon()
+            button.imagePosition = .imageOnly
+            button.toolTip = "Talus"
+            button.target = self
+            button.action = #selector(statusBarClicked(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            installTrackingIfNeeded(on: button)
+        }
 
-        let menu = NSMenu()
         menu.delegate = self
 
         axWarningItem.target = self
@@ -1091,7 +1110,108 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let quit = NSMenuItem(title: "退出 Talus", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
-        item.menu = menu
+    }
+
+    private func installTrackingIfNeeded(on button: NSStatusBarButton) {
+        guard trackingArea == nil else { return }
+        hoverResponder.onMoved = { [weak self] event in self?.handleMouseMoved(event) }
+        hoverResponder.onExited = { [weak self] in self?.setHoveredWorkspace(nil) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: hoverResponder,
+            userInfo: nil
+        )
+        button.addTrackingArea(area)
+        trackingArea = area
+    }
+
+    private func workspaceIndex(at event: NSEvent?) -> Int? {
+        guard manager.isVirtualMode,
+              let button = item.button,
+              let event,
+              let imageRect = button.cell?.imageRect(forBounds: button.bounds)
+        else { return nil }
+        let local = button.convert(event.locationInWindow, from: nil)
+        guard button.bounds.contains(local) else { return nil }
+        let imageX = local.x - imageRect.origin.x
+        return workspaceHitRects.first {
+            imageX >= $0.rect.minX - 1 && imageX <= $0.rect.maxX + 1
+        }?.index
+    }
+
+    private func handleMouseMoved(_ event: NSEvent) {
+        guard manager.isVirtualMode, !manager.paused, AXIsProcessTrusted() else {
+            setHoveredWorkspace(nil)
+            return
+        }
+        setHoveredWorkspace(workspaceIndex(at: event))
+    }
+
+    private func setHoveredWorkspace(_ next: Int?) {
+        guard hoveredWorkspace != next else { return }
+        hoveredWorkspace = next
+        updateToolTip()
+        renderCurrentImage()
+    }
+
+    private func updateToolTip() {
+        guard let button = item.button else { return }
+        if let ws = hoveredWorkspace, manager.isVirtualMode {
+            let label = ws < config.spaceLabels.count ? ":\(config.spaceLabels[ws])" : ""
+            button.toolTip = "点击切换到工作区 \(ws + 1)\(label)（右键打开 Talus 菜单）"
+        } else if manager.isVirtualMode {
+            button.toolTip = "Talus: \(lastSpokenStatus)（点击工作区切换，右键或点图标打开菜单）"
+        } else {
+            button.toolTip = "Talus: \(lastSpokenStatus)"
+        }
+    }
+
+    private func renderCurrentImage(force: Bool = false) {
+        guard let button = item.button, let parts = cachedParts else { return }
+        let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if !force && dark == cachedDark && hoveredWorkspace == cachedHover { return }
+        let rendered = renderConfiguredStatus(
+            parts: parts,
+            dark: dark,
+            showIcon: config.statusShowIcon,
+            hoveredWorkspace: hoveredWorkspace
+        )
+        rendered.image.accessibilityDescription = "Talus: \(lastSpokenStatus)"
+        button.title = ""; button.image = rendered.image; button.imagePosition = .imageOnly
+        workspaceHitRects = rendered.workspaceRegions
+        cachedDark = dark
+        cachedHover = hoveredWorkspace
+    }
+
+    @objc func statusBarClicked(_ sender: Any?) {
+        let event = NSApp.currentEvent
+        let isRightClick = event?.type == .rightMouseUp
+            || event?.modifierFlags.contains(.control) == true
+        if !isRightClick,
+           manager.isVirtualMode, !manager.paused, AXIsProcessTrusted(),
+           let wsIdx = workspaceIndex(at: event) {
+            manager.switchWorkspace(wsIdx)
+            updateStatus()
+            return
+        }
+        openDropdownMenu()
+    }
+
+    private func openDropdownMenu() {
+        if hoveredWorkspace != nil {
+            hoveredWorkspace = nil
+            updateToolTip()
+            renderCurrentImage(force: true)
+        }
+        guard let button = item.button else { return }
+        button.highlight(true)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 5), in: button)
+        button.highlight(false)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        item.button?.highlight(false)
     }
 
     func apply(config newConfig: Configuration) {
@@ -1161,15 +1281,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let spoken = parts.map { $0.isCurrent ? "[\($0.text)]" : $0.text }.joined()
         guard let button = item.button else { return }
         let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        if parts != cachedParts || dark != cachedDark {
-            let image = configuredStatusImage(parts: parts, dark: dark, showIcon: currentCfg.statusShowIcon)
-            image.accessibilityDescription = "Talus: \(spoken)"
-            button.title = ""; button.image = image; button.imagePosition = .imageOnly
-            button.toolTip = "Talus: \(spoken)"
+        if parts != cachedParts || dark != cachedDark || hoveredWorkspace != cachedHover {
+            lastSpokenStatus = spoken
+            cachedParts = parts
+            renderCurrentImage(force: true)
+            updateToolTip()
             if ProcessInfo.processInfo.environment["TALUS_TRACE_STATUS"] == "1" {
                 fputs("status: \(spoken)\n", stderr)
             }
-            cachedParts = parts; cachedDark = dark
         }
     }
 

@@ -62,6 +62,14 @@ import Foundation
         precondition(darkImg.size.width > 20 && darkImg.size.height == 18)
         precondition(lightImg.size.width > 20 && lightImg.size.height == 18)
 
+        // 4. Presets apply cleanly and validate
+        for preset in ["compact", "underline", "pills", "powerline", "clock"] {
+            vm.applyTemplatePreset(preset)
+            let presetCfg = vm.buildConfiguration()
+            try presetCfg.validate()
+            precondition(vm.previewImage(dark: true).size.width > 20)
+        }
+
         print("Settings UI view model tests passed")
     }
 }

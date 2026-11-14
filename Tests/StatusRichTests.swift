@@ -53,6 +53,22 @@ import AppKit
     precondition(vParts.first { $0.text.contains("2•") }?.style?.dimmed == false)
     precondition(vParts.first { $0.text.contains("3") }?.style?.dimmed == true)
 
+    // Clickable workspace hit regions are recorded in order and non-overlapping
+    let rendered = renderConfiguredStatus(parts:vParts, dark:true, showIcon:true, hoveredWorkspace:1)
+    precondition(rendered.workspaceRegions.count == 3)
+    precondition(rendered.workspaceRegions.map(\.index) == [0, 1, 2])
+    precondition(rendered.workspaceRegions[0].rect.maxX < rendered.workspaceRegions[1].rect.minX)
+    precondition(rendered.workspaceRegions[1].rect.maxX < rendered.workspaceRegions[2].rect.minX)
+
+    // <box> underline/outline tags & empty-foreground background <fc=,#bg>
+    let boxParts = parseStatusMarkup("<box type=Bottom width=2 color=#14B8A6>ws1</box> <fc=,#80808024>ws2</fc> <box type=bogus>raw</box>", fonts:[], fontSize:11.5)
+    precondition(boxParts.first { $0.text == "ws1" }?.style?.box == StatusBoxStyle(type: .bottom, width: 2, color: "#14B8A6", radius: nil))
+    let bgOnly = boxParts.first { $0.text == "ws2" }!
+    precondition(bgOnly.style?.foreground == nil && bgOnly.style?.background == "#80808024")
+    precondition(boxParts.map(\.text).joined().contains("<box type=bogus>raw</box>"))
+    let boxImg = configuredStatusImage(parts: boxParts, dark: true)
+    precondition(boxImg.size.height == 18 && boxImg.size.width > 30)
+
     print("Status templates, colours, fonts and command markup tests passed")
  }
 }

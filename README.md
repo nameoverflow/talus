@@ -74,10 +74,12 @@ timeout = 2
 Set `show_icon = false` if the text should occupy the entire item.
 The supported substitutions are `%spaces%`, `%layout%`, `%title%`, `%count%`,
 `%custom%`, and `%name%` for a configured command. `%%` emits a literal percent
-sign. Workspace templates accept `%label%`, `%index%`, and `%fullscreen%`.
-`<fc=#RRGGBB>` and `<fc=#RRGGBB,#RRGGBB>` set foreground and foreground plus
-background, with nested `</fc>` tags; common colour names are also accepted.
+sign. Workspace templates accept `%label%`, `%index%`, `%occupied%`, and `%fullscreen%`.
+`<fc=#RRGGBB>`, `<fc=#RRGGBB,#RRGGBB>`, and `<fc=,#RRGGBB>` (adaptive foreground)
+set foreground and rounded-pill background, with nested `</fc>` tags; common colour names are also accepted.
+`<box type=Bottom|Top|Full|HBoth|VBoth width=2 color=#RRGGBB>...</box>` draws xmobar-style underlines or pill borders.
 `<fn=0>...</fn>` selects the first installed font named in `fonts`.
+In `virtual` workspace mode, clicking any workspace segment in the menu bar switches directly to that workspace; right-clicking (or clicking the Talus icon / layout area) opens the menu.
 `font_size` is in points (8–14). Missing fonts fall back to the system font.
 Arbitrary Unicode characters are allowed, including glyphs supplied by installed
 icon fonts. The menu item is capped at 400 points and may clip long output.

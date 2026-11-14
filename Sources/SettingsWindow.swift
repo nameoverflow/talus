@@ -380,17 +380,25 @@ final class SettingsViewModel: ObservableObject {
     func applyTemplatePreset(_ preset: String) {
         switch preset {
         case "compact":
-            customTemplate = "%spaces%  <fc=#89CFC2>%layout%</fc>"
-            workspaceCurrent = "<fc=#10201E,#89CFC2> %label%%fullscreen% </fc>"
-            workspaceOther = "<fc=#CBD5D6>%label%%fullscreen%</fc>"
+            customTemplate = "%spaces%  <fc=#80808066>│</fc>  <fc=#0D9488>%layout%</fc> · %count%"
+            workspaceCurrent = "<fc=#FFFFFF,#0F766E> %index%:%label%%fullscreen% </fc>"
+            workspaceOther = " %index%:%label%%occupied%%fullscreen% "
+        case "underline":
+            customTemplate = "%spaces%  <fc=#80808066>│</fc>  <fc=#14B8A6>%layout%</fc> · %count%"
+            workspaceCurrent = "<box type=Bottom width=2 color=#14B8A6> %index%:%label%%fullscreen% </box>"
+            workspaceOther = " %index%:%label%%occupied%%fullscreen% "
+        case "pills":
+            customTemplate = "%spaces%  <fc=,#80808024> %layout% · %count% </fc>"
+            workspaceCurrent = "<fc=#FFFFFF,#0F766E><box type=Full width=1 color=#2DD4BF80> %index%:%label%%fullscreen% </box></fc>"
+            workspaceOther = "<fc=,#80808022> %index%:%label%%occupied%%fullscreen% </fc>"
         case "powerline":
-            customTemplate = "%spaces% <fc=#F0C674>▶ %layout%</fc>"
-            workspaceCurrent = "<fc=#191C24,#F0C674> %label%%fullscreen% </fc>"
-            workspaceOther = "<fc=#D8DEE9,#34414F> %label%%fullscreen% </fc>"
+            customTemplate = "%spaces%  <fc=#D97706>▶ %layout%</fc>"
+            workspaceCurrent = "<fc=#191C24,#F0C674> %index%:%label%%fullscreen% </fc>"
+            workspaceOther = "<fc=,#80808028> %index%:%label%%occupied%%fullscreen% </fc>"
         case "clock":
-            customTemplate = "%spaces%  <fc=#89CFC2>%layout%</fc>  %clock%"
-            workspaceCurrent = "<fc=#10201E,#89CFC2> %label%%fullscreen% </fc>"
-            workspaceOther = "%label%%fullscreen%"
+            customTemplate = "%spaces%  <fc=#80808066>│</fc>  <fc=#0D9488>%layout%</fc>  %clock%"
+            workspaceCurrent = "<fc=#FFFFFF,#0F766E> %index%:%label%%fullscreen% </fc>"
+            workspaceOther = " %index%:%label%%occupied%%fullscreen% "
             if !commands.contains(where: { $0.name == "clock" }) {
                 commands.append(StatusCommand(name: "clock", executable: "/bin/date", arguments: ["+%H:%M"], interval: 30, timeout: 2))
                 showCommandsSection = true
@@ -1458,8 +1466,10 @@ private struct MenuBarSettingsView: View {
                             .font(.system(size: 12, weight: .medium))
                         Spacer()
                         Menu("套用示例预设") {
-                            Button("青绿胶囊高亮") { model.applyTemplatePreset("compact") }
-                            Button("暖金分段风格") { model.applyTemplatePreset("powerline") }
+                            Button("青绿圆角胶囊") { model.applyTemplatePreset("compact") }
+                            Button("xmobar 下划线指示") { model.applyTemplatePreset("underline") }
+                            Button("磨砂分组胶囊") { model.applyTemplatePreset("pills") }
+                            Button("暖金分段胶囊") { model.applyTemplatePreset("powerline") }
                             Button("工作区 + 布局 + 时钟") { model.applyTemplatePreset("clock") }
                         }
                         .controlSize(.small)
@@ -1684,12 +1694,13 @@ private struct MenuBarPreviewPill: View {
             .frame(height: 30)
             .frame(maxWidth: .infinity)
             .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(dark ? Color(red: 0.13, green: 0.14, blue: 0.17) : Color(red: 0.92, green: 0.93, blue: 0.95))
             )
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
             )
         }
     }
