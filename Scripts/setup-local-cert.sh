@@ -58,7 +58,7 @@ EOF
 fi
 
 echo "Requesting macOS authorization to trust '$CERT_NAME' for Code Signing ONLY..."
-security add-trusted-cert -r trustAsRoot -p codeSign -k "$LOGIN_KEYCHAIN" "$TMPD/cert.pem"
+security add-trusted-cert -r trustRoot -p codeSign -k "$LOGIN_KEYCHAIN" "$TMPD/cert.pem"
 
 verified_id="$(security find-identity -v -p codesigning "$LOGIN_KEYCHAIN" 2>/dev/null | grep -F "\"$CERT_NAME\"" | head -n 1 | awk '{print $2}' || true)"
 if [ -z "$verified_id" ]; then
