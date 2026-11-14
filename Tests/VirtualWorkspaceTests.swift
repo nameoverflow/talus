@@ -96,6 +96,64 @@ import Foundation
         precondition(!rec2.changed && rec2.autoShiftedOffActive.isEmpty)
         precondition(routed.stacks[0].contains("safari:1"))
 
+        // 11. Persisted session round-trip: Full layout, active workspace, manual window placement, stack order & focus survive restart
+        let session = PersistedWorkspaceSession(
+            activeWorkspace: 2,
+            layouts: [
+                WorkspaceLayoutState(layoutMode: 2, ratio: 0.52, masters: 1),
+                WorkspaceLayoutState(layoutMode: 0, ratio: 0.52, masters: 1),
+                WorkspaceLayoutState(layoutMode: 2, ratio: 0.60, masters: 1),
+                WorkspaceLayoutState(layoutMode: 0, ratio: 0.52, masters: 1),
+                WorkspaceLayoutState(layoutMode: 0, ratio: 0.52, masters: 1),
+            ],
+            workspaceWindowIDs: [[101], [202], [302, 301], [], [501, 502]],
+            focusedByWorkspace: [0: 101, 2: 301, 4: 502],
+            floatingWindowIDs: [999],
+            savedFrames: [999: PersistedWindowRect(x: 120, y: 80, width: 640, height: 480)]
+        )
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("talus-session-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let sessionFile = tmpDir.appendingPathComponent("session-state.json")
+        try! session.save(to: sessionFile)
+        let loaded = PersistedWorkspaceSession.load(from: sessionFile)!
+        precondition(loaded == session)
+        precondition(loaded.focusedByWorkspaceMap == [0: 101, 2: 301, 4: 502])
+        precondition(loaded.savedFramesMap[999] == PersistedWindowRect(x: 120, y: 80, width: 640, height: 480))
+        precondition(PersistedWorkspaceSession.defaultFileURL(homeDirectory: tmpDir, environment: ["TALUS_TEST_PID": "123"]) == nil)
+        precondition(PersistedWorkspaceSession.defaultFileURL(homeDirectory: tmpDir, environment: ["TALUS_TEST_PID": "123", "TALUS_SESSION_FILE": sessionFile.path]) == sessionFile)
+
+        let restarted = VirtualWorkspaceEngine<UInt32>(count: 5, defaultRatio: 0.52, defaultMasters: 1)
+        restarted.restoreLayoutsAndActive(active: loaded.activeWorkspace, layouts: loaded.layouts)
+        precondition(restarted.active == 2)
+        precondition(restarted.layouts[0].layoutMode == 2 && restarted.layouts[2].layoutMode == 2)
+        precondition(abs(restarted.layouts[2].ratio - 0.60) < 0.0001)
+
+        var lastWS: [UInt32: Int] = [:]
+        var rankMap: [UInt32: Int] = [:]
+        var rankCounter = 0
+        for (ws, wids) in loaded.workspaceWindowIDs.enumerated() {
+            for wid in wids {
+                lastWS[wid] = ws
+                rankMap[wid] = rankCounter
+                rankCounter += 1
+            }
+        }
+        let persistedFocus = loaded.focusedByWorkspaceMap
+        // Simulate arbitrary AX discovery order on restart; manual placement of 501/502 in ws 4 and stack order [302, 301] in ws 2 must be preserved
+        restarted.seedFromCurrentDesktop(
+            [502, 301, 101, 302, 501, 202],
+            focused: nil,
+            assignedWorkspace: { wid in lastWS[wid] },
+            preferredOrderRank: { wid in rankMap[wid] },
+            preferredFocusForWorkspace: { ws, _ in persistedFocus[ws] }
+        )
+        precondition(restarted.stacks[0] == [101])
+        precondition(restarted.stacks[1] == [202])
+        precondition(restarted.stacks[2] == [302, 301])
+        precondition(restarted.activeFocused == 301)
+        precondition(restarted.stacks[4] == [501, 502])
+        precondition(restarted.focusedByWorkspace[4] == 502)
+
         print("Virtual workspace engine tests passed")
     }
 }

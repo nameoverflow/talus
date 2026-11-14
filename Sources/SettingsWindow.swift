@@ -39,6 +39,7 @@ final class SettingsViewModel: ObservableObject {
     @Published var showManualBundleInput: Bool = false
 
     @Published var appWorkspaces: [String: WorkspaceTarget]
+    @Published var floatWindows: [FloatWindowRule]
     @Published var manualAssignBundleID: String = ""
     @Published var manualAssignWorkspace: Int = 2
     @Published var showManualAssignInput: Bool = false
@@ -99,6 +100,7 @@ final class SettingsViewModel: ObservableObject {
         self.masterCount = config.masterCount
         self.ignoreApps = config.ignoreApps
         self.appWorkspaces = config.appWorkspaces
+        self.floatWindows = config.floatWindows
 
         self.statusShowIcon = config.statusShowIcon
         self.spaceLabels = config.spaceLabels
@@ -171,6 +173,7 @@ final class SettingsViewModel: ObservableObject {
         masterCount = config.masterCount
         ignoreApps = config.ignoreApps
         appWorkspaces = config.appWorkspaces
+        floatWindows = config.floatWindows
         statusShowIcon = config.statusShowIcon
         spaceLabels = config.spaceLabels
         workspaceIcons = config.workspaceIcons
@@ -217,6 +220,7 @@ final class SettingsViewModel: ObservableObject {
         config.masterCount = min(20, max(1, masterCount))
         config.ignoreApps = ignoreApps
         config.appWorkspaces = appWorkspaces
+        config.floatWindows = floatWindows
 
         config.statusShowIcon = statusShowIcon
         config.spaceLabels = spaceLabels.map { String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(16)) }.filter { !$0.isEmpty }
@@ -491,6 +495,7 @@ final class SettingsViewModel: ObservableObject {
             case .invalidWorkspaceMode: return "工作区模式必须为原生空间或虚拟工作区"
             case .invalidWorkspaceCount: return "虚拟工作区数量需在 1 到 9 之间"
             case .invalidAppWorkspace: return "应用自动归位规则无效：请检查 Bundle ID 与目标工作区（1–9 或有效名称）"
+            case .invalidFloatRule: return "浮动窗口规则无效：请检查应用 Bundle ID 与窗口标题列表"
             case .invalidRatio: return "主窗口占比需在 20% 到 80% 之间"
             case .invalidStep: return "每次调整步长需在 1% 到 20% 之间"
             case .invalidCount: return "主区窗口数需在 1 到 20 之间"

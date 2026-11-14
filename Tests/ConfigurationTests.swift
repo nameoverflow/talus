@@ -42,6 +42,10 @@ import Foundation
         "com.apple.Safari" = 2
         "com.tencent.xinWeChat" = "聊天"
 
+        [[rules.float_windows]]
+        app = "com.tencent.xinWeChat"
+        except_titles = ["微信", "微信 (*)", "WeChat", "WeChat (*)"]
+
         [status]
         show_icon = false
         space_labels = ["终端", "网页", "聊天"]
@@ -71,6 +75,19 @@ import Foundation
         precondition(parsedTOML.appWorkspaces["com.tencent.xinWeChat"] == .label("聊天"))
         precondition(parsedTOML.appWorkspaces["com.apple.Safari"]?.resolve(workspaceCount: 6, spaceLabels: parsedTOML.spaceLabels) == 1)
         precondition(parsedTOML.appWorkspaces["com.tencent.xinWeChat"]?.resolve(workspaceCount: 6, spaceLabels: parsedTOML.spaceLabels) == 2)
+        precondition(parsedTOML.floatWindows.count == 1)
+        let wechatFloat = parsedTOML.floatWindows[0]
+        precondition(!wechatFloat.matches(bundleID: "com.tencent.xinWeChat", windowTitle: "微信"))
+        precondition(!wechatFloat.matches(bundleID: "com.tencent.xinWeChat", windowTitle: "微信 (聊天)"))
+        precondition(!wechatFloat.matches(bundleID: "com.tencent.xinWeChat", windowTitle: "微信 (3)"))
+        precondition(wechatFloat.matches(bundleID: "com.tencent.xinWeChat", windowTitle: ""))
+        precondition(wechatFloat.matches(bundleID: "com.tencent.xinWeChat", windowTitle: "图片和视频"))
+        precondition(wechatFloat.matches(bundleID: "com.tencent.xinWeChat", windowTitle: "预览"))
+        precondition(!wechatFloat.matches(bundleID: "com.apple.Safari", windowTitle: ""))
+        let explicitTitleRule = FloatWindowRule(app: "com.example.App", titles: ["Preview", ""])
+        precondition(explicitTitleRule.matches(bundleID: "com.example.App", windowTitle: "Image Preview"))
+        precondition(explicitTitleRule.matches(bundleID: "com.example.App", windowTitle: ""))
+        precondition(!explicitTitleRule.matches(bundleID: "com.example.App", windowTitle: "Main Window"))
         precondition(WorkspaceTarget.label("unknown").resolve(workspaceCount: 6, spaceLabels: parsedTOML.spaceLabels) == nil)
         precondition(!parsedTOML.statusShowIcon && parsedTOML.spaceLabels == ["终端", "网页", "聊天"])
         precondition(parsedTOML.workspaceIcons == ["terminal", "globe", "chevron.left.forwardslash.chevron.right"])

@@ -50,6 +50,75 @@ enum WorkspaceTarget: Codable, Equatable {
     }
 }
 
+struct FloatWindowRule: Codable, Equatable {
+    var app: String
+    var titles: [String]?
+    var exceptTitles: [String]?
+
+    init(app: String, titles: [String]? = nil, exceptTitles: [String]? = nil) {
+        self.app = app
+        self.titles = titles
+        self.exceptTitles = exceptTitles
+    }
+
+    func matches(bundleID: String?, windowTitle: String) -> Bool {
+        guard let bundleID, bundleID == app else { return false }
+        let normalizedTitle = windowTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let exceptTitles, !exceptTitles.isEmpty {
+            for ex in exceptTitles {
+                let target = ex.trimmingCharacters(in: .whitespacesAndNewlines)
+                if Self.matchesGlobOrExact(text: normalizedTitle, pattern: target) {
+                    return false
+                }
+            }
+        }
+        if let titles, !titles.isEmpty {
+            return titles.contains { pattern in
+                let p = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+                if p.contains("*") {
+                    return Self.matchesGlob(text: normalizedTitle, pattern: p)
+                }
+                return p.isEmpty ? normalizedTitle.isEmpty : normalizedTitle.localizedCaseInsensitiveContains(p)
+            }
+        }
+        return true
+    }
+
+    private static func matchesGlobOrExact(text: String, pattern: String) -> Bool {
+        if pattern.contains("*") {
+            return matchesGlob(text: text, pattern: pattern)
+        }
+        return text == pattern
+    }
+
+    private static func matchesGlob(text: String, pattern: String) -> Bool {
+        let lowerText = Array(text.lowercased())
+        let lowerPat = Array(pattern.lowercased())
+        var ti = 0, pi = 0
+        var starIdx = -1, matchIdx = 0
+        while ti < lowerText.count {
+            if pi < lowerPat.count && lowerPat[pi] == lowerText[ti] {
+                pi += 1
+                ti += 1
+            } else if pi < lowerPat.count && lowerPat[pi] == "*" {
+                starIdx = pi
+                matchIdx = ti
+                pi += 1
+            } else if starIdx != -1 {
+                pi = starIdx + 1
+                matchIdx += 1
+                ti = matchIdx
+            } else {
+                return false
+            }
+        }
+        while pi < lowerPat.count && lowerPat[pi] == "*" {
+            pi += 1
+        }
+        return pi == lowerPat.count
+    }
+}
+
 struct Configuration: Codable, Equatable {
     var modifiers: [String] = ["control", "option"]
     var workspaceMode: String = "native"
@@ -59,6 +128,7 @@ struct Configuration: Codable, Equatable {
     var masterCount: Int = 1
     var ignoreApps: [String] = []
     var appWorkspaces: [String: WorkspaceTarget] = [:]
+    var floatWindows: [FloatWindowRule] = []
     var statusFormat: String = "{spaces}  {layout}"
     var statusTemplate: String?
     var statusShowIcon: Bool = true
@@ -74,7 +144,7 @@ struct Configuration: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case modifiers, workspaceMode, workspaceCount
-        case masterRatio, ratioStep, masterCount, ignoreApps, appWorkspaces
+        case masterRatio, ratioStep, masterCount, ignoreApps, appWorkspaces, floatWindows
         case statusFormat, statusTextFile, statusStateFile, statusTemplate
         case statusShowIcon, workspaceCurrent, workspaceOther, statusFonts
         case statusFontSize, statusCommands, spaceLabels, workspaceIcons
@@ -92,6 +162,7 @@ struct Configuration: Codable, Equatable {
         masterCount = try values.decodeIfPresent(Int.self, forKey: .masterCount) ?? masterCount
         ignoreApps = try values.decodeIfPresent([String].self, forKey: .ignoreApps) ?? ignoreApps
         appWorkspaces = try values.decodeIfPresent([String: WorkspaceTarget].self, forKey: .appWorkspaces) ?? appWorkspaces
+        floatWindows = try values.decodeIfPresent([FloatWindowRule].self, forKey: .floatWindows) ?? floatWindows
         statusFormat = try values.decodeIfPresent(String.self, forKey: .statusFormat) ?? statusFormat
         statusTemplate = try values.decodeIfPresent(String.self, forKey: .statusTemplate)
         statusShowIcon = try values.decodeIfPresent(Bool.self, forKey: .statusShowIcon) ?? statusShowIcon
@@ -130,6 +201,25 @@ struct Configuration: Codable, Equatable {
                 guard (1...9).contains(n) else { throw ConfigError.invalidAppWorkspace }
             case .label(let s):
                 guard !s.isEmpty, s.count <= 16 else { throw ConfigError.invalidAppWorkspace }
+            }
+        }
+        guard floatWindows.count <= 64 else {
+            throw ConfigError.invalidFloatRule
+        }
+        for rule in floatWindows {
+            let trimmedApp = rule.app.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedApp.isEmpty, rule.app == trimmedApp, rule.app.count <= 200 else {
+                throw ConfigError.invalidFloatRule
+            }
+            if let titles = rule.titles {
+                guard titles.count <= 32, titles.allSatisfy({ $0.count <= 200 }) else {
+                    throw ConfigError.invalidFloatRule
+                }
+            }
+            if let exceptTitles = rule.exceptTitles {
+                guard exceptTitles.count <= 32, exceptTitles.allSatisfy({ $0.count <= 200 }) else {
+                    throw ConfigError.invalidFloatRule
+                }
             }
         }
         guard masterRatio >= 0.2 && masterRatio <= 0.8 else { throw ConfigError.invalidRatio }
@@ -326,6 +416,38 @@ struct Configuration: Codable, Equatable {
             }
             return out
         }
+        func parseFloatRule(_ val: TOMLValue, prefix: String) throws -> FloatWindowRule {
+            guard let table = val.tableValue else {
+                throw ConfigParseError("'\(prefix)' entry must be a table")
+            }
+            var app: String?
+            var titles: [String]?
+            var exceptTitles: [String]?
+            var ruleSeen: Set<String> = []
+            for (k, v) in table {
+                switch k {
+                case "app", "bundle_id", "bundleId":
+                    if !ruleSeen.insert("app").inserted { throw ConfigParseError("duplicate '\(prefix).\(k)'") }
+                    app = try requireString(v, key: "\(prefix).\(k)")
+                case "titles":
+                    if !ruleSeen.insert("titles").inserted { throw ConfigParseError("duplicate '\(prefix).\(k)'") }
+                    titles = try requireStringArray(v, key: "\(prefix).\(k)")
+                case "except_titles", "exceptTitles":
+                    if !ruleSeen.insert("exceptTitles").inserted { throw ConfigParseError("duplicate '\(prefix).\(k)'") }
+                    exceptTitles = try requireStringArray(v, key: "\(prefix).\(k)")
+                default:
+                    throw ConfigParseError("unknown float rule key '\(prefix).\(k)'")
+                }
+            }
+            guard let finalApp = app else { throw ConfigParseError("'\(prefix)' is missing 'app'") }
+            return FloatWindowRule(app: finalApp, titles: titles, exceptTitles: exceptTitles)
+        }
+        func parseFloatRuleList(_ val: TOMLValue, key: String) throws -> [FloatWindowRule] {
+            guard let arr = val.arrayValue else { throw ConfigParseError("'\(key)' must be an array of tables") }
+            return try arr.enumerated().map { idx, item in
+                try parseFloatRule(item, prefix: "\(key)[\(idx)]")
+            }
+        }
 
         for (key, value) in root {
             switch key {
@@ -353,6 +475,9 @@ struct Configuration: Codable, Equatable {
             case "app_workspaces", "appWorkspaces":
                 try claim("appWorkspaces", keyLabel: key)
                 config.appWorkspaces = try parseAppWorkspaces(value, key: key)
+            case "float_windows", "floatWindows":
+                try claim("floatWindows", keyLabel: key)
+                config.floatWindows = try parseFloatRuleList(value, key: key)
             case "status_format", "statusFormat":
                 try claim("statusFormat", keyLabel: key)
                 config.statusFormat = try requireString(value, key: key)
@@ -448,6 +573,9 @@ struct Configuration: Codable, Equatable {
                     case "app_workspaces", "appWorkspaces", "assign", "workspaces":
                         try claim("appWorkspaces", keyLabel: "rules.\(sk)")
                         config.appWorkspaces = try parseAppWorkspaces(sv, key: "rules.\(sk)")
+                    case "float_windows", "floatWindows":
+                        try claim("floatWindows", keyLabel: "rules.\(sk)")
+                        config.floatWindows = try parseFloatRuleList(sv, key: "rules.\(sk)")
                     default:
                         throw ConfigParseError("unknown key 'rules.\(sk)'")
                     }
@@ -546,6 +674,18 @@ struct Configuration: Codable, Equatable {
             }
         }
 
+        for rule in floatWindows {
+            lines.append("")
+            lines.append("[[rules.float_windows]]")
+            lines.append("app = \(TOMLWriter.quote(rule.app))")
+            if let titles = rule.titles {
+                lines.append("titles = \(TOMLWriter.stringArray(titles))")
+            }
+            if let exceptTitles = rule.exceptTitles {
+                lines.append("except_titles = \(TOMLWriter.stringArray(exceptTitles))")
+            }
+        }
+
         lines.append("")
         lines.append("[status]")
         lines.append("show_icon = \(statusShowIcon ? "true" : "false")")
@@ -617,6 +757,7 @@ enum ConfigError: String, Error, CustomStringConvertible {
     case invalidWorkspaceMode = "workspaceMode must be 'native' or 'virtual'"
     case invalidWorkspaceCount = "workspaceCount must be between 1 and 9"
     case invalidAppWorkspace = "appWorkspaces entries must map non-empty bundle IDs to workspace 1..9 or a valid label"
+    case invalidFloatRule = "floatWindows entries must specify a non-empty app bundle ID and at most 32 title patterns"
     case invalidRatio = "masterRatio must be between 0.2 and 0.8"
     case invalidStep = "ratioStep must be greater than 0 and at most 0.2"
     case invalidStatusCommand = "invalid status command: check name, executable, arguments, interval and timeout"

@@ -19,6 +19,8 @@ struct Window {
     let element: AXUIElement
     let pid: pid_t
     let bundleID: String?
+    let windowID: UInt32?
+    let title: String
     let screen: NSScreen
     let isResizable: Bool
     var key: AXWindowKey { AXWindowKey(element: element) }
@@ -92,6 +94,8 @@ final class Manager {
     var windows: [Window] = []
     var history: [Window] = []
     var floating: Set<AXWindowKey> = []
+    var autoFloatedKeys: Set<AXWindowKey> = []
+    var userToggledFloatKeys: Set<AXWindowKey> = []
     var savedFrames: [AXWindowKey: CGRect] = [:]
     var homeScreens: [AXWindowKey: NSScreen] = [:]
     var parkedKeys: Set<AXWindowKey> = []
@@ -101,6 +105,16 @@ final class Manager {
     let virtualEngine: VirtualWorkspaceEngine<AXWindowKey>
     private var virtualSeeded = false
     var suppressExternalFocusUntil: Date = .distantPast
+    var programmaticFocusKey: AXWindowKey?
+    var programmaticFocusUntil: Date = .distantPast
+
+    let sessionFileURL: URL? = PersistedWorkspaceSession.defaultFileURL()
+    var lastWorkspaceByWindowID: [UInt32: Int] = [:]
+    var persistedWindowRank: [UInt32: Int] = [:]
+    var persistedFocusedByWS: [Int: UInt32] = [:]
+    var persistedFloatingIDs: Set<UInt32> = []
+    var persistedSavedFrames: [UInt32: CGRect] = [:]
+    private var lastSavedSession: PersistedWorkspaceSession?
 
     private var nativeRatio: Double
     private var nativeMasters: Int
@@ -109,6 +123,7 @@ final class Manager {
     var paused = false
     var ignoredApps: Set<String>
     var appWorkspaces: [String: WorkspaceTarget]
+    var floatWindows: [FloatWindowRule]
     var spaceLabels: [String]
     var ratioStep: Double
     let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -150,12 +165,94 @@ final class Manager {
         ratioStep = config.ratioStep
         ignoredApps = Set(config.ignoreApps)
         appWorkspaces = config.appWorkspaces
+        floatWindows = config.floatWindows
         spaceLabels = config.spaceLabels
         virtualEngine = VirtualWorkspaceEngine(
             count: config.workspaceCount,
             defaultRatio: config.masterRatio,
             defaultMasters: config.masterCount
         )
+        if config.workspaceMode == "virtual" {
+            loadPersistedSessionIfAvailable()
+        }
+    }
+
+    private func loadPersistedSessionIfAvailable() {
+        guard let url = sessionFileURL,
+              let restored = PersistedWorkspaceSession.load(from: url)
+        else { return }
+        virtualEngine.restoreLayoutsAndActive(active: restored.activeWorkspace, layouts: restored.layouts)
+        lastWorkspaceByWindowID.removeAll()
+        persistedWindowRank.removeAll()
+        var rank = 0
+        for (ws, wids) in restored.workspaceWindowIDs.enumerated() {
+            let clampedWS = min(virtualEngine.count - 1, max(0, ws))
+            for wid in wids {
+                lastWorkspaceByWindowID[wid] = clampedWS
+                persistedWindowRank[wid] = rank
+                rank += 1
+            }
+        }
+        persistedFocusedByWS = restored.focusedByWorkspaceMap
+        persistedFloatingIDs = Set(restored.floatingWindowIDs)
+        persistedSavedFrames.removeAll()
+        for (wid, rect) in restored.savedFramesMap {
+            persistedSavedFrames[wid] = CGRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
+        }
+        lastSavedSession = restored
+    }
+
+    func shouldAutoFloat(bundleID: String?, title: String) -> Bool {
+        floatWindows.contains { $0.matches(bundleID: bundleID, windowTitle: title) }
+    }
+
+    func recordCurrentSessionState() {
+        guard isVirtualMode, virtualSeeded else { return }
+        for (ws, keys) in virtualEngine.stacks.enumerated() {
+            for key in keys {
+                if let wid = windowByKey[key]?.windowID {
+                    lastWorkspaceByWindowID[wid] = ws
+                }
+            }
+        }
+        guard let url = sessionFileURL else { return }
+        let workspaceWindowIDs: [[UInt32]] = virtualEngine.stacks.map { stack in
+            stack.compactMap { windowByKey[$0]?.windowID }
+        }
+        var focusedMap: [Int: UInt32] = [:]
+        for ws in 0..<virtualEngine.count {
+            let focusKey = virtualEngine.focusedByWorkspace[ws] ?? virtualEngine.stacks[ws].first
+            if let focusKey, let wid = windowByKey[focusKey]?.windowID {
+                focusedMap[ws] = wid
+            }
+        }
+        let floatingIDs = floating.compactMap { windowByKey[$0]?.windowID }
+        var framesOut: [UInt32: PersistedWindowRect] = [:]
+        for (key, rect) in savedFrames {
+            if let wid = windowByKey[key]?.windowID {
+                framesOut[wid] = PersistedWindowRect(
+                    x: Double(rect.origin.x),
+                    y: Double(rect.origin.y),
+                    width: Double(rect.size.width),
+                    height: Double(rect.size.height)
+                )
+            }
+        }
+        let snapshot = PersistedWorkspaceSession(
+            activeWorkspace: virtualEngine.active,
+            layouts: virtualEngine.layouts,
+            workspaceWindowIDs: workspaceWindowIDs,
+            focusedByWorkspace: focusedMap,
+            floatingWindowIDs: floatingIDs,
+            savedFrames: framesOut
+        )
+        guard snapshot != lastSavedSession else { return }
+        do {
+            try snapshot.save(to: url)
+            lastSavedSession = snapshot
+        } catch {
+            fputs("Talus session save failed: \(error)\n", stderr)
+        }
     }
 
     func assignedWorkspace(for bundleID: String?) -> Int? {
@@ -179,17 +276,20 @@ final class Manager {
         ratioStep = config.ratioStep
         ignoredApps = Set(config.ignoreApps)
         appWorkspaces = config.appWorkspaces
+        floatWindows = config.floatWindows
         spaceLabels = config.spaceLabels
         virtualEngine.updateDefaults(ratio: config.masterRatio, masters: config.masterCount)
         virtualEngine.resizeCount(to: config.workspaceCount)
 
         if wasVirtual && !willBeVirtual {
+            recordCurrentSessionState()
             restoreAllParkedWindows()
             workspaceMode = "native"
             virtualSeeded = false
         } else if !wasVirtual && willBeVirtual {
             workspaceMode = "virtual"
             virtualSeeded = false
+            loadPersistedSessionIfAvailable()
         } else {
             workspaceMode = config.workspaceMode
             if willBeVirtual && virtualSeeded {
@@ -201,6 +301,9 @@ final class Manager {
                     let matchingKeys = virtualEngine.allWindows.filter { windowByKey[$0]?.bundleID == bundle }
                     for key in matchingKeys where virtualEngine.workspace(containing: key) != newWS {
                         if virtualEngine.moveWindow(key, to: newWS).moved {
+                            if let wid = windowByKey[key]?.windowID {
+                                lastWorkspaceByWindowID[wid] = newWS
+                            }
                             movedAny = true
                         }
                     }
@@ -216,6 +319,7 @@ final class Manager {
                             relinquishFocusForEmptyWorkspace()
                         }
                     }
+                    recordCurrentSessionState()
                 }
             }
         }
@@ -312,6 +416,7 @@ final class Manager {
             if let win = windowByKey[frontKey] {
                 focus(win)
             }
+            recordCurrentSessionState()
             statusChanged?()
             return
         }
@@ -346,6 +451,7 @@ final class Manager {
             if let win = windowByKey[targetKey] {
                 focus(win)
             }
+            recordCurrentSessionState()
             statusChanged?()
         }
     }
@@ -420,9 +526,20 @@ final class Manager {
             let wid = (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value
             return VisibleWindowCandidate(pid: pid, windowID: wid, bounds: rect)
         }
+        let visibleWindowIDs = Set(visible.compactMap(\.windowID))
+
+        let allWindowList = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let allExistingCGWindowIDs = Set(allWindowList.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
+        if !allExistingCGWindowIDs.isEmpty {
+            lastWorkspaceByWindowID = lastWorkspaceByWindowID.filter { allExistingCGWindowIDs.contains($0.key) }
+            persistedWindowRank = persistedWindowRank.filter { allExistingCGWindowIDs.contains($0.key) }
+            persistedFloatingIDs = persistedFloatingIDs.filter { allExistingCGWindowIDs.contains($0) }
+            persistedSavedFrames = persistedSavedFrames.filter { allExistingCGWindowIDs.contains($0.key) }
+        }
 
         var found: [Window] = []
         var nextMap: [AXWindowKey: Window] = [:]
+        var newlyAutoFloatedOnActive: [AXWindowKey] = []
         var sawStaleSandboxAPIDisabled = false
         var eligibleVisibleWindowExists = false
 
@@ -443,12 +560,23 @@ final class Manager {
             if winErr == .apiDisabled && appHasVisibleCGWindow {
                 sawStaleSandboxAPIDisabled = true
             }
+            if winErr != .success, winErr != .apiDisabled, appHasVisibleCGWindow {
+                // Transient AX timeout/busy IPC (e.g. Qt/video streaming): carry forward known live on-screen windows
+                for prevWin in windowByKey.values where prevWin.pid == app.processIdentifier {
+                    if let wid = prevWin.windowID, visibleWindowIDs.contains(wid) {
+                        found.append(prevWin)
+                        nextMap[prevWin.key] = prevWin
+                    }
+                }
+                continue
+            }
             guard winErr == .success, let elements = rawWindows as? [AXUIElement] else { continue }
             for e in elements {
                 if let role = axValue(e, kAXRoleAttribute as CFString) as? String,
                    role != (kAXWindowRole as String) {
                     continue
                 }
+                if (axValue(e, kAXMinimizedAttribute as CFString) as? Bool) == true { continue }
                 var axWid: CGWindowID = 0
                 let resolvedWid: UInt32? = (_AXUIElementGetWindow(e, &axWid) == .success && axWid != 0) ? axWid : nil
                 guard var f = frame(e), f.width > 100, f.height > 80,
@@ -478,10 +606,49 @@ final class Manager {
                 let isResizable = (AXUIElementIsAttributeSettable(e, kAXSizeAttribute as CFString, &canResize) == .success && canResize.boolValue)
                 if !isVirtualMode && !isResizable { continue }
 
+                let winTitle = (axValue(e, kAXTitleAttribute as CFString) as? String) ?? ""
+                if let wid = resolvedWid {
+                    if let persistedRect = persistedSavedFrames.removeValue(forKey: wid), savedFrames[key] == nil {
+                        savedFrames[key] = persistedRect
+                    }
+                    if persistedFloatingIDs.remove(wid) != nil {
+                        floating.insert(key)
+                        if !shouldAutoFloat(bundleID: app.bundleIdentifier, title: winTitle) {
+                            userToggledFloatKeys.insert(key)
+                        } else {
+                            autoFloatedKeys.insert(key)
+                        }
+                    }
+                }
+                if isResizable && !userToggledFloatKeys.contains(key) {
+                    if shouldAutoFloat(bundleID: app.bundleIdentifier, title: winTitle) {
+                        let wasFloating = floating.contains(key)
+                        floating.insert(key)
+                        autoFloatedKeys.insert(key)
+                        if !wasFloating && windowByKey[key] != nil {
+                            newlyAutoFloatedOnActive.append(key)
+                        }
+                    } else if autoFloatedKeys.contains(key) {
+                        floating.remove(key)
+                        autoFloatedKeys.remove(key)
+                    }
+                }
+
                 let parkedNow = isParkedWindowFrame(f, screen: fullScreenRect(screen))
+                let belongsToInactiveOnSeed: Bool = {
+                    guard isVirtualMode, !virtualSeeded else { return false }
+                    let targetWS = resolvedWid.flatMap { lastWorkspaceByWindowID[$0] }
+                        ?? assignedWorkspace(for: app.bundleIdentifier)
+                    return targetWS != nil && targetWS != virtualEngine.active
+                }()
+
                 // Crash-recovery: if a window was stranded at a 1px corner from an earlier session, rescue it
+                // unless it already belongs to an inactive virtual workspace we are restoring.
                 if parkedNow && !parkedKeys.contains(key) {
-                    if isResizable {
+                    if belongsToInactiveOnSeed {
+                        homeScreens[key] = screen
+                        parkedKeys.insert(key)
+                    } else if isResizable {
                         let rescued = savedFrames[key] ?? centeredFrame(size: f.size, on: screen)
                         setFrame(e, rescued)
                         f = rescued
@@ -493,7 +660,20 @@ final class Manager {
                 } else if !parkedNow {
                     homeScreens[key] = screen
                     if savedFrames[key] == nil || floating.contains(key) || !isResizable {
-                        savedFrames[key] = f
+                        let area = screenRect(screen)
+                        if newlyAutoFloatedOnActive.contains(key),
+                           abs(f.width - area.width) <= 4,
+                           abs(f.height - area.height) <= 4 {
+                            let fallback = centeredFrame(
+                                size: CGSize(width: min(960, area.width * 0.72), height: min(720, area.height * 0.76)),
+                                on: screen
+                            )
+                            savedFrames[key] = fallback
+                            setFrame(e, fallback)
+                            f = fallback
+                        } else {
+                            savedFrames[key] = f
+                        }
                     }
                 }
 
@@ -501,6 +681,8 @@ final class Manager {
                     element: e,
                     pid: app.processIdentifier,
                     bundleID: app.bundleIdentifier,
+                    windowID: resolvedWid,
+                    title: winTitle,
                     screen: screen,
                     isResizable: isResizable
                 )
@@ -543,9 +725,23 @@ final class Manager {
                     orderedSeed.map(\.key),
                     focused: frontKey,
                     assignedWorkspace: { [nextMap, weak self] key in
-                        self?.assignedWorkspace(for: nextMap[key]?.bundleID)
+                        guard let self, let win = nextMap[key] else { return nil }
+                        if let wid = win.windowID, let prevWS = self.lastWorkspaceByWindowID[wid] {
+                            return prevWS
+                        }
+                        return self.assignedWorkspace(for: win.bundleID)
+                    },
+                    preferredOrderRank: { [nextMap, weak self] key in
+                        guard let self, let wid = nextMap[key]?.windowID else { return nil }
+                        return self.persistedWindowRank[wid]
+                    },
+                    preferredFocusForWorkspace: { [nextMap, weak self] ws, candidates in
+                        guard let self, let targetWid = self.persistedFocusedByWS[ws] else { return nil }
+                        return candidates.first { nextMap[$0]?.windowID == targetWid }
                     }
                 )
+                persistedWindowRank.removeAll()
+                persistedFocusedByWS.removeAll()
                 virtualSeeded = true
             }
 
@@ -554,7 +750,15 @@ final class Manager {
                 discovered: found.map(\.key),
                 currentlyFocused: frontKey,
                 assignedWorkspace: { [nextMap, weak self] key in
-                    self?.assignedWorkspace(for: nextMap[key]?.bundleID)
+                    guard let self, let win = nextMap[key] else { return nil }
+                    if let wid = win.windowID, let prevWS = self.lastWorkspaceByWindowID[wid] {
+                        return prevWS
+                    }
+                    if self.floating.contains(key),
+                       self.virtualEngine.activeWindows.contains(where: { nextMap[$0]?.pid == win.pid }) {
+                        return self.virtualEngine.active
+                    }
+                    return self.assignedWorkspace(for: win.bundleID)
                 },
                 canInsertBeforeFocus: { [nextMap] newKey, anchorKey in
                     nextMap[newKey]?.screen == nextMap[anchorKey]?.screen
@@ -566,9 +770,14 @@ final class Manager {
             }
 
             let nextActiveWindows = virtualEngine.activeWindows.compactMap { nextMap[$0] }
-            let activeChanged = nextActiveWindows.count != windows.count || zip(nextActiveWindows, windows).contains {
-                !CFEqual($0.element, $1.element) || $0.screen != $1.screen || $0.isResizable != $1.isResizable
-            }
+            let activeChanged = !newlyAutoFloatedOnActive.isEmpty
+                || nextActiveWindows.count != windows.count
+                || zip(nextActiveWindows, windows).contains {
+                    !CFEqual($0.element, $1.element)
+                        || $0.screen != $1.screen
+                        || $0.isResizable != $1.isResizable
+                        || isFloating($0) != isFloating($1)
+                }
 
             windows = nextActiveWindows
             if let focused = virtualEngine.activeFocused {
@@ -592,6 +801,9 @@ final class Manager {
                         relinquishFocusForEmptyWorkspace()
                     }
                 }
+            }
+            if virtualSeeded && (stacksChanged || activeChanged || switchedExternally || force) {
+                recordCurrentSessionState()
             }
             statusChanged?()
             return
@@ -629,6 +841,8 @@ final class Manager {
             knownAlive = Set(history.map(\.key))
         }
         floating = floating.filter { knownAlive.contains($0) }
+        autoFloatedKeys = autoFloatedKeys.filter { knownAlive.contains($0) }
+        userToggledFloatKeys = userToggledFloatKeys.filter { knownAlive.contains($0) }
         savedFrames = savedFrames.filter { knownAlive.contains($0.key) }
         homeScreens = homeScreens.filter { knownAlive.contains($0.key) }
         parkedKeys = parkedKeys.filter { knownAlive.contains($0) }
@@ -675,7 +889,16 @@ final class Manager {
             guard let rects else { continue }
             let current = focusedIndex().map { windows[$0] }
             for (w, r) in zip(group, rects) {
-                setFrame(w.element, CGRect(x: r.x, y: r.y, width: r.w, height: r.h))
+                let targetRect = CGRect(x: r.x, y: r.y, width: r.w, height: r.h)
+                if let cur = frame(w.element),
+                   abs(cur.origin.x - targetRect.origin.x) <= 1,
+                   abs(cur.origin.y - targetRect.origin.y) <= 1,
+                   abs(cur.size.width - targetRect.size.width) <= 1,
+                   abs(cur.size.height - targetRect.size.height) <= 1 {
+                    // Already at target frame; avoid redundant AX resize/move churn
+                } else {
+                    setFrame(w.element, targetRect)
+                }
                 parkedKeys.remove(w.key)
             }
             if mode == 2, let current, current.screen == screen { focus(current) }
@@ -706,6 +929,13 @@ final class Manager {
               let focused = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
               let window = windows.first(where: { CFEqual($0.element, focused) })
         else { return }
+        if Date() < programmaticFocusUntil, let target = programmaticFocusKey {
+            if window.key == target {
+                programmaticFocusUntil = .distantPast
+            } else {
+                return
+            }
+        }
         lastFocused = window.element
         if isVirtualMode {
             virtualEngine.setActiveFocus(window.key)
@@ -713,6 +943,11 @@ final class Manager {
     }
 
     func focusedIndex() -> Int? {
+        if Date() < programmaticFocusUntil,
+           let target = programmaticFocusKey,
+           let idx = windows.firstIndex(where: { $0.key == target }) {
+            return idx
+        }
         if AXIsProcessTrusted(), !isSessionScreenLocked(),
            let app = NSWorkspace.shared.frontmostApplication,
            app.processIdentifier != ownPID,
@@ -728,17 +963,26 @@ final class Manager {
 
     func focus(_ w: Window) {
         lastFocused = w.element
+        programmaticFocusKey = w.key
+        let deadline = Date().addingTimeInterval(0.45)
+        programmaticFocusUntil = deadline
+        suppressExternalFocusUntil = max(suppressExternalFocusUntil, deadline)
         if isVirtualMode {
             virtualEngine.setActiveFocus(w.key)
         }
-        NSRunningApplication(processIdentifier: w.pid)?.activate()
-        AXUIElementPerformAction(w.element, kAXRaiseAction as CFString)
         AXUIElementSetAttributeValue(w.element, kAXMainAttribute as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(w.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(w.element, kAXRaiseAction as CFString)
+        let axApp = AXUIElementCreateApplication(w.pid)
+        AXUIElementSetAttributeValue(axApp, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        NSRunningApplication(processIdentifier: w.pid)?.activate()
+        AXUIElementPerformAction(w.element, kAXRaiseAction as CFString)
     }
 
     private func relinquishFocusForEmptyWorkspace() {
         lastFocused = nil
+        programmaticFocusKey = nil
+        programmaticFocusUntil = .distantPast
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -758,6 +1002,7 @@ final class Manager {
         } else if windows.isEmpty {
             relinquishFocusForEmptyWorkspace()
         }
+        recordCurrentSessionState()
         statusChanged?()
     }
 
@@ -770,6 +1015,9 @@ final class Manager {
 
         let outcome = virtualEngine.moveWindow(moving.key, to: index)
         guard outcome.moved else { return }
+        if let wid = moving.windowID {
+            lastWorkspaceByWindowID[wid] = index
+        }
 
         windows = virtualEngine.activeWindows.compactMap { windowByKey[$0] }
         tile()
@@ -779,6 +1027,7 @@ final class Manager {
         } else {
             relinquishFocusForEmptyWorkspace()
         }
+        recordCurrentSessionState()
         statusChanged?()
     }
 
@@ -823,6 +1072,8 @@ final class Manager {
         case UInt32(kVK_ANSI_T):
             guard let i = focusedIndex(), windows[i].isResizable else { return }
             let win = windows[i]
+            userToggledFloatKeys.insert(win.key)
+            autoFloatedKeys.remove(win.key)
             if floating.contains(win.key) {
                 if let current = frame(win.element), !isParkedWindowFrame(current, screen: fullScreenRect(win.screen)) {
                     savedFrames[win.key] = current
@@ -832,25 +1083,35 @@ final class Manager {
             } else {
                 floating.insert(win.key)
                 tile()
-                let restored = savedFrames[win.key] ?? centeredFrame(size: CGSize(width: 860, height: 600), on: win.screen)
+                let area = screenRect(win.screen)
+                let saved = savedFrames[win.key]
+                let useSaved = saved.map { abs($0.width - area.width) > 4 || abs($0.height - area.height) > 4 } ?? false
+                let restored = (useSaved ? saved : nil) ?? centeredFrame(size: CGSize(width: 860, height: 600), on: win.screen)
+                savedFrames[win.key] = restored
                 setFrame(win.element, restored)
                 focus(win)
             }
+            recordCurrentSessionState()
         case UInt32(kVK_ANSI_H):
             currentRatio = max(0.2, currentRatio - ratioStep)
             tile()
+            recordCurrentSessionState()
         case UInt32(kVK_ANSI_L):
             currentRatio = min(0.8, currentRatio + ratioStep)
             tile()
+            recordCurrentSessionState()
         case UInt32(kVK_ANSI_Comma):
             currentMasters += 1
             tile()
+            recordCurrentSessionState()
         case UInt32(kVK_ANSI_Period):
             currentMasters = max(1, currentMasters - 1)
             tile()
+            recordCurrentSessionState()
         case UInt32(kVK_Space):
             currentLayoutMode = (currentLayoutMode + 1) % 3
             tile()
+            recordCurrentSessionState()
         case UInt32(kVK_ANSI_J), UInt32(kVK_ANSI_K):
             guard let i = focusedIndex(), windows.count > 1 else { return }
             if shift {
@@ -872,12 +1133,13 @@ final class Manager {
                 syncActiveVirtualStackFromWindows()
                 updateHistory(aliveKeys: isVirtualMode ? Set(windowByKey.keys) : nil)
                 tile()
+                recordCurrentSessionState()
             } else {
                 let indices = windows.indices.filter { windows[$0].screen == windows[i].screen }
                 guard let p = indices.firstIndex(of: i), indices.count > 1 else { return }
                 let next = indices[(p + (code == UInt32(kVK_ANSI_J) ? 1 : indices.count - 1)) % indices.count]
                 focus(windows[next])
-                if currentLayoutMode == 2 { tile() }
+                recordCurrentSessionState()
             }
         case UInt32(kVK_Return):
             guard let i = focusedIndex(),
@@ -891,6 +1153,7 @@ final class Manager {
             syncActiveVirtualStackFromWindows()
             updateHistory(aliveKeys: isVirtualMode ? Set(windowByKey.keys) : nil)
             tile()
+            recordCurrentSessionState()
         default: break
         }
     }
@@ -1349,6 +1612,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     @objc func reloadConfigNow() { onReloadConfig?() }
     @objc func quitApp() {
         settingsController?.viewModel.flushPendingSave()
+        manager.recordCurrentSessionState()
         manager.restoreAllParkedWindows()
         commands.stopAll()
         NSApp.terminate(nil)
@@ -1375,6 +1639,7 @@ NotificationCenter.default.addObserver(
     queue: .main
 ) { _ in
     settingsController?.viewModel.flushPendingSave()
+    manager.recordCurrentSessionState()
     manager.restoreAllParkedWindows()
     statusMenu.commands.stopAll()
 }
@@ -1495,6 +1760,7 @@ if !isAutomatedTest || ProcessInfo.processInfo.environment["TALUS_TEST_HOTKEYS"]
 func relaunchForFreshTCCSession(reason: String, extraEnv: [String: String] = [:]) -> Never {
     fputs("Talus relaunching for fresh Accessibility audit token (\(reason))...\n", stderr)
     settingsController?.viewModel.flushPendingSave()
+    manager.recordCurrentSessionState()
     manager.restoreAllParkedWindows()
     statusMenu.commands.stopAll()
     if lockFD >= 0 {
@@ -1608,6 +1874,7 @@ let stopSignals = [SIGINT, SIGTERM].map { number -> DispatchSourceSignal in
     let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
     source.setEventHandler {
         settingsController?.viewModel.flushPendingSave()
+        manager.recordCurrentSessionState()
         manager.restoreAllParkedWindows()
         statusMenu.commands.stopAll()
         exit(0)
@@ -1617,5 +1884,6 @@ let stopSignals = [SIGINT, SIGTERM].map { number -> DispatchSourceSignal in
 }
 
 app.run()
+manager.recordCurrentSessionState()
 manager.restoreAllParkedWindows()
 statusMenu.commands.stopAll()

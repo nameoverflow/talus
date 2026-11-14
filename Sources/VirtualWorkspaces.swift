@@ -1,6 +1,7 @@
 import Foundation
+import Darwin
 
-struct WorkspaceLayoutState: Equatable {
+struct WorkspaceLayoutState: Codable, Equatable {
     var layoutMode: Int
     var ratio: Double
     var masters: Int
@@ -9,6 +10,118 @@ struct WorkspaceLayoutState: Equatable {
         self.layoutMode = layoutMode
         self.ratio = ratio
         self.masters = masters
+    }
+}
+
+struct PersistedWindowRect: Codable, Equatable {
+    var x: Double
+    var y: Double
+    var width: Double
+    var height: Double
+
+    init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+struct PersistedWorkspaceSession: Codable, Equatable {
+    var activeWorkspace: Int
+    var layouts: [WorkspaceLayoutState]
+    var workspaceWindowIDs: [[UInt32]]
+    var focusedWindowIDByWorkspace: [String: UInt32]
+    var floatingWindowIDs: [UInt32]
+    var savedFramesByWindowID: [String: PersistedWindowRect]
+
+    init(
+        activeWorkspace: Int = 0,
+        layouts: [WorkspaceLayoutState] = [],
+        workspaceWindowIDs: [[UInt32]] = [],
+        focusedByWorkspace: [Int: UInt32] = [:],
+        floatingWindowIDs: [UInt32] = [],
+        savedFrames: [UInt32: PersistedWindowRect] = [:]
+    ) {
+        self.activeWorkspace = activeWorkspace
+        self.layouts = layouts
+        self.workspaceWindowIDs = workspaceWindowIDs
+        var focusOut: [String: UInt32] = [:]
+        for (ws, wid) in focusedByWorkspace {
+            focusOut[String(ws)] = wid
+        }
+        self.focusedWindowIDByWorkspace = focusOut
+        self.floatingWindowIDs = floatingWindowIDs.sorted()
+        var framesOut: [String: PersistedWindowRect] = [:]
+        for (wid, rect) in savedFrames {
+            framesOut[String(wid)] = rect
+        }
+        self.savedFramesByWindowID = framesOut
+    }
+
+    var focusedByWorkspaceMap: [Int: UInt32] {
+        var out: [Int: UInt32] = [:]
+        for (k, wid) in focusedWindowIDByWorkspace {
+            if let ws = Int(k) {
+                out[ws] = wid
+            }
+        }
+        return out
+    }
+
+    var savedFramesMap: [UInt32: PersistedWindowRect] {
+        var out: [UInt32: PersistedWindowRect] = [:]
+        for (k, rect) in savedFramesByWindowID {
+            if let wid = UInt32(k) {
+                out[wid] = rect
+            }
+        }
+        return out
+    }
+
+    static func defaultFileURL(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
+        if let custom = environment["TALUS_SESSION_FILE"], !custom.isEmpty {
+            let expanded = (custom as NSString).expandingTildeInPath
+            return URL(fileURLWithPath: expanded)
+        }
+        if environment["TALUS_TEST_PID"] != nil {
+            return nil
+        }
+        return homeDirectory.appendingPathComponent("Library/Application Support/Talus/session-state.json")
+    }
+
+    static func load(from url: URL) -> PersistedWorkspaceSession? {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url)
+        else { return nil }
+        return try? JSONDecoder().decode(PersistedWorkspaceSession.self, from: data)
+    }
+
+    func save(to url: URL) throws {
+        let dir = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(self)
+        let temporary = dir.appendingPathComponent(".talus-session-\(UUID().uuidString)")
+        let fd = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(fd); unlink(temporary.path) }
+        try data.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                let amount = write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                if amount < 0 && errno == EINTR { continue }
+                guard amount > 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                offset += amount
+            }
+        }
+        guard rename(temporary.path, url.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 }
 
@@ -73,10 +186,23 @@ final class VirtualWorkspaceEngine<ID: Hashable> {
         return stacks[workspace].count
     }
 
+    func restoreLayoutsAndActive(active restoredActive: Int, layouts restoredLayouts: [WorkspaceLayoutState]) {
+        active = min(count - 1, max(0, restoredActive))
+        for idx in 0..<min(count, restoredLayouts.count) {
+            let src = restoredLayouts[idx]
+            let mode = (0...2).contains(src.layoutMode) ? src.layoutMode : 0
+            let clampedRatio = min(0.8, max(0.2, src.ratio))
+            let clampedMasters = min(20, max(1, src.masters))
+            layouts[idx] = WorkspaceLayoutState(layoutMode: mode, ratio: clampedRatio, masters: clampedMasters)
+        }
+    }
+
     func seedFromCurrentDesktop(
         _ orderedWindows: [ID],
         focused: ID?,
-        assignedWorkspace: (ID) -> Int? = { _ in nil }
+        assignedWorkspace: (ID) -> Int? = { _ in nil },
+        preferredOrderRank: (ID) -> Int? = { _ in nil },
+        preferredFocusForWorkspace: (Int, [ID]) -> ID? = { _, _ in nil }
     ) {
         var seen: Set<ID> = []
         let unique = orderedWindows.filter { seen.insert($0).inserted }
@@ -88,8 +214,21 @@ final class VirtualWorkspaceEngine<ID: Hashable> {
             let ws = assignedWorkspace(id).flatMap { (0..<count).contains($0) ? $0 : nil } ?? active
             stacks[ws].append(id)
         }
+        for ws in 0..<count where stacks[ws].count > 1 {
+            let indexed = Array(stacks[ws].enumerated())
+            stacks[ws] = indexed.sorted { lhs, rhs in
+                let r1 = preferredOrderRank(lhs.element) ?? Int.max
+                let r2 = preferredOrderRank(rhs.element) ?? Int.max
+                if r1 != r2 { return r1 < r2 }
+                return lhs.offset < rhs.offset
+            }.map(\.element)
+        }
         for ws in 0..<count where !stacks[ws].isEmpty {
-            if let focused, stacks[ws].contains(focused) {
+            if ws == active, let focused, stacks[ws].contains(focused) {
+                focusedByWorkspace[ws] = focused
+            } else if let pref = preferredFocusForWorkspace(ws, stacks[ws]), stacks[ws].contains(pref) {
+                focusedByWorkspace[ws] = pref
+            } else if let focused, stacks[ws].contains(focused) {
                 focusedByWorkspace[ws] = focused
             } else {
                 focusedByWorkspace[ws] = stacks[ws].first
