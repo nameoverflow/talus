@@ -106,21 +106,16 @@ struct PersistedWorkspaceSession: Codable, Equatable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(self)
-        let temporary = dir.appendingPathComponent(".talus-session-\(UUID().uuidString)")
-        let fd = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
-        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        defer { close(fd); unlink(temporary.path) }
-        try data.withUnsafeBytes { buffer in
-            var offset = 0
-            while offset < buffer.count {
-                let amount = write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
-                if amount < 0 && errno == EINTR { continue }
-                guard amount > 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-                offset += amount
+        var errPtr: UnsafeMutablePointer<CChar>?
+        let ok = data.withUnsafeBytes { rawBuf in
+            url.path.withCString { cPath in
+                let ptr = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                return talus_write_atomic_0600(ptr, data.count, cPath, &errPtr)
             }
         }
-        guard rename(temporary.path, url.path) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        defer { if let errPtr { talus_string_free(errPtr) } }
+        guard ok else {
+            throw POSIXError(.EIO)
         }
     }
 }

@@ -1,6 +1,6 @@
 import AppKit
 
-struct StatusPart: Equatable {
+struct StatusPart: Codable, Equatable {
     let text: String
     let style: StatusSegmentStyle?
     let isCurrent: Bool

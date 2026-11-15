@@ -1,6 +1,6 @@
 import Foundation
 
-enum StatusBoxType: String, Equatable {
+enum StatusBoxType: String, Codable, Equatable {
     case full = "Full"
     case bottom = "Bottom"
     case top = "Top"
@@ -8,7 +8,7 @@ enum StatusBoxType: String, Equatable {
     case vBoth = "VBoth"
 }
 
-struct StatusBoxStyle: Equatable {
+struct StatusBoxStyle: Codable, Equatable {
     var type: StatusBoxType = .full
     var width: Double = 2
     var color: String?
@@ -16,13 +16,43 @@ struct StatusBoxStyle: Equatable {
 }
 
 /// Internal rendering style produced by the markup parser.
-struct StatusSegmentStyle: Equatable {
+struct StatusSegmentStyle: Codable, Equatable {
     var foreground: String?
     var background: String?
     var font: String?
     var fontSize: Double?
     var dimmed: Bool = false
     var box: StatusBoxStyle?
+
+    init(
+        foreground: String? = nil,
+        background: String? = nil,
+        font: String? = nil,
+        fontSize: Double? = nil,
+        dimmed: Bool = false,
+        box: StatusBoxStyle? = nil
+    ) {
+        self.foreground = foreground
+        self.background = background
+        self.font = font
+        self.fontSize = fontSize
+        self.dimmed = dimmed
+        self.box = box
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case foreground, background, font, fontSize, dimmed, box
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        foreground = try c.decodeIfPresent(String.self, forKey: .foreground)
+        background = try c.decodeIfPresent(String.self, forKey: .background)
+        font = try c.decodeIfPresent(String.self, forKey: .font)
+        fontSize = try c.decodeIfPresent(Double.self, forKey: .fontSize)
+        dimmed = try c.decodeIfPresent(Bool.self, forKey: .dimmed) ?? false
+        box = try c.decodeIfPresent(StatusBoxStyle.self, forKey: .box)
+    }
 }
 
 struct StatusCommand: Codable, Equatable {

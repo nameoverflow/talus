@@ -1,20 +1,32 @@
-.PHONY: all clean app dist install setup-cert
+.PHONY: all clean app dist install setup-cert rust-test
 CERT_NAME ?= Talus Local Code Signing
 CODESIGN_IDENTITY ?= auto
+CORE_LIB = Core/target/release/libtalus_core.a
+CORE_HEADER = Core/include/talus_core.h
+CORE_FLAGS = -import-objc-header $(CORE_HEADER) $(CORE_LIB)
+CORE_SOURCES = Core/Cargo.toml $(wildcard Core/src/*.rs)
+
 all: build/talus
+
+$(CORE_LIB): $(CORE_SOURCES)
+	cargo build --release --manifest-path Core/Cargo.toml
+
 APP_SOURCES = Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/SettingsWindow.swift
-build/talus: $(APP_SOURCES)
+build/talus: $(APP_SOURCES) $(CORE_LIB) $(CORE_HEADER)
 	mkdir -p build
-	swiftc -O $(APP_SOURCES) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework Carbon -framework ApplicationServices -o $@
+	swiftc -O $(APP_SOURCES) $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework Carbon -framework ApplicationServices -o $@
 clean:
 	rm -rf build
-test:
+	cargo clean --manifest-path Core/Cargo.toml
+rust-test:
+	cargo test --manifest-path Core/Cargo.toml
+test: rust-test $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/Layout.swift Tests/LayoutTests.swift -o build/layout-tests
+	swiftc Sources/Layout.swift Tests/LayoutTests.swift $(CORE_FLAGS) -o build/layout-tests
 	build/layout-tests
-property-test:
+property-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc -O Sources/Layout.swift Tests/LayoutProperties.swift -o build/layout-properties
+	swiftc -O Sources/Layout.swift Tests/LayoutProperties.swift $(CORE_FLAGS) -o build/layout-properties
 	build/layout-properties
 stack-test:
 	mkdir -p build
@@ -68,25 +80,25 @@ dist: build/talus Resources/Info.plist build/Talus.icns
 	codesign --force --sign "$$id" build/dist/Talus.app
 	ditto -c -k --keepParent build/dist/Talus.app build/Talus-macos.zip
 	@echo "Built distributable archive: build/Talus-macos.zip"
-toml-test:
+toml-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/TOML.swift Tests/TOMLTests.swift -o build/toml-tests
+	swiftc Sources/TOML.swift Tests/TOMLTests.swift $(CORE_FLAGS) -o build/toml-tests
 	build/toml-tests
-config-test:
+config-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Tests/ConfigurationTests.swift -o build/config-tests
+	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Tests/ConfigurationTests.swift $(CORE_FLAGS) -o build/config-tests
 	build/config-tests
-settings-ui-test:
+settings-ui-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/SettingsWindow.swift Tests/SettingsViewModelTests.swift -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework CoreGraphics -o build/settings-ui-tests
+	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/SettingsWindow.swift Tests/SettingsViewModelTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework CoreGraphics -o build/settings-ui-tests
 	build/settings-ui-tests
 integration-test: all
 	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
 	swiftc Tests/Integration/Probe.swift -o build/integration-probe
 	Tests/Integration/smoke.sh
-virtual-workspace-test:
+virtual-workspace-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/VirtualWorkspaces.swift Tests/VirtualWorkspaceTests.swift -o build/virtual-workspace-tests
+	swiftc Sources/VirtualWorkspaces.swift Tests/VirtualWorkspaceTests.swift $(CORE_FLAGS) -o build/virtual-workspace-tests
 	build/virtual-workspace-tests
 test: toml-test config-test settings-ui-test virtual-workspace-test history-test stack-test screen-test
 multi-integration-test: all
@@ -97,38 +109,38 @@ latency-test: all
 	swiftc Tests/Integration/EventFixture.swift -o build/event-fixture
 	swiftc Tests/Integration/EventProbe.swift -o build/event-probe
 	Tests/Integration/latency.sh
-screen-test:
+screen-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/ScreenGeometry.swift Tests/ScreenGeometryTests.swift -o build/screen-tests
+	swiftc Sources/ScreenGeometry.swift Tests/ScreenGeometryTests.swift $(CORE_FLAGS) -o build/screen-tests
 	build/screen-tests
 icon-test:
 	mkdir -p build
 	swiftc Sources/StatusIcon.swift Tests/StatusIconTests.swift -framework Cocoa -o build/icon-tests
 	build/icon-tests
 test: icon-test
-status-test:
+status-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/Spaces.swift Sources/StatusText.swift Tests/StatusTextTests.swift -framework Cocoa -framework CoreGraphics -o build/status-tests
+	swiftc Sources/Spaces.swift Sources/StatusText.swift Tests/StatusTextTests.swift $(CORE_FLAGS) -framework Cocoa -framework CoreGraphics -o build/status-tests
 	build/status-tests
 test: status-test
-status-export-test:
+status-export-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/Spaces.swift Sources/StatusExport.swift Tests/StatusExportTests.swift -framework Cocoa -framework CoreGraphics -o build/status-export-tests
+	swiftc Sources/Spaces.swift Sources/StatusExport.swift Tests/StatusExportTests.swift $(CORE_FLAGS) -framework Cocoa -framework CoreGraphics -o build/status-export-tests
 	build/status-export-tests
 test: status-export-test
-rich-status-test:
+rich-status-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Tests/StatusRichTests.swift -framework Cocoa -framework CoreGraphics -o build/rich-status-tests
+	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Tests/StatusRichTests.swift $(CORE_FLAGS) -framework Cocoa -framework CoreGraphics -o build/rich-status-tests
 	build/rich-status-tests
 test: rich-status-test
-status-command-test:
+status-command-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/StatusCommands.swift Tests/StatusCommandTests.swift -o build/status-command-tests
+	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/StatusCommands.swift Tests/StatusCommandTests.swift $(CORE_FLAGS) -o build/status-command-tests
 	build/status-command-tests
 test: status-command-test
-haskell-status-test:
+haskell-status-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/StatusCommands.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Tests/HaskellStatusIntegration.swift -framework Cocoa -framework CoreGraphics -o build/haskell-status-tests
+	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/StatusCommands.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Tests/HaskellStatusIntegration.swift $(CORE_FLAGS) -framework Cocoa -framework CoreGraphics -o build/haskell-status-tests
 	build/haskell-status-tests "$$(command -v runghc)" "$$PWD/Examples/clock.hs"
 status-cleanup-test: all
 	Tests/Integration/command-cleanup.sh
