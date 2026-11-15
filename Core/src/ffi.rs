@@ -628,6 +628,21 @@ pub struct TalusManagerHandle {
     core: ManagerCore,
 }
 
+fn deserialize_u64_rect_map<'de, D>(deserializer: D) -> Result<HashMap<u64, Rect>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = HashMap::<String, Rect>::deserialize(deserializer)?;
+    let mut out = HashMap::with_capacity(raw.len());
+    for (k, v) in raw {
+        let parsed = k
+            .parse::<u64>()
+            .map_err(|_| serde::de::Error::custom(format!("invalid u64 map key: {}", k)))?;
+        out.insert(parsed, v);
+    }
+    Ok(out)
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 enum ManagerRequest {
@@ -652,6 +667,7 @@ enum ManagerRequest {
         now: f64,
         trusted: bool,
         frontmost_key: Option<u64>,
+        #[serde(deserialize_with = "deserialize_u64_rect_map")]
         live_frames: HashMap<u64, Rect>,
     },
     #[serde(rename_all = "camelCase")]
@@ -660,6 +676,7 @@ enum ManagerRequest {
         now: f64,
         trusted: bool,
         frontmost_key: Option<u64>,
+        #[serde(deserialize_with = "deserialize_u64_rect_map")]
         live_frames: HashMap<u64, Rect>,
     },
     #[serde(rename_all = "camelCase")]
@@ -668,6 +685,7 @@ enum ManagerRequest {
         now: f64,
         trusted: bool,
         frontmost_key: Option<u64>,
+        #[serde(deserialize_with = "deserialize_u64_rect_map")]
         live_frames: HashMap<u64, Rect>,
     },
     #[serde(rename_all = "camelCase")]
@@ -676,6 +694,7 @@ enum ManagerRequest {
         trusted: bool,
         locked: bool,
         frontmost_key: Option<u64>,
+        #[serde(deserialize_with = "deserialize_u64_rect_map")]
         live_frames: HashMap<u64, Rect>,
     },
     #[serde(rename_all = "camelCase")]
@@ -685,6 +704,7 @@ enum ManagerRequest {
         trusted: bool,
         locked: bool,
         app_focused_key: Option<u64>,
+        #[serde(deserialize_with = "deserialize_u64_rect_map")]
         live_frames: HashMap<u64, Rect>,
     },
     #[serde(rename_all = "camelCase")]
@@ -693,11 +713,13 @@ enum ManagerRequest {
         now: f64,
         trusted: bool,
         frontmost_key: Option<u64>,
+        #[serde(deserialize_with = "deserialize_u64_rect_map")]
         live_frames: HashMap<u64, Rect>,
     },
     #[serde(rename_all = "camelCase")]
     RestoreAllParkedWindows {
         trusted: bool,
+        #[serde(deserialize_with = "deserialize_u64_rect_map")]
         live_frames: HashMap<u64, Rect>,
     },
     #[serde(rename_all = "camelCase")]
@@ -936,3 +958,198 @@ pub extern "C" fn talus_manager_dispatch(
 const _: Option<WorkspaceLayoutState> = None;
 const _: Option<PersistedWorkspaceSession> = None;
 const _: fn(&[u8], &Path) -> Result<(), String> = write_atomic_0600;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::WorkspaceTarget;
+
+    fn dispatch(handle: *mut TalusManagerHandle, payload: serde_json::Value) -> String {
+        let req = CString::new(payload.to_string()).unwrap();
+        let ptr = talus_manager_dispatch(handle, req.as_ptr());
+        assert!(!ptr.is_null());
+        let out = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_string();
+        talus_string_free(ptr);
+        out
+    }
+
+    #[test]
+    fn manager_dispatch_decodes_non_empty_live_frames_for_all_ops() {
+        let mut cfg = Configuration::default();
+        cfg.workspace_mode = "virtual".to_string();
+        cfg.workspace_count = 5;
+        cfg.app_workspaces
+            .insert("com.apple.Terminal".to_string(), WorkspaceTarget::Index(2));
+        cfg.app_workspaces
+            .insert("com.google.Chrome".to_string(), WorkspaceTarget::Label("网页".to_string()));
+        let cfg_c = CString::new(serde_json::to_string(&cfg).unwrap()).unwrap();
+        let empty = CString::new("").unwrap();
+        let handle = talus_manager_new(cfg_c.as_ptr(), empty.as_ptr());
+        assert!(!handle.is_null());
+
+        let refresh_out: ManagerActionOutput = serde_json::from_str(&dispatch(
+            handle,
+            serde_json::json!({
+                "op": "refresh",
+                "force": true,
+                "now": 100.0,
+                "screens": [{
+                    "id": 0,
+                    "visibleFrame": {"x": 0.0, "y": 34.0, "w": 1710.0, "h": 1073.0},
+                    "fullFrame": {"x": 0.0, "y": 0.0, "w": 1710.0, "h": 1107.0}
+                }],
+                "candidates": [{
+                    "key": 1,
+                    "pid": 1001,
+                    "bundleId": "com.example.App",
+                    "windowId": 42,
+                    "title": "Main",
+                    "screenId": 0,
+                    "isResizable": true,
+                    "frame": {"x": 0.0, "y": 34.0, "w": 855.0, "h": 1073.0}
+                }],
+                "busyPids": [],
+                "visibleWindowIds": [42],
+                "allExistingCgWindowIds": [42],
+                "deadHistoryKeys": [],
+                "eligibleVisibleWindowExists": true,
+                "frontmostKey": 1,
+                "traceEvents": false
+            }),
+        ))
+        .unwrap();
+        assert_eq!(refresh_out.active_workspace, 0);
+
+        let live_frames = serde_json::json!({
+            "1": {"x": 0.0, "y": 34.0, "w": 1710.0, "h": 1073.0}
+        });
+
+        let switch_out: ManagerActionOutput = serde_json::from_str(&dispatch(
+            handle,
+            serde_json::json!({
+                "op": "switchWorkspace",
+                "index": 1,
+                "now": 101.0,
+                "trusted": true,
+                "frontmostKey": 1,
+                "liveFrames": live_frames
+            }),
+        ))
+        .unwrap();
+        assert_eq!(switch_out.active_workspace, 1);
+        assert!(switch_out.status_changed);
+        assert!(!switch_out.effects.is_empty());
+
+        let move_out: ManagerActionOutput = serde_json::from_str(&dispatch(
+            handle,
+            serde_json::json!({
+                "op": "moveWindowToWorkspace",
+                "index": 2,
+                "now": 102.0,
+                "trusted": true,
+                "frontmostKey": 1,
+                "liveFrames": live_frames
+            }),
+        ))
+        .unwrap();
+        assert!(move_out.is_virtual_mode);
+
+        let key_out: ManagerActionOutput = serde_json::from_str(&dispatch(
+            handle,
+            serde_json::json!({
+                "op": "handleKey",
+                "code": 49,
+                "shift": false,
+                "now": 103.0,
+                "trusted": true,
+                "frontmostKey": 1,
+                "liveFrames": live_frames
+            }),
+        ))
+        .unwrap();
+        assert_eq!(key_out.layout_name, "Mirror");
+
+        let ax_out: ManagerActionOutput = serde_json::from_str(&dispatch(
+            handle,
+            serde_json::json!({
+                "op": "handleAxFocusNotification",
+                "now": 104.0,
+                "trusted": true,
+                "locked": false,
+                "frontmostKey": 1,
+                "liveFrames": live_frames
+            }),
+        ))
+        .unwrap();
+        assert!(ax_out.is_virtual_mode);
+
+        let app_out: ManagerActionOutput = serde_json::from_str(&dispatch(
+            handle,
+            serde_json::json!({
+                "op": "handleApplicationActivated",
+                "pid": 1001,
+                "now": 105.0,
+                "trusted": true,
+                "locked": false,
+                "appFocusedKey": 1,
+                "liveFrames": live_frames
+            }),
+        ))
+        .unwrap();
+        assert!(app_out.is_virtual_mode);
+
+        let cfg_out: ManagerActionOutput = serde_json::from_str(&dispatch(
+            handle,
+            serde_json::json!({
+                "op": "applyConfig",
+                "config": cfg,
+                "now": 106.0,
+                "trusted": true,
+                "frontmostKey": 1,
+                "liveFrames": live_frames
+            }),
+        ))
+        .unwrap();
+        assert_eq!(cfg_out.workspace_count, 5);
+
+        let park_out: ManagerActionOutput = serde_json::from_str(&dispatch(
+            handle,
+            serde_json::json!({
+                "op": "switchWorkspace",
+                "index": 3,
+                "now": 106.5,
+                "trusted": true,
+                "frontmostKey": 1,
+                "liveFrames": live_frames
+            }),
+        ))
+        .unwrap();
+        assert_eq!(park_out.active_workspace, 3);
+
+        let restore_out: ManagerActionOutput = serde_json::from_str(&dispatch(
+            handle,
+            serde_json::json!({
+                "op": "restoreAllParkedWindows",
+                "trusted": true,
+                "liveFrames": live_frames
+            }),
+        ))
+        .unwrap();
+        assert!(!restore_out.effects.is_empty());
+
+        let invalid_out = dispatch(
+            handle,
+            serde_json::json!({
+                "op": "switchWorkspace",
+                "index": 1,
+                "now": 107.0,
+                "trusted": true,
+                "frontmostKey": 1,
+                "liveFrames": {"not_a_number": {"x": 0.0, "y": 0.0, "w": 100.0, "h": 100.0}}
+            }),
+        );
+        assert_eq!(invalid_out, "{}");
+
+        talus_manager_free(handle);
+    }
+}
