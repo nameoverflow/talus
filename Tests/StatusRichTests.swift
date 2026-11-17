@@ -60,6 +60,16 @@ import AppKit
     precondition(rendered.workspaceRegions[0].rect.maxX < rendered.workspaceRegions[1].rect.minX)
     precondition(rendered.workspaceRegions[1].rect.maxX < rendered.workspaceRegions[2].rect.minX)
 
+    let buttonBounds = NSRect(x: 0, y: 0, width: rendered.image.size.width + 16, height: 24)
+    let imageRect = NSRect(x: 8, y: 3, width: rendered.image.size.width, height: 18)
+    for region in rendered.workspaceRegions {
+        let point = NSPoint(x: imageRect.minX + region.rect.midX, y: buttonBounds.midY)
+        precondition(statusWorkspaceIndex(at: point, buttonBounds: buttonBounds,
+                                         imageRect: imageRect, regions: rendered.workspaceRegions) == region.index)
+    }
+    precondition(statusWorkspaceIndex(at: NSPoint(x: -1, y: 12), buttonBounds: buttonBounds,
+                                     imageRect: imageRect, regions: rendered.workspaceRegions) == nil)
+
     // <box> underline/outline tags & empty-foreground background <fc=,#bg>
     let boxParts = parseStatusMarkup("<box type=Bottom width=2 color=#14B8A6>ws1</box> <fc=,#80808024>ws2</fc> <box type=bogus>raw</box>", fonts:[], fontSize:11.5)
     precondition(boxParts.first { $0.text == "ws1" }?.style?.box == StatusBoxStyle(type: .bottom, width: 2, color: "#14B8A6", radius: nil))
