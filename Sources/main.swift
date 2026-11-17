@@ -33,55 +33,6 @@ func isSessionScreenLocked() -> Bool {
     return isSessionDictionaryLocked(session, frontmostBundleID: frontBundle)
 }
 
-func axValue(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
-    var result: CFTypeRef?
-    return AXUIElementCopyAttributeValue(element, attribute, &result) == .success ? result : nil
-}
-
-func frame(_ e: AXUIElement) -> CGRect? {
-    var values: CFArray?
-    let error = AXUIElementCopyMultipleAttributeValues(e, [kAXPositionAttribute, kAXSizeAttribute] as CFArray,
-        AXCopyMultipleAttributeOptions(rawValue: 0), &values)
-    if error == .cannotComplete || error == .invalidUIElement { return nil }
-    let attributes = values as? [CFTypeRef]
-    guard let p = attributes?.first ?? axValue(e, kAXPositionAttribute as CFString),
-          let s = (attributes?.count == 2 ? attributes?[1] : nil) ?? axValue(e, kAXSizeAttribute as CFString),
-          CFGetTypeID(p) == AXValueGetTypeID(),
-          CFGetTypeID(s) == AXValueGetTypeID()
-    else { return nil }
-    var point = CGPoint.zero; var size = CGSize.zero
-    guard AXValueGetValue(p as! AXValue, .cgPoint, &point),
-          AXValueGetValue(s as! AXValue, .cgSize, &size)
-    else { return nil }
-    return CGRect(origin: point, size: size)
-}
-
-@discardableResult
-func setFrame(_ e: AXUIElement, _ r: CGRect, current: CGRect? = nil) -> AXError {
-    if let current, abs(current.width - r.width) < 1, abs(current.height - r.height) < 1 {
-        return setPosition(e, r.origin)
-    }
-    var p = r.origin; var s = r.size
-    if let position = AXValueCreate(.cgPoint, &p), let size = AXValueCreate(.cgSize, &s) {
-        // Keep resize-before-move and the final resize for apps which constrain
-        // their frame to the old display, but use one call for position-only work.
-        AXUIElementSetAttributeValue(e, kAXSizeAttribute as CFString, size)
-        let moved = AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, position)
-        let resized = AXUIElementSetAttributeValue(e, kAXSizeAttribute as CFString, size)
-        return moved == .success ? resized : moved
-    }
-    return .failure
-}
-
-@discardableResult
-func setPosition(_ e: AXUIElement, _ origin: CGPoint) -> AXError {
-    var p = origin
-    if let position = AXValueCreate(.cgPoint, &p) {
-        return AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, position)
-    }
-    return .failure
-}
-
 func screenRect(_ screen: NSScreen) -> CGRect {
     let r = screen.visibleFrame
     let top = NSScreen.screens.first?.frame.maxY ?? 0
@@ -173,6 +124,7 @@ final class Manager {
     private var elementByHandle: [UInt64: AXUIElement] = [:]
     private var pidByHandle: [UInt64: pid_t] = [:]
     private var nextHandle: UInt64 = 1
+    private var foregroundCreation: (key: UInt64, pid: pid_t, until: Date)?
     private var frameByHandle: [UInt64: CGRect] = [:]
     private var dirtyFrameHandles: Set<UInt64> = []
     private var observedWindowHandles: Set<UInt64> = []
@@ -500,6 +452,13 @@ final class Manager {
         DispatchQueue.main.async(execute: work)
     }
 
+    func noteCreatedWindow(_ element: AXUIElement, pid: pid_t) {
+        guard WindowFocus.isFrontmost(pid) else { return }
+        foregroundCreation = (handle(for: element, pid: pid), pid, Date().addingTimeInterval(1.5))
+    }
+
+    func cancelNewWindowFocus() { foregroundCreation = nil }
+
     func observeApplications() {
         guard AXIsProcessTrusted(), !isSessionScreenLocked() else { return }
         let applications = NSWorkspace.shared.runningApplications.filter {
@@ -530,6 +489,9 @@ final class Manager {
                 }
                 var pid: pid_t = 0
                 AXUIElementGetPid(element, &pid)
+                if name == kAXWindowCreatedNotification as String, pid != 0 {
+                    manager.noteCreatedWindow(element, pid: pid)
+                }
                 manager.rememberFocus()
                 manager.scheduleRefresh(pid: pid == 0 ? nil : pid,
                     created: name == kAXWindowCreatedNotification as String ? element : nil)
@@ -693,12 +655,24 @@ final class Manager {
                     self.failedWriteAttempts.removeValue(forKey: key)
                 }
                 if result.staleAPIDisabled { self.onStaleSandboxTCCDetected?() }
+                var frontmost = self.currentFrontmostWindowHandle()
+                if let created = self.foregroundCreation {
+                    if created.until < Date() || !WindowFocus.isFrontmost(created.pid) {
+                        self.foregroundCreation = nil
+                    } else if self.candidatesByHandle[created.key] != nil {
+                        // A queued activation of an older window must not beat
+                        // the foreground app's newly created window.
+                        _ = self.dispatchJSON(["op": "cancelFocusDelivery"])
+                        frontmost = created.key
+                        self.foregroundCreation = nil
+                    }
+                }
                 let payload = WireRefreshPayload(force: requestedForce, now: Date().timeIntervalSince1970,
                     screens: wireScreens, candidates: self.candidatesByHandle.values.sorted { $0.key < $1.key },
                     busyPids: Array(result.busyPIDs), visibleWindowIds: result.visibleWindowIDs,
                     allExistingCgWindowIds: result.existingWindowIDs, deadHistoryKeys: result.deadHandles,
                     eligibleVisibleWindowExists: result.eligibleVisibleWindowExists,
-                    frontmostKey: self.currentFrontmostWindowHandle(),
+                    frontmostKey: frontmost,
                     traceEvents: ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1")
                 if let data = try? JSONEncoder().encode(payload) { _ = self.dispatchData(data) }
                 self.statusChanged?()
@@ -723,6 +697,7 @@ final class Manager {
     }
 
     func switchWorkspace(_ index: Int) {
+        foregroundCreation = nil
         var req: [String: Any] = [
             "op": "switchWorkspace",
             "index": index,
@@ -738,6 +713,7 @@ final class Manager {
     }
 
     func moveWindowToWorkspace(_ index: Int) {
+        foregroundCreation = nil
         var req: [String: Any] = [
             "op": "moveWindowToWorkspace",
             "index": index,
@@ -753,6 +729,7 @@ final class Manager {
     }
 
     func key(_ code: UInt32, shift: Bool) {
+        foregroundCreation = nil
         var req: [String: Any] = [
             "op": "handleKey",
             "code": code,
@@ -1446,6 +1423,12 @@ let unlockObserver = DistributedNotificationCenter.default().addObserver(
         manager.refresh(force: true)
         statusMenu.updateStatus()
     }
+}
+let creationPointerMask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+let creationGlobalPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: creationPointerMask) { _ in manager.cancelNewWindowFocus() }
+let creationLocalPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: creationPointerMask) { event in
+    manager.cancelNewWindowFocus()
+    return event
 }
 let activationToken = workspace.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification,

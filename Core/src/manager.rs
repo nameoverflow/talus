@@ -472,6 +472,12 @@ impl ManagerCore {
         }
     }
 
+    pub fn cancel_focus_delivery(&mut self) {
+        self.programmatic_focus_key = None;
+        self.programmatic_focus_until = 0.0;
+        self.suppress_external_focus_until = 0.0;
+    }
+
     pub fn focused_index(&self, now: f64, frontmost_key: Option<u64>) -> Option<usize> {
         if now < self.programmatic_focus_until {
             if let Some(target) = self.programmatic_focus_key {
@@ -1789,6 +1795,55 @@ mod tests {
         assert_eq!(sw_out.active_window_keys, vec![1]);
         assert_eq!(sw_out.active_workspace, 1);
         assert!(sw_out
+            .effects
+            .iter()
+            .any(|e| matches!(e, WindowEffect::Focus { key: 1, .. })));
+    }
+
+    #[test]
+    fn foreground_creation_can_replace_an_older_full_layout_focus() {
+        let cfg = Configuration {
+            workspace_mode: "virtual".into(),
+            ..Configuration::default()
+        };
+        let mut mgr = ManagerCore::new(&cfg, None);
+        let first = candidate(1, 101, 1001, "app.zen-browser.zen", "old");
+        mgr.refresh(
+            false,
+            10.0,
+            vec![sample_screen()],
+            vec![first.clone()],
+            &[],
+            &[101],
+            &[101],
+            &[],
+            &[],
+            true,
+            Some(1),
+            false,
+        );
+        mgr.set_current_layout_mode(2);
+        mgr.switch_workspace(0, 10.1, true, Some(1), &HashMap::new());
+        mgr.cancel_focus_delivery();
+        let created = mgr.refresh(
+            false,
+            10.2,
+            vec![sample_screen()],
+            vec![first, candidate(2, 102, 1001, "app.zen-browser.zen", "new")],
+            &[],
+            &[101, 102],
+            &[101, 102],
+            &[],
+            &[],
+            true,
+            Some(2),
+            false,
+        );
+        assert!(created
+            .effects
+            .iter()
+            .any(|e| matches!(e, WindowEffect::Focus { key: 2, .. })));
+        assert!(!created
             .effects
             .iter()
             .any(|e| matches!(e, WindowEffect::Focus { key: 1, .. })));
