@@ -4,6 +4,7 @@ use crate::layout::{
     tall_layout_with_gaps, Rect,
 };
 use crate::screen_geometry::{is_parked_window_frame, parked_window_origin};
+use crate::session_writer::SessionWriter;
 use crate::status_markup::SpaceEntry;
 use crate::virtual_workspaces::{
     PersistedWindowRect, PersistedWorkspaceSession, VirtualWorkspaceEngine,
@@ -121,6 +122,7 @@ pub struct ManagerCore {
     pub persisted_floating_ids: HashSet<u32>,
     pub persisted_saved_frames: HashMap<u32, Rect>,
     last_saved_session: Option<PersistedWorkspaceSession>,
+    session_writer: Option<SessionWriter>,
 
     native_ratio: f64,
     native_masters: usize,
@@ -160,6 +162,7 @@ impl ManagerCore {
             suppress_external_focus_until: 0.0,
             programmatic_focus_key: None,
             programmatic_focus_until: 0.0,
+            session_writer: session_file_path.clone().map(SessionWriter::new),
             session_file_path,
             last_workspace_by_window_id: HashMap::new(),
             persisted_window_rank: HashMap::new(),
@@ -251,6 +254,8 @@ impl ManagerCore {
     }
 
     fn load_persisted_session_if_available(&mut self) {
+        // A quick native -> virtual toggle may follow a queued virtual save.
+        self.flush_session();
         let Some(ref path) = self.session_file_path else {
             return;
         };
@@ -303,7 +308,7 @@ impl ManagerCore {
                 }
             }
         }
-        let Some(ref path) = self.session_file_path else {
+        let Some(ref writer) = self.session_writer else {
             return;
         };
         let workspace_window_ids: Vec<Vec<u32>> = self
@@ -358,13 +363,17 @@ impl ManagerCore {
             &floating_ids,
             &frames_out,
         );
-        if self.last_saved_session.as_ref() == Some(&snapshot) {
+        if self.last_saved_session.as_ref() == Some(&snapshot) && !writer.failed() {
             return;
         }
-        if let Err(e) = snapshot.save_to_path(path) {
-            eprintln!("Talus session save failed: {}", e);
-        } else {
+        if writer.submit(snapshot.clone()) {
             self.last_saved_session = Some(snapshot);
+        }
+    }
+
+    pub fn flush_session(&self) {
+        if let Some(writer) = &self.session_writer {
+            writer.flush();
         }
     }
 
@@ -450,6 +459,8 @@ impl ManagerCore {
             if let Some(target) = self.programmatic_focus_key {
                 if fk == target {
                     self.programmatic_focus_until = 0.0;
+                    // Confirmed focus no longer needs the fallback echo guard.
+                    self.suppress_external_focus_until = 0.0;
                 } else {
                     return;
                 }
@@ -1146,6 +1157,9 @@ impl ManagerCore {
         live_frames: &HashMap<u64, Rect>,
     ) -> ManagerActionOutput {
         self.update_live_frames(live_frames);
+        if trusted && !locked {
+            self.remember_focus(now, frontmost_key);
+        }
         if !self.is_virtual_mode()
             || self.paused
             || !trusted
@@ -1191,6 +1205,15 @@ impl ManagerCore {
         live_frames: &HashMap<u64, Rect>,
     ) -> ManagerActionOutput {
         self.update_live_frames(live_frames);
+        if trusted && !locked {
+            self.remember_focus(now, app_focused_key);
+            // An empty workspace has no target window to acknowledge. The
+            // shell verifies that this activation is currently frontmost, so
+            // it is new intent rather than an old AX focus echo.
+            if self.windows.is_empty() && self.programmatic_focus_key.is_none() {
+                self.suppress_external_focus_until = 0.0;
+            }
+        }
         if !self.is_virtual_mode()
             || self.paused
             || !trusted
@@ -1208,8 +1231,12 @@ impl ManagerCore {
                 .into_iter()
                 .filter(|k| self.window_by_key.get(k).map(|w| w.pid) == Some(pid))
                 .collect();
-            let active_set: HashSet<u64> =
-                self.virtual_engine.active_windows().iter().copied().collect();
+            let active_set: HashSet<u64> = self
+                .virtual_engine
+                .active_windows()
+                .iter()
+                .copied()
+                .collect();
             if !app_keys.iter().any(|k| active_set.contains(k)) {
                 app_keys.into_iter().next()
             } else {
@@ -1484,8 +1511,10 @@ impl ManagerCore {
                     let next = indices[(p + step) % indices.len()];
                     let direction = if code == KVK_ANSI_J { 1 } else { -1 };
                     if (direction > 0 && p == indices.len() - 1) || (direction < 0 && p == 0) {
-                        let mut group: Vec<TrackedWindow> =
-                            indices.iter().map(|&idx| self.windows[idx].clone()).collect();
+                        let mut group: Vec<TrackedWindow> = indices
+                            .iter()
+                            .map(|&idx| self.windows[idx].clone())
+                            .collect();
                         if direction > 0 {
                             if let Some(last) = group.pop() {
                                 group.insert(0, last);
@@ -1763,6 +1792,57 @@ mod tests {
             .effects
             .iter()
             .any(|e| matches!(e, WindowEffect::Focus { key: 1, .. })));
+    }
+
+    #[test]
+    fn confirmed_focus_accepts_next_workspace_activation_without_waiting() {
+        let cfg = Configuration {
+            workspace_mode: "virtual".into(),
+            workspace_count: 3,
+            ..Configuration::default()
+        };
+        let mut mgr = ManagerCore::new(&cfg, None);
+        mgr.refresh(
+            false,
+            10.0,
+            vec![sample_screen()],
+            vec![
+                candidate(1, 101, 1001, "com.apple.Terminal", "term"),
+                candidate(2, 102, 1002, "com.apple.Safari", "web"),
+            ],
+            &[],
+            &[101, 102],
+            &[101, 102],
+            &[],
+            &[],
+            true,
+            Some(1),
+            false,
+        );
+        mgr.move_window_to_workspace(1, 11.0, true, Some(1), &HashMap::new());
+        mgr.switch_workspace(1, 12.0, true, Some(2), &HashMap::new());
+        // An old focus event before confirmation must not bounce the workspace.
+        let old = mgr.handle_ax_focus_notification(12.01, true, false, Some(2), &HashMap::new());
+        assert_eq!(old.active_workspace, 1);
+        assert!(!old.status_changed);
+        // Confirm the requested target, then activate another application 20 ms later.
+        mgr.handle_ax_focus_notification(12.02, true, false, Some(1), &HashMap::new());
+        let next =
+            mgr.handle_application_activated(1002, 12.04, true, false, Some(2), &HashMap::new());
+        assert_eq!(next.active_workspace, 0);
+        assert!(next.status_changed);
+        // Confirmation must work through application activation as well as AX focus.
+        mgr.handle_application_activated(1002, 12.05, true, false, Some(2), &HashMap::new());
+        let next = mgr.handle_ax_focus_notification(12.06, true, false, Some(1), &HashMap::new());
+        assert_eq!(next.active_workspace, 1);
+        assert!(next.status_changed);
+        mgr.switch_workspace(2, 12.07, true, Some(1), &HashMap::new());
+        let old = mgr.handle_ax_focus_notification(12.08, true, false, Some(1), &HashMap::new());
+        assert_eq!(old.active_workspace, 2);
+        let next =
+            mgr.handle_application_activated(1001, 12.09, true, false, Some(1), &HashMap::new());
+        assert_eq!(next.active_workspace, 1);
+        assert!(next.status_changed);
     }
 
     #[test]

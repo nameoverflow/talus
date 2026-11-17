@@ -118,8 +118,17 @@ Editable example configurations are in `Examples/status-compact.toml` and
 
 `make test` runs pure tests, including TOML parsing, dotfile resolution, Settings UI view-model state, template parsing, command limits, and
 window ordering. `make integration-test`, `make multi-integration-test`, and
-`make latency-test` open isolated test windows; they require a logged-in macOS
+`make latency-test` open isolated test windows; they require an unlocked macOS
 desktop and Accessibility permission. `make haskell-status-test` exercises the Haskell example when `runghc` is installed.
+
+Window discovery runs on a serial background queue. Structural events reconcile the
+affected application, while a two-second full reconciliation remains as a fallback.
+Focus events reuse cached geometry, and a confirmed programmatic focus releases its
+echo guard immediately. Session saves are coalesced in the background and flushed
+on exit. `make test` also checks event coalescing and rejection of stale discovery
+results. `make virtual-integration-test` exercises real workspace throwing, rapid
+switches, external focus, quit restoration, and the final saved session. Quit other
+window managers before running the interactive integration tests.
 `make xmonad-oracle XMONAD_SRC=/path/to/xmonad/src`
 compares stack wraparound with XMonad and requires GHC.
 

@@ -965,6 +965,7 @@ pub extern "C" fn talus_manager_dispatch(
         }
         ManagerRequest::RecordCurrentSessionState => {
             core.record_current_session_state();
+            core.flush_session();
             into_c_string("{}".to_string())
         }
         ManagerRequest::RememberFocus { now, frontmost_key } => {

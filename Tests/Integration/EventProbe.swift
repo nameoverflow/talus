@@ -4,7 +4,27 @@ let pid = pid_t(CommandLine.arguments[1])!, file = CommandLine.arguments[2]
 let app = AXUIElementCreateApplication(pid)
 let deadline = Date().addingTimeInterval(8)
 var start: Double?
+var triggered = false
 while Date() < deadline {
+    if !triggered, let screen = NSScreen.screens.first {
+        var raw: CFTypeRef?
+        if AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &raw) == .success,
+           let windows = raw as? [AXUIElement], windows.count == 1 {
+            var sizeValue: CFTypeRef?, size = CGSize.zero
+            if AXUIElementCopyAttributeValue(windows[0], kAXSizeAttribute as CFString, &sizeValue) == .success,
+               let sizeValue, CFGetTypeID(sizeValue) == AXValueGetTypeID(),
+               AXValueGetValue(sizeValue as! AXValue, .cgSize, &size),
+               abs(size.width - screen.visibleFrame.width) < 3,
+               abs(size.height - screen.visibleFrame.height) < 3 {
+                try! "ready".write(toFile: file + ".ready", atomically: true, encoding: .utf8)
+                if let delay = ProcessInfo.processInfo.environment["TALUS_PROBE_TRIGGER_DELAY"].flatMap(Double.init) {
+                    usleep(useconds_t(delay * 1_000_000))
+                }
+                try! "go".write(toFile: file + ".go", atomically: true, encoding: .utf8)
+                triggered = true
+            }
+        }
+    }
     if start == nil, let text = try? String(contentsOfFile:file,encoding:.utf8) { start = Double(text) }
     if let start {
         var v: CFTypeRef?
