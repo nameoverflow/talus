@@ -222,3 +222,14 @@ deployment-test: build/talus
 	test "$$actual" = "$(MACOS_DEPLOYMENT_TARGET)" || { echo "Expected macOS $(MACOS_DEPLOYMENT_TARGET), binary requires $$actual"; exit 1; }; \
 	echo "Binary minimum macOS version verified: $$actual"
 test: deployment-test
+
+status-click-integration-build: $(CORE_LIB)
+	mkdir -p build/StatusClickProbe.app/Contents/MacOS
+	$(SWIFTC) Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Tests/Integration/StatusClickProbe.swift $(CORE_FLAGS) -framework Cocoa -o build/StatusClickProbe.app/Contents/MacOS/Probe
+	cp Resources/Info.plist build/StatusClickProbe.app/Contents/Info.plist
+	/usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier local.talus.testing.status-click' build/StatusClickProbe.app/Contents/Info.plist
+	/usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Probe' build/StatusClickProbe.app/Contents/Info.plist
+	codesign --force --sign - build/StatusClickProbe.app
+status-click-integration-test: status-click-integration-build
+	sh Tests/Integration/status-click.sh
+test: status-click-integration-build

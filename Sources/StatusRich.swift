@@ -13,6 +13,25 @@ struct StatusWorkspaceHitRegion: Equatable {
     let rect: NSRect
 }
 
+func statusWorkspaceIndex(at point: NSPoint, buttonBounds: NSRect, imageRect: NSRect,
+                          regions: [StatusWorkspaceHitRegion]) -> Int? {
+    guard buttonBounds.contains(point) else { return nil }
+    let imageX = point.x - imageRect.minX
+    return regions.first { imageX >= $0.rect.minX - 1 && imageX <= $0.rect.maxX + 1 }?.index
+}
+
+func statusWorkspaceIndexUnderPointer(button: NSStatusBarButton,
+                                     regions: [StatusWorkspaceHitRegion]) -> Int? {
+    guard let window = button.window,
+          let imageRect = button.cell?.imageRect(forBounds: button.bounds) else { return nil }
+    // Status-item action events can be synthesized at the button's center by
+    // AppKit. Their locationInWindow (and CGEvent location) loses the real click.
+    let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+    let localPoint = button.convert(windowPoint, from: nil)
+    return statusWorkspaceIndex(at: localPoint, buttonBounds: button.bounds,
+                                imageRect: imageRect, regions: regions)
+}
+
 struct StatusRenderOutput {
     let image: NSImage
     let workspaceRegions: [StatusWorkspaceHitRegion]

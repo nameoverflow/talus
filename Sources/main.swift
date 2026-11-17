@@ -1154,15 +1154,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private func workspaceIndex(at event: NSEvent?) -> Int? {
         guard manager.isVirtualMode,
               let button = item.button,
-              let event,
-              let imageRect = button.cell?.imageRect(forBounds: button.bounds)
+              event != nil
         else { return nil }
-        let local = button.convert(event.locationInWindow, from: nil)
-        guard button.bounds.contains(local) else { return nil }
-        let imageX = local.x - imageRect.origin.x
-        return workspaceHitRects.first {
-            imageX >= $0.rect.minX - 1 && imageX <= $0.rect.maxX + 1
-        }?.index
+        return statusWorkspaceIndexUnderPointer(button: button, regions: workspaceHitRects)
     }
 
     private func handleMouseMoved(_ event: NSEvent) {
