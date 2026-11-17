@@ -39,8 +39,13 @@ func axValue(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
 }
 
 func frame(_ e: AXUIElement) -> CGRect? {
-    guard let p = axValue(e, kAXPositionAttribute as CFString),
-          let s = axValue(e, kAXSizeAttribute as CFString),
+    var values: CFArray?
+    let error = AXUIElementCopyMultipleAttributeValues(e, [kAXPositionAttribute, kAXSizeAttribute] as CFArray,
+        AXCopyMultipleAttributeOptions(rawValue: 0), &values)
+    if error == .cannotComplete || error == .invalidUIElement { return nil }
+    let attributes = values as? [CFTypeRef]
+    guard let p = attributes?.first ?? axValue(e, kAXPositionAttribute as CFString),
+          let s = (attributes?.count == 2 ? attributes?[1] : nil) ?? axValue(e, kAXSizeAttribute as CFString),
           CFGetTypeID(p) == AXValueGetTypeID(),
           CFGetTypeID(s) == AXValueGetTypeID()
     else { return nil }
@@ -51,20 +56,30 @@ func frame(_ e: AXUIElement) -> CGRect? {
     return CGRect(origin: point, size: size)
 }
 
-func setFrame(_ e: AXUIElement, _ r: CGRect) {
+@discardableResult
+func setFrame(_ e: AXUIElement, _ r: CGRect, current: CGRect? = nil) -> AXError {
+    if let current, abs(current.width - r.width) < 1, abs(current.height - r.height) < 1 {
+        return setPosition(e, r.origin)
+    }
     var p = r.origin; var s = r.size
     if let position = AXValueCreate(.cgPoint, &p), let size = AXValueCreate(.cgSize, &s) {
+        // Keep resize-before-move and the final resize for apps which constrain
+        // their frame to the old display, but use one call for position-only work.
         AXUIElementSetAttributeValue(e, kAXSizeAttribute as CFString, size)
-        AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, position)
-        AXUIElementSetAttributeValue(e, kAXSizeAttribute as CFString, size)
+        let moved = AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, position)
+        let resized = AXUIElementSetAttributeValue(e, kAXSizeAttribute as CFString, size)
+        return moved == .success ? resized : moved
     }
+    return .failure
 }
 
-func setPosition(_ e: AXUIElement, _ origin: CGPoint) {
+@discardableResult
+func setPosition(_ e: AXUIElement, _ origin: CGPoint) -> AXError {
     var p = origin
     if let position = AXValueCreate(.cgPoint, &p) {
-        AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, position)
+        return AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, position)
     }
+    return .failure
 }
 
 func screenRect(_ screen: NSScreen) -> CGRect {
@@ -111,7 +126,7 @@ private struct WireCandidateWindow: Encodable {
     let bundleId: String?
     let windowId: UInt32?
     let title: String
-    let frame: WireRect
+    var frame: WireRect
     let isResizable: Bool
 }
 
@@ -158,6 +173,26 @@ final class Manager {
     private var elementByHandle: [UInt64: AXUIElement] = [:]
     private var pidByHandle: [UInt64: pid_t] = [:]
     private var nextHandle: UInt64 = 1
+    private var frameByHandle: [UInt64: CGRect] = [:]
+    private var dirtyFrameHandles: Set<UInt64> = []
+    private var observedWindowHandles: Set<UInt64> = []
+    private var activeWindowHandles: Set<UInt64> = []
+    private var candidatesByHandle: [UInt64: WireCandidateWindow] = [:]
+    private let discoveryQueue = DispatchQueue(label: "local.talus.discovery", qos: .userInitiated)
+    private let discoverSnapshot: WindowDiscoveryFunction
+    private let canDiscover: () -> Bool
+    private var discoveryRevision: UInt64 = 0
+    private var discoveryInFlight = false
+    private var pendingDiscovery = false
+    private var pendingFullDiscovery = false
+    private var pendingDiscoveryPIDs: Set<pid_t> = []
+    private var pendingForce = false
+    private var scheduledRefresh: DispatchWorkItem?
+    private var readinessRetry: DispatchWorkItem?
+    private var pendingCreations: [AXWindowKey: (pid: pid_t, until: Date)] = [:]
+    private var failedWriteAttempts: [UInt64: Int] = [:]
+    private var writeRetryPIDs: Set<pid_t> = []
+    private var writeRetry: DispatchWorkItem?
 
     let ownPID = ProcessInfo.processInfo.processIdentifier
     var ignoredApps: Set<String>
@@ -177,9 +212,11 @@ final class Manager {
     var observers: [pid_t: AXObserver] = [:]
     var statusChanged: (() -> Void)?
     var onStaleSandboxTCCDetected: (() -> Void)?
-    var scheduled = false
 
-    init(config: Configuration) {
+    init(config: Configuration, discover: @escaping WindowDiscoveryFunction = discoverWindows,
+         canDiscover: @escaping () -> Bool = { AXIsProcessTrusted() && !isSessionScreenLocked() }) {
+        self.discoverSnapshot = discover
+        self.canDiscover = canDiscover
         self.ignoredApps = Set(config.ignoreApps)
         self.isVirtualMode = (config.workspaceMode == "virtual")
         self.workspaceCount = config.workspaceCount
@@ -210,25 +247,56 @@ final class Manager {
         }
         let id = nextHandle
         nextHandle += 1
+        AXUIElementSetMessagingTimeout(element, 0.1)
         handleByKey[key] = id
         elementByHandle[id] = element
         if let pid { pidByHandle[id] = pid }
         return id
     }
 
-    private func collectLiveFrames() -> [String: Any] {
-        var out: [String: Any] = [:]
-        for (h, el) in elementByHandle {
-            if let f = frame(el) {
-                out[String(h)] = [
-                    "x": Double(f.origin.x),
-                    "y": Double(f.origin.y),
-                    "w": Double(f.size.width),
-                    "h": Double(f.size.height),
-                ]
+    private func collectLiveFrames(readAll: Bool = false) -> [String: Any] {
+        let keys = readAll ? Set(elementByHandle.keys) : dirtyFrameHandles.intersection(activeWindowHandles)
+        for key in keys {
+            if let element = elementByHandle[key], let rect = frame(element) {
+                frameByHandle[key] = rect
+                dirtyFrameHandles.remove(key)
+                if var candidate = candidatesByHandle[key] {
+                    candidate.frame = WireRect(rect)
+                    candidatesByHandle[key] = candidate
+                }
             }
         }
-        return out
+        return Dictionary(uniqueKeysWithValues: frameByHandle.map { key, rect in
+            (String(key), ["x": Double(rect.minX), "y": Double(rect.minY),
+                           "w": Double(rect.width), "h": Double(rect.height)] as Any)
+        })
+    }
+
+    private func cacheFrame(_ rect: CGRect, for key: UInt64) {
+        frameByHandle[key] = rect
+        dirtyFrameHandles.remove(key)
+        if var candidate = candidatesByHandle[key] {
+            candidate.frame = WireRect(rect)
+            candidatesByHandle[key] = candidate
+        }
+    }
+
+    private func retryFailedWrite(_ key: UInt64) {
+        dirtyFrameHandles.insert(key)
+        let attempts = failedWriteAttempts[key, default: 0]
+        guard attempts < 2, let pid = pidByHandle[key] else { return }
+        failedWriteAttempts[key] = attempts + 1
+        writeRetryPIDs.insert(pid)
+        guard writeRetry == nil else { return }
+        let retry = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.writeRetry = nil
+            let pids = self.writeRetryPIDs
+            self.writeRetryPIDs.removeAll()
+            self.refresh(force: true, onlyPIDs: pids)
+        }
+        writeRetry = retry
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: retry)
     }
 
     @discardableResult
@@ -250,19 +318,23 @@ final class Manager {
         if let ln = decoded.layoutName { self.currentLayoutName = ln }
         if let aw = decoded.activeWorkspace { self.activeWorkspace = aw }
         if let wc = decoded.workspaceCount { self.workspaceCount = wc }
-        if let keys = decoded.activeWindowKeys { self.activeWindowCount = keys.count }
+        if let keys = decoded.activeWindowKeys {
+            self.activeWindowCount = keys.count
+            self.activeWindowHandles = Set(keys)
+        }
         if let log = decoded.traceLog {
             fputs("\(log)\n", stderr)
         }
         if let obsKeys = decoded.observeWindowKeys {
-            for k in obsKeys {
+            for k in obsKeys where !observedWindowHandles.contains(k) {
                 if let el = elementByHandle[k], let pid = pidByHandle[k], let observer = observers[pid] {
-                    AXObserverAddNotification(
-                        observer,
-                        el,
-                        kAXUIElementDestroyedNotification as CFString,
-                        Unmanaged.passUnretained(self).toOpaque()
-                    )
+                    let context = Unmanaged.passUnretained(self).toOpaque()
+                    let result = AXObserverAddNotification(observer, el, kAXUIElementDestroyedNotification as CFString, context)
+                    if result == .success || result == .notificationAlreadyRegistered {
+                        observedWindowHandles.insert(k)
+                        AXObserverAddNotification(observer, el, kAXMovedNotification as CFString, context)
+                        AXObserverAddNotification(observer, el, kAXResizedNotification as CFString, context)
+                    }
                 }
             }
         }
@@ -283,18 +355,33 @@ final class Manager {
             switch effect.kind {
             case "setFrame":
                 if let k = effect.key, let r = effect.rect, let el = elementByHandle[k] {
-                    setFrame(el, r.cgRect)
+                    discoveryRevision &+= 1
+                    let target = r.cgRect
+                    if setFrame(el, target, current: frameByHandle[k]) == .success {
+                        failedWriteAttempts.removeValue(forKey: k)
+                        cacheFrame(target, for: k)
+                    } else {
+                        retryFailedWrite(k)
+                    }
                 }
             case "setPosition":
                 if let k = effect.key, let x = effect.x, let y = effect.y, let el = elementByHandle[k] {
-                    setPosition(el, CGPoint(x: x, y: y))
+                    discoveryRevision &+= 1
+                    if setPosition(el, CGPoint(x: x, y: y)) == .success {
+                        failedWriteAttempts.removeValue(forKey: k)
+                        if let current = frameByHandle[k] {
+                            cacheFrame(CGRect(origin: CGPoint(x: x, y: y), size: current.size), for: k)
+                        }
+                    } else {
+                        retryFailedWrite(k)
+                    }
                 }
             case "focus":
                 if let k = effect.key, let pid = effect.pid, let el = elementByHandle[k] {
                     AXUIElementSetAttributeValue(el, kAXMainAttribute as CFString, kCFBooleanTrue)
                     AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
                     AXUIElementPerformAction(el, kAXRaiseAction as CFString)
-                    let axApp = AXUIElementCreateApplication(pid)
+                    let axApp = axApplication(pid)
                     AXUIElementSetAttributeValue(axApp, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
                     NSRunningApplication(processIdentifier: pid)?.activate()
                     AXUIElementPerformAction(el, kAXRaiseAction as CFString)
@@ -369,11 +456,12 @@ final class Manager {
         _ = dispatchJSON([
             "op": "restoreAllParkedWindows",
             "trusted": AXIsProcessTrusted(),
-            "liveFrames": collectLiveFrames(),
+            "liveFrames": collectLiveFrames(readAll: true),
         ])
     }
 
     func apply(config: Configuration) {
+        discoveryRevision &+= 1
         ignoredApps = Set(config.ignoreApps)
         guard let cfgData = try? JSONEncoder().encode(config),
               let cfgObj = try? JSONSerialization.jsonObject(with: cfgData)
@@ -394,20 +482,27 @@ final class Manager {
         }
     }
 
-    func scheduleRefresh() {
+    func scheduleRefresh(pid: pid_t? = nil, created: AXUIElement? = nil) {
         if ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1" {
             fputs("event \(Date().timeIntervalSince1970)\n", stderr)
         }
-        guard !scheduled else { return }
-        scheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            guard let self else { return }
-            self.scheduled = false
-            self.refresh()
-            for delay in [0.15, 0.4] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.refresh() }
-            }
+        discoveryRevision &+= 1
+        readinessRetry?.cancel()
+        readinessRetry = nil
+        if let created, let pid {
+            pendingCreations[AXWindowKey(element: created)] = (pid, Date().addingTimeInterval(0.6))
         }
+        if let pid { pendingDiscoveryPIDs.insert(pid) } else { pendingFullDiscovery = true }
+        guard scheduledRefresh == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.scheduledRefresh = nil
+            let pids = self.pendingFullDiscovery ? nil : self.pendingDiscoveryPIDs
+            self.refresh(onlyPIDs: pids)
+        }
+        scheduledRefresh = work
+        // Coalesce this run-loop turn without adding a fixed input delay.
+        DispatchQueue.main.async(execute: work)
     }
 
     func observeApplications() {
@@ -424,18 +519,28 @@ final class Manager {
         for application in applications where observers[application.processIdentifier] == nil {
             let pid = application.processIdentifier
             var observer: AXObserver?
-            let callback: AXObserverCallback = { _, _, notification, context in
+            let callback: AXObserverCallback = { _, element, notification, context in
                 guard let context else { return }
                 let manager = Unmanaged<Manager>.fromOpaque(context).takeUnretainedValue()
-                if notification as String == kAXFocusedWindowChangedNotification as String {
-                    manager.handleAXFocusNotification()
-                } else {
-                    manager.rememberFocus()
+                let name = notification as String
+                if name == kAXMovedNotification as String || name == kAXResizedNotification as String {
+                    if let key = manager.handleByKey[AXWindowKey(element: element)] {
+                        manager.dirtyFrameHandles.insert(key)
+                    }
+                    return
                 }
-                manager.scheduleRefresh()
+                if name == kAXFocusedWindowChangedNotification as String {
+                    manager.handleAXFocusNotification()
+                    return
+                }
+                var pid: pid_t = 0
+                AXUIElementGetPid(element, &pid)
+                manager.rememberFocus()
+                manager.scheduleRefresh(pid: pid == 0 ? nil : pid,
+                    created: name == kAXWindowCreatedNotification as String ? element : nil)
             }
             guard AXObserverCreate(pid, callback, &observer) == .success, let observer else { continue }
-            let ax = AXUIElementCreateApplication(pid)
+            let ax = axApplication(pid)
             let context = Unmanaged.passUnretained(self).toOpaque()
             let result = AXObserverAddNotification(observer, ax, kAXWindowCreatedNotification as CFString, context)
             if result == .success {
@@ -450,7 +555,7 @@ final class Manager {
         guard AXIsProcessTrusted(), !isSessionScreenLocked(),
               let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != ownPID,
-              let focused = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
+              let focused = axValue(axApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
               CFGetTypeID(focused) == AXUIElementGetTypeID()
         else { return nil }
         let el = focused as! AXUIElement
@@ -477,10 +582,12 @@ final class Manager {
             "now": Date().timeIntervalSince1970,
             "trusted": AXIsProcessTrusted(),
             "locked": isSessionScreenLocked(),
-            "liveFrames": collectLiveFrames(),
+            "liveFrames": [:],
         ]
         if let fk = currentFrontmostWindowHandle() {
             req["frontmostKey"] = fk
+            if !activeWindowHandles.contains(fk) { req["liveFrames"] = collectLiveFrames() }
+            if candidatesByHandle[fk] == nil, let pid = pidByHandle[fk] { scheduleRefresh(pid: pid) }
         }
         if let out = dispatchJSON(req), out.statusChanged == true {
             statusChanged?()
@@ -488,10 +595,13 @@ final class Manager {
     }
 
     func handleApplicationActivated(_ app: NSRunningApplication) {
-        guard app.processIdentifier != ownPID else { return }
+        // Activation notifications can arrive after another application became
+        // frontmost. Such an old notification must not undo a confirmed switch.
+        guard app.processIdentifier != ownPID,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
         var appFocusedKey: UInt64?
         if AXIsProcessTrusted(), !isSessionScreenLocked(),
-           let axFocused = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
+           let axFocused = axValue(axApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
            CFGetTypeID(axFocused) == AXUIElementGetTypeID(),
            (axValue(axFocused as! AXUIElement, kAXRoleAttribute as CFString) as? String ?? (kAXWindowRole as String)) == (kAXWindowRole as String) {
             appFocusedKey = handle(for: axFocused as! AXUIElement, pid: app.processIdentifier)
@@ -502,10 +612,11 @@ final class Manager {
             "now": Date().timeIntervalSince1970,
             "trusted": AXIsProcessTrusted(),
             "locked": isSessionScreenLocked(),
-            "liveFrames": collectLiveFrames(),
+            "liveFrames": [:],
         ]
         if let appFocusedKey {
             req["appFocusedKey"] = appFocusedKey
+            if !activeWindowHandles.contains(appFocusedKey) { req["liveFrames"] = collectLiveFrames() }
         }
         if let out = dispatchJSON(req), out.statusChanged == true {
             statusChanged?()
@@ -527,141 +638,93 @@ final class Manager {
         let traceEvents: Bool
     }
 
-    func refresh(force: Bool = false) {
-        guard !paused, AXIsProcessTrusted(), !isSessionScreenLocked() else { return }
+    func refresh(force: Bool = false, onlyPIDs: Set<pid_t>? = nil) {
+        guard !paused, canDiscover() else { return }
+        pendingForce = pendingForce || force
+        if let onlyPIDs { pendingDiscoveryPIDs.formUnion(onlyPIDs) } else { pendingFullDiscovery = true }
+        if discoveryInFlight { pendingDiscovery = true; return }
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return }
-
         let wireScreens = screens.enumerated().map { idx, scr in
-            WireScreenSpec(
-                id: idx,
-                visibleFrame: WireRect(screenRect(scr)),
-                fullFrame: WireRect(fullScreenRect(scr))
-            )
+            WireScreenSpec(id: idx, visibleFrame: WireRect(screenRect(scr)), fullFrame: WireRect(fullScreenRect(scr)))
         }
-
-        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        let visible: [VisibleWindowCandidate] = list.filter {
-            ($0[kCGWindowLayer as String] as? Int) == 0
-                && (($0[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0
-        }.compactMap { row in
-            guard let pid = row[kCGWindowOwnerPID as String] as? pid_t,
-                  let dict = row[kCGWindowBounds as String] as? [String: Any],
-                  let rect = CGRect(dictionaryRepresentation: dict as CFDictionary),
-                  rect.width > 100, rect.height > 80
-            else { return nil }
-            let wid = (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value
-            return VisibleWindowCandidate(pid: pid, windowID: wid, bounds: rect)
+        let scope: Set<pid_t>? = pendingFullDiscovery || candidatesByHandle.isEmpty ? nil : pendingDiscoveryPIDs
+        let requestedForce = pendingForce
+        pendingFullDiscovery = false
+        pendingDiscoveryPIDs.removeAll()
+        pendingForce = false
+        pendingDiscovery = false
+        discoveryInFlight = true
+        let revision = discoveryRevision
+        let elements = elementByHandle, pids = pidByHandle
+        let ignored = ignoredApps, own = ownPID
+        let selected = ProcessInfo.processInfo.environment["TALUS_TEST_PID"].map {
+            Set($0.split(separator: ",").compactMap { pid_t($0) })
         }
-        let visibleWindowIDs = visible.compactMap(\.windowID)
-
-        let allWindowList = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        let allExistingCGWindowIDs = allWindowList.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value }
-
-        var candidates: [WireCandidateWindow] = []
-        var busyPids: [Int32] = []
-        var sawStaleSandboxAPIDisabled = false
-        var eligibleVisibleWindowExists = false
-        var seenHandles: Set<UInt64> = []
-
-        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && !app.isHidden {
-            if app.processIdentifier == ownPID { continue }
-            if let selectedPIDs = ProcessInfo.processInfo.environment["TALUS_TEST_PID"] {
-                let allowed = selectedPIDs.split(separator: ",").map(String.init)
-                if !allowed.contains(String(app.processIdentifier)) { continue }
-            }
-            if let bundle = app.bundleIdentifier, ignoredApps.contains(bundle) { continue }
-            let appHasVisibleCGWindow = visible.contains { $0.pid == app.processIdentifier }
-            if appHasVisibleCGWindow {
-                eligibleVisibleWindowExists = true
-            }
-            let ax = AXUIElementCreateApplication(app.processIdentifier)
-            var rawWindows: CFTypeRef?
-            let winErr = AXUIElementCopyAttributeValue(ax, kAXWindowsAttribute as CFString, &rawWindows)
-            if winErr == .apiDisabled && appHasVisibleCGWindow {
-                sawStaleSandboxAPIDisabled = true
-            }
-            if winErr != .success, winErr != .apiDisabled, appHasVisibleCGWindow {
-                busyPids.append(app.processIdentifier)
-                continue
-            }
-            guard winErr == .success, let elements = rawWindows as? [AXUIElement] else { continue }
-            for e in elements {
-                if let role = axValue(e, kAXRoleAttribute as CFString) as? String,
-                   role != (kAXWindowRole as String) {
-                    continue
+        let discover = discoverSnapshot
+        discoveryQueue.async { [weak self] in
+            let result = discover(own, ignored, selected, elements, pids, scope)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.discoveryInFlight = false
+                guard !self.paused, self.canDiscover() else { return }
+                // A key, config change or newer structural event wins over an
+                // older scan; never feed stale parked geometry back to the core.
+                guard revision == self.discoveryRevision else {
+                    self.refresh(force: requestedForce, onlyPIDs: scope)
+                    return
                 }
-                if (axValue(e, kAXMinimizedAttribute as CFString) as? Bool) == true { continue }
-                var axWid: CGWindowID = 0
-                let resolvedWid: UInt32? = (_AXUIElementGetWindow(e, &axWid) == .success && axWid != 0) ? axWid : nil
-                guard let f = frame(e), f.width > 100, f.height > 80,
-                      matchesVisibleWindow(
-                          pid: app.processIdentifier,
-                          axWindowID: resolvedWid,
-                          axFrame: f,
-                          candidates: visible
-                      )
-                else { continue }
-
-                if let sub = axValue(e, kAXSubroleAttribute as CFString) as? String, sub != kAXStandardWindowSubrole as String { continue }
-                if (axValue(e, kAXModalAttribute as CFString) as? Bool) == true { continue }
-                var canMove = DarwinBoolean(false); var canResize = DarwinBoolean(false)
-                guard AXUIElementIsAttributeSettable(e, kAXPositionAttribute as CFString, &canMove) == .success,
-                      canMove.boolValue
-                else { continue }
-                let isResizable = (AXUIElementIsAttributeSettable(e, kAXSizeAttribute as CFString, &canResize) == .success && canResize.boolValue)
-
-                let winTitle = (axValue(e, kAXTitleAttribute as CFString) as? String) ?? ""
-                let h = handle(for: e, pid: app.processIdentifier)
-                seenHandles.insert(h)
-                candidates.append(
-                    WireCandidateWindow(
-                        key: h,
-                        pid: app.processIdentifier,
-                        bundleId: app.bundleIdentifier,
-                        windowId: resolvedWid,
-                        title: winTitle,
-                        frame: WireRect(f),
-                        isResizable: isResizable
-                    )
-                )
+                self.candidatesByHandle = self.candidatesByHandle.filter { _, candidate in
+                    result.livePIDs.contains(candidate.pid)
+                        && (result.busyPIDs.contains(candidate.pid) || (scope.map { !$0.contains(candidate.pid) } ?? false))
+                }
+                for window in result.windows {
+                    let key = self.handle(for: window.element, pid: window.pid)
+                    self.cacheFrame(window.rect, for: key)
+                    self.candidatesByHandle[key] = WireCandidateWindow(key: key, pid: window.pid,
+                        bundleId: window.bundleID, windowId: window.windowID, title: window.title,
+                        frame: WireRect(window.rect), isResizable: window.isResizable)
+                    self.pendingCreations.removeValue(forKey: AXWindowKey(element: window.element))
+                }
+                for key in result.deadHandles {
+                    if let element = self.elementByHandle.removeValue(forKey: key) {
+                        self.handleByKey.removeValue(forKey: AXWindowKey(element: element))
+                    }
+                    self.pidByHandle.removeValue(forKey: key)
+                    self.frameByHandle.removeValue(forKey: key)
+                    self.candidatesByHandle.removeValue(forKey: key)
+                    self.observedWindowHandles.remove(key)
+                    self.dirtyFrameHandles.remove(key)
+                    self.failedWriteAttempts.removeValue(forKey: key)
+                }
+                if result.staleAPIDisabled { self.onStaleSandboxTCCDetected?() }
+                let payload = WireRefreshPayload(force: requestedForce, now: Date().timeIntervalSince1970,
+                    screens: wireScreens, candidates: self.candidatesByHandle.values.sorted { $0.key < $1.key },
+                    busyPids: Array(result.busyPIDs), visibleWindowIds: result.visibleWindowIDs,
+                    allExistingCgWindowIds: result.existingWindowIDs, deadHistoryKeys: result.deadHandles,
+                    eligibleVisibleWindowExists: result.eligibleVisibleWindowExists,
+                    frontmostKey: self.currentFrontmostWindowHandle(),
+                    traceEvents: ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1")
+                if let data = try? JSONEncoder().encode(payload) { _ = self.dispatchData(data) }
+                self.statusChanged?()
+                if self.pendingDiscovery {
+                    let next = self.pendingFullDiscovery ? nil : self.pendingDiscoveryPIDs
+                    self.refresh(onlyPIDs: next)
+                } else {
+                    self.pendingCreations = self.pendingCreations.filter { $0.value.until > Date() }
+                    if !self.pendingCreations.isEmpty {
+                        self.readinessRetry?.cancel()
+                        let retry = DispatchWorkItem { [weak self] in
+                            guard let self else { return }
+                            self.readinessRetry = nil
+                            self.refresh(onlyPIDs: Set(self.pendingCreations.values.map(\.pid)))
+                        }
+                        self.readinessRetry = retry
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: retry)
+                    }
+                }
             }
         }
-
-        if sawStaleSandboxAPIDisabled {
-            onStaleSandboxTCCDetected?()
-        }
-
-        var deadHistoryKeys: [UInt64] = []
-        for (h, el) in elementByHandle where !seenHandles.contains(h) {
-            if axValue(el, kAXRoleAttribute as CFString) == nil {
-                deadHistoryKeys.append(h)
-            }
-        }
-        for dead in deadHistoryKeys {
-            if let el = elementByHandle.removeValue(forKey: dead) {
-                handleByKey.removeValue(forKey: AXWindowKey(element: el))
-            }
-            pidByHandle.removeValue(forKey: dead)
-        }
-
-        let payload = WireRefreshPayload(
-            force: force,
-            now: Date().timeIntervalSince1970,
-            screens: wireScreens,
-            candidates: candidates,
-            busyPids: busyPids,
-            visibleWindowIds: visibleWindowIDs,
-            allExistingCgWindowIds: allExistingCGWindowIDs,
-            deadHistoryKeys: deadHistoryKeys,
-            eligibleVisibleWindowExists: eligibleVisibleWindowExists,
-            frontmostKey: currentFrontmostWindowHandle(),
-            traceEvents: ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1"
-        )
-        if let data = try? JSONEncoder().encode(payload) {
-            _ = dispatchData(data)
-        }
-        statusChanged?()
     }
 
     func switchWorkspace(_ index: Int) {
@@ -701,7 +764,7 @@ final class Manager {
             "shift": shift,
             "now": Date().timeIntervalSince1970,
             "trusted": AXIsProcessTrusted(),
-            "liveFrames": collectLiveFrames(),
+            "liveFrames": (!shift && (code == UInt32(kVK_ANSI_J) || code == UInt32(kVK_ANSI_K))) ? [:] : collectLiveFrames(),
         ]
         if let fk = currentFrontmostWindowHandle() {
             req["frontmostKey"] = fk
@@ -1050,8 +1113,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
         let snap = manager.statusSnapshot()
         let locked = isSessionScreenLocked()
-        let frontmost = locked ? nil : NSWorkspace.shared.frontmostApplication
-        let frontWindow = (trusted && !locked) ? frontmost.flatMap { axValue(AXUIElementCreateApplication($0.processIdentifier), kAXFocusedWindowAttribute as CFString) } : nil
+        let needsTitle = (config.statusTemplate ?? "").contains("%title%")
+            || config.statusFormat.contains("{title}") || !config.statusCommands.isEmpty
+            || !(config.statusStateFile ?? "").isEmpty
+        let frontmost = locked || !needsTitle ? nil : NSWorkspace.shared.frontmostApplication
+        let frontWindow = (trusted && !locked) ? frontmost.flatMap { axValue(axApplication($0.processIdentifier), kAXFocusedWindowAttribute as CFString) } : nil
         let title: String
         if let frontWindow, CFGetTypeID(frontWindow) == AXUIElementGetTypeID() {
             title = axValue(frontWindow as! AXUIElement, kAXTitleAttribute as CFString) as? String ?? ""
@@ -1361,9 +1427,10 @@ let tokens = [
     NSWorkspace.activeSpaceDidChangeNotification,
     NSWorkspace.screensDidWakeNotification,
 ].map { name in
-    workspace.addObserver(forName: name, object: nil, queue: .main) { _ in
+    workspace.addObserver(forName: name, object: nil, queue: .main) { note in
         manager.observeApplications()
-        manager.scheduleRefresh()
+        let changedApp = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        manager.scheduleRefresh(pid: changedApp?.processIdentifier)
         statusMenu.updateStatus()
         if name == NSWorkspace.activeSpaceDidChangeNotification || name == NSWorkspace.screensDidWakeNotification {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {

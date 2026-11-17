@@ -11,7 +11,7 @@ all: build/talus
 $(CORE_LIB): $(CORE_SOURCES)
 	cargo build --release --manifest-path Core/Cargo.toml
 
-APP_SOURCES = Sources/main.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/SettingsWindow.swift
+APP_SOURCES = Sources/main.swift Sources/WindowDiscovery.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/SettingsWindow.swift
 build/talus: $(APP_SOURCES) $(CORE_LIB) $(CORE_HEADER)
 	mkdir -p build
 	swiftc -O $(APP_SOURCES) $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework Carbon -framework ApplicationServices -o $@
@@ -149,3 +149,15 @@ haskell-status-test: $(CORE_LIB)
 	build/haskell-status-tests "$$(command -v runghc)" "$$PWD/Examples/clock.hs"
 status-cleanup-test: all
 	Tests/Integration/command-cleanup.sh
+
+manager-responsiveness-test: $(CORE_LIB)
+	mkdir -p build
+	awk '/^final class HotkeyRegistry/ { exit } { print }' Sources/main.swift > build/ManagerUnderTest.swift
+	swiftc -O -parse-as-library build/ManagerUnderTest.swift Sources/WindowDiscovery.swift Sources/Layout.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/Spaces.swift Sources/StatusConfiguration.swift Tests/ManagerResponsivenessTests.swift $(CORE_FLAGS) -framework Cocoa -framework Carbon -framework ApplicationServices -o build/manager-responsiveness-tests
+	TALUS_TEST_PID=0 build/manager-responsiveness-tests
+test: manager-responsiveness-test
+
+virtual-integration-test: all
+	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
+	swiftc -O Tests/Integration/VirtualResponsivenessProbe.swift -framework Carbon -o build/virtual-responsiveness-probe
+	sh Tests/Integration/virtual-responsiveness.sh

@@ -3,6 +3,7 @@ pub mod ffi;
 pub mod layout;
 pub mod manager;
 pub mod screen_geometry;
+pub mod session_writer;
 pub mod status_commands;
 pub mod status_markup;
 pub mod virtual_workspaces;
