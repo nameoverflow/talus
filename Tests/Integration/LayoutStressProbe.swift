@@ -3,6 +3,8 @@ import ApplicationServices
 import Carbon
 import Darwin
 
+setbuf(stdout, nil)
+
 let slowPID = pid_t(CommandLine.arguments[1])!
 let fastPID = pid_t(CommandLine.arguments[2])!
 let clickPID = pid_t(CommandLine.arguments[3])!
@@ -23,9 +25,14 @@ func rect(_ element: AXUIElement) -> CGRect? {
 }
 func windows(_ pid: pid_t) -> [String: AXUIElement] {
     guard let list = get(AXUIElementCreateApplication(pid), kAXWindowsAttribute as CFString) as? [AXUIElement] else { return [:] }
-    return Dictionary(uniqueKeysWithValues: list.compactMap { element in
-        (get(element, kAXTitleAttribute as CFString) as? String).map { ($0, element) }
-    })
+    var result: [String: AXUIElement] = [:]
+    let expected: Set<String> = ["Talus Test A", "Talus Test B", "Talus Test Fixed", "Talus External Click Target"]
+    for element in list {
+        if let title = get(element, kAXTitleAttribute as CFString) as? String, expected.contains(title) {
+            result[title] = element
+        }
+    }
+    return result
 }
 func wait(_ label: String, timeout: TimeInterval = 4, _ condition: () -> Bool) {
     let until = Date().addingTimeInterval(timeout)
@@ -33,6 +40,11 @@ func wait(_ label: String, timeout: TimeInterval = 4, _ condition: () -> Bool) {
         if condition() { return }
         usleep(2_000)
     }
+    for pid in [slowPID, fastPID, clickPID] {
+        print("Failure snapshot pid=\(pid) hidden=\(String(describing: NSRunningApplication(processIdentifier: pid)?.isHidden))")
+        for (title, element) in windows(pid) { print("  \(title): \(String(describing: rect(element)))") }
+    }
+    print("Workspace=\(String(describing: workspace())) front=\(String(describing: WindowFocus.frontmostPID()))")
     fatalError("Timed out: \(label)")
 }
 func state(_ name: String) -> [String: Any]? {
@@ -95,6 +107,10 @@ usleep(50_000)
 key(kVK_Return)
 wait("fast app is master") { rect(a).map { abs($0.width - area.width * 0.5) < 3 && abs($0.minX - area.minX) < 3 } ?? false }
 usleep(60_000)
+if ProcessInfo.processInfo.environment["TALUS_STRESS_RECORDING"] == "1" {
+    try! Data().write(to: directory.appendingPathComponent("record-ready"))
+    wait("recording started", timeout: 8) { FileManager.default.fileExists(atPath: directory.appendingPathComponent("record-go").path) }
+}
 
 let resumed = DispatchSemaphore(value: 0)
 kill(slowPID, SIGSTOP)
@@ -126,10 +142,29 @@ key(kVK_ANSI_2)
 wait("fast windows park while another app is stalled") { parked(a) }
 guard let target = rect(clickWindow) else { fatalError("Missing external window frame") }
 let point = CGPoint(x: target.midX, y: target.midY)
-CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
-CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
-usleep(10_000)
-CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
+wait("external click target is exposed in WindowServer") {
+    let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+    let top = list.first { row in
+        guard row[kCGWindowLayer as String] as? Int == 0,
+              let bounds = row[kCGWindowBounds as String] as? [String: Any],
+              let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return false }
+        return frame.contains(point)
+    }
+    return top?[kCGWindowOwnerPID as String] as? pid_t == clickPID
+}
+print("Click target pid=\(clickPID) rect=\(target) point=\(point) frontBefore=\(String(describing: WindowFocus.frontmostPID()))")
+let released = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_Command), keyDown: false)!
+released.type = .flagsChanged
+released.flags = []
+released.post(tap: .cghidEventTap)
+for type in [CGEventType.mouseMoved, .leftMouseDown, .leftMouseUp] {
+    let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left)!
+    // A normal click releases the synthetic hotkey's modifier flags; command
+    // or option clicks have different AppKit activation/hide semantics.
+    event.flags = []
+    event.post(tap: .cghidEventTap)
+    usleep(10_000)
+}
 wait("external click focused its app") { WindowFocus.frontmostPID() == clickPID }
 usleep(650_000)
 precondition(WindowFocus.frontmostPID() == clickPID, "Old queued focus stole the user's click")

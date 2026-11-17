@@ -155,6 +155,10 @@ are required.
 
 Geometry writes run on a separate serial queue per application. Each window keeps
 its latest complete target, so a superseded move cannot lose an earlier resize.
+Each layout publishes its complete target snapshot, even when its sparse effect
+list is empty; this supersedes any older queued target despite delayed physical
+snapshots. The shell compares submitted goals rather than treating observed bounds
+as proof that an asynchronous request has completed.
 Logical input is processed in order; obsolete geometry and focus requests are
 coalesced. Focus waits for the remaining geometry, and an explicit mouse click can
 cancel queued focus. Pausing cancels queued writes; exit drains writes before

@@ -82,6 +82,15 @@ func setPosition(_ e: AXUIElement, _ origin: CGPoint) -> AXError {
     return .failure
 }
 
+func applyWindowGeometry(_ geometry: WindowGeometry, _ current: CGRect?) -> AXError {
+    let result = geometry.resizable ? setFrame(geometry.element, geometry.target, current: current)
+        : setPosition(geometry.element, geometry.target.origin)
+    if ProcessInfo.processInfo.environment["TALUS_TRACE_GEOMETRY"] == "1" {
+        fputs("geometry key=\(geometry.key) pid=\(geometry.pid) from=\(String(describing: current)) target=\(geometry.target) result=\(result.rawValue) actual=\(String(describing: frame(geometry.element)))\n", stderr)
+    }
+    return result
+}
+
 func screenRect(_ screen: NSScreen) -> CGRect {
     let r = screen.visibleFrame
     let top = NSScreen.screens.first?.frame.maxY ?? 0
@@ -140,6 +149,8 @@ private struct WireWindowEffect: Decodable {
 }
 
 private struct WireManagerActionOutput: Decodable {
+    let geometryGeneration: UInt64?
+    let windowFrames: [String: WireRect]?
     let effects: [WireWindowEffect]?
     let activeWindowKeys: [UInt64]?
     let observeWindowKeys: [UInt64]?
@@ -200,6 +211,8 @@ final class Manager {
     private var titleReadPending: Set<UInt64> = []
     private var titleReadAt: [UInt64: Date] = [:]
     private var frameReadPending: Set<UInt64> = []
+    private var geometryGeneration: UInt64 = 0
+    private var lastSubmittedFrames: [UInt64: CGRect] = [:]
 
     let ownPID = ProcessInfo.processInfo.processIdentifier
     var ignoredApps: Set<String>
@@ -226,10 +239,7 @@ final class Manager {
 
     init(config: Configuration, discover: @escaping WindowDiscoveryFunction = discoverWindows,
          canDiscover: @escaping () -> Bool = { AXIsProcessTrusted() && !isSessionScreenLocked() },
-         applyGeometry: @escaping WindowExecutor.Apply = { geometry, current in
-             geometry.resizable ? setFrame(geometry.element, geometry.target, current: current)
-                 : setPosition(geometry.element, geometry.target.origin)
-         }) {
+         applyGeometry: @escaping WindowExecutor.Apply = applyWindowGeometry) {
         self.windowExecutor = WindowExecutor(apply: applyGeometry)
         self.discoverSnapshot = discover
         self.canDiscover = canDiscover
@@ -330,6 +340,7 @@ final class Manager {
 
     private func cacheFrame(_ rect: CGRect, for key: UInt64, observed: Bool = true) {
         frameByHandle[key] = rect
+        if observed, lastSubmittedFrames[key] == nil { lastSubmittedFrames[key] = rect }
         if observed, let pid = pidByHandle[key] { windowExecutor.observe(key: key, pid: pid, frame: rect) }
         dirtyFrameHandles.remove(key)
         if var candidate = candidatesByHandle[key] {
@@ -390,9 +401,15 @@ final class Manager {
                 }
             }
         }
-        if let effects = decoded.effects {
-            executeEffects(effects)
+        var authoritativeFrames: [UInt64: CGRect]?
+        if let generation = decoded.geometryGeneration, generation > geometryGeneration,
+           let frames = decoded.windowFrames {
+            geometryGeneration = generation
+            authoritativeFrames = Dictionary(uniqueKeysWithValues: frames.compactMap { key, rect in
+                UInt64(key).map { ($0, rect.cgRect) }
+            })
         }
+        executeEffects(decoded.effects ?? [], authoritativeFrames: authoritativeFrames)
         return decoded
     }
 
@@ -402,7 +419,7 @@ final class Manager {
         return dispatchData(data)
     }
 
-    private func executeEffects(_ effects: [WireWindowEffect]) {
+    private func executeEffects(_ effects: [WireWindowEffect], authoritativeFrames: [UInt64: CGRect]? = nil) {
         var geometries: [WindowGeometry] = []
         var focusAction: (() -> Void)?
         var focusKey: UInt64?
@@ -417,10 +434,13 @@ final class Manager {
                 } else if let x = effect.x, let y = effect.y, let current = frameByHandle[key] {
                     target = CGRect(origin: CGPoint(x: x, y: y), size: current.size)
                 } else { continue }
-                discoveryRevision &+= 1
-                geometries.append(WindowGeometry(key: key, pid: pid, element: element,
-                    target: target, resizable: candidatesByHandle[key]?.isResizable ?? (effect.kind == "setFrame")))
-                cacheFrame(target, for: key, observed: false)
+                if authoritativeFrames == nil {
+                    discoveryRevision &+= 1
+                    geometries.append(WindowGeometry(key: key, pid: pid, element: element,
+                        target: target, resizable: candidatesByHandle[key]?.isResizable ?? (effect.kind == "setFrame")))
+                    lastSubmittedFrames[key] = target
+                    cacheFrame(target, for: key, observed: false)
+                }
             case "focus":
                 guard let key = effect.key, let pid = effect.pid, let element = elementByHandle[key] else { continue }
                 focusKey = key
@@ -444,6 +464,23 @@ final class Manager {
                 }
             default:
                 break
+            }
+        }
+        if let frames = authoritativeFrames {
+            let explicit = Set(effects.filter { $0.kind == "setFrame" || $0.kind == "setPosition" }.compactMap(\.key))
+            for key in Array(lastSubmittedFrames.keys) where frames[key] == nil {
+                windowExecutor.forget(key)
+                lastSubmittedFrames.removeValue(forKey: key)
+            }
+            for (key, target) in frames {
+                guard let pid = pidByHandle[key], let element = elementByHandle[key] else { continue }
+                if lastSubmittedFrames[key] != target || explicit.contains(key) {
+                    discoveryRevision &+= 1
+                    geometries.append(WindowGeometry(key: key, pid: pid, element: element,
+                        target: target, resizable: candidatesByHandle[key]?.isResizable ?? true))
+                    lastSubmittedFrames[key] = target
+                }
+                cacheFrame(target, for: key, observed: false)
             }
         }
         if !geometries.isEmpty || focusAction != nil {
@@ -809,6 +846,7 @@ final class Manager {
                     }
                     self.pidByHandle.removeValue(forKey: key)
                     self.frameByHandle.removeValue(forKey: key)
+                    self.lastSubmittedFrames.removeValue(forKey: key)
                     self.candidatesByHandle.removeValue(forKey: key)
                     self.observedWindowHandles.remove(key)
                     self.dirtyFrameHandles.remove(key)

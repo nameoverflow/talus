@@ -1,8 +1,9 @@
 #!/bin/sh
 set -eu
 test_dir=$(mktemp -d)
-first=''; second=''; click=''; manager=''
+first=''; second=''; click=''; manager=''; recorder=''
 cleanup() {
+    if [ -n "$recorder" ]; then kill -INT "$recorder" 2>/dev/null || true; wait "$recorder" 2>/dev/null || true; fi
     if [ -n "$first" ]; then kill -CONT "$first" 2>/dev/null || true; fi
     if [ -n "$second" ]; then kill -CONT "$second" 2>/dev/null || true; fi
     if [ -n "$manager" ]; then kill -TERM "$manager" 2>/dev/null || true; wait "$manager" 2>/dev/null || true; fi
@@ -33,8 +34,24 @@ TALUS_TEST_PID="$first,$second" TALUS_TEST_HOTKEYS=1 TALUS_TRACE_EVENTS=1 \
     TALUS_SESSION_FILE="$test_dir/session.json" TALUS_CONFIG="$test_dir/config.json" \
     "${TALUS_BIN:-build/talus}" &
 manager=$!
-build/layout-stress/probe "$first" "$second" "$click" "$test_dir"
+if [ -n "${TALUS_STRESS_VIDEO:-}" ]; then
+    TALUS_STRESS_RECORDING=1 build/layout-stress/probe "$first" "$second" "$click" "$test_dir" &
+    probe=$!
+    for attempt in $(seq 1 80); do
+        if [ -f "$test_dir/record-ready" ]; then break; fi
+        sleep 0.05
+    done
+    test -f "$test_dir/record-ready"
+    screencapture -x -v -V 6 -R0,34,1710,1073 "$TALUS_STRESS_VIDEO" &
+    recorder=$!
+    sleep 0.5
+    touch "$test_dir/record-go"
+    wait "$probe"
+else
+    build/layout-stress/probe "$first" "$second" "$click" "$test_dir"
+fi
 kill -TERM "$manager"
 wait "$manager"
 manager=''
 build/layout-stress/probe "$first" "$second" "$click" "$test_dir" --restored
+if [ -n "$recorder" ]; then wait "$recorder"; recorder=''; fi
