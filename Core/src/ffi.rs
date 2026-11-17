@@ -774,6 +774,7 @@ enum ManagerRequest {
     },
     #[serde(rename_all = "camelCase")]
     RecordCurrentSessionState,
+    CancelFocusDelivery,
     #[serde(rename_all = "camelCase")]
     RememberFocus {
         now: f64,
@@ -966,6 +967,10 @@ pub extern "C" fn talus_manager_dispatch(
         ManagerRequest::RecordCurrentSessionState => {
             core.record_current_session_state();
             core.flush_session();
+            into_c_string("{}".to_string())
+        }
+        ManagerRequest::CancelFocusDelivery => {
+            core.cancel_focus_delivery();
             into_c_string("{}".to_string())
         }
         ManagerRequest::RememberFocus { now, frontmost_key } => {

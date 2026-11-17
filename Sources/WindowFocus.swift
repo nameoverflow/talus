@@ -31,6 +31,7 @@ private final class FrontProcess {
 }
 
 enum WindowFocus {
+    static func isFrontmost(_ pid: pid_t) -> Bool { FrontProcess.shared.isFrontmost(pid) }
     /// AXFrontmost runs the application's activation path. Merely activating
     /// its WindowServer process can leave a different window holding key focus.
     /// Keep the original sequence as a compatibility fallback for AX providers
