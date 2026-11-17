@@ -50,7 +50,7 @@ import AppKit
                 }
             }
         }
-        print("Settings window layout tests passed (3 tabs, 3 sizes, light/dark, overlay/legacy scrollbars, scrolling)")
+        print("Settings window layout tests passed (\(SettingsTab.allCases.count) tabs, 3 sizes, light/dark, overlay/legacy scrollbars, scrolling)")
     }
 
     private static func firstScrollView(in view: NSView) -> NSScrollView? {

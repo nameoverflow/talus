@@ -32,6 +32,8 @@ Talus reads its configuration in the following order (unless `TALUS_CONFIG` is s
 
 You can configure Talus either through the built-in **Settings window** (click the Talus menu-bar item → **设置…** / `⌘,`, reopen `Talus.app`, or run `talus --settings`) or by editing `~/.talus.toml` directly. Changes saved from the Settings UI or written to the dotfile on disk are applied live without restarting Talus.
 
+To start Talus automatically when you log in, open **设置… → 通用 → 登录后自动启动** in the installed `Talus.app`. This uses macOS Login Items and starts disabled unless already enabled in macOS. If approval is required, Settings links to **System Settings → General → Login Items**. The switch refreshes when you return to Talus; this per-user setting is managed by macOS, not the TOML file.
+
 Example `~/.talus.toml`:
 
 ```toml

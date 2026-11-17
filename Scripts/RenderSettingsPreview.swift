@@ -1,5 +1,13 @@
 import AppKit
 import SwiftUI
+import ServiceManagement
+
+private final class PreviewLoginService: LaunchAtLoginService {
+    var status = SMAppService.Status(rawValue: Int(ProcessInfo.processInfo.environment["TALUS_PREVIEW_LOGIN_STATUS"] ?? "0") ?? 0) ?? .notRegistered
+    func register() throws { status = .enabled }
+    func unregister() throws { status = .notRegistered }
+    func openSystemSettings() {}
+}
 
 @main struct RenderSettingsPreview {
     @MainActor
@@ -57,7 +65,10 @@ import SwiftUI
         for (appearanceName, isDark) in [("dark", true), ("light", false)] {
             let appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)!
             for tab in SettingsTab.allCases {
-                let vm = SettingsViewModel(config: config, resolution: resolution)
+                // Simulated OS state keeps offline previews deterministic and never
+                // registers the preview tool itself as a login item.
+                let login = LaunchAtLoginModel(service: PreviewLoginService())
+                let vm = SettingsViewModel(config: config, resolution: resolution, launchAtLogin: login)
                 vm.selectedTab = tab
                 vm.statusBanner = "✓ 已自动保存至 ~/.talus.toml 并生效"
 

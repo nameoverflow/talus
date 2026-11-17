@@ -26,7 +26,8 @@ struct IgnoredAppDisplay: Identifiable, Equatable {
 }
 
 final class SettingsViewModel: ObservableObject {
-    @Published var selectedTab: SettingsTab = .layout
+    @Published var selectedTab: SettingsTab = .general
+    let launchAtLogin: LaunchAtLoginModel
     @Published var modifiers: [String]
     @Published var workspaceMode: String
     @Published var workspaceCount: Int
@@ -91,7 +92,8 @@ final class SettingsViewModel: ObservableObject {
     var onConfigurationApplied: ((Configuration, URL) -> Void)?
     var lastWrittenDate: Date?
 
-    init(config: Configuration, resolution: ConfigResolution) {
+    init(config: Configuration, resolution: ConfigResolution, launchAtLogin: LaunchAtLoginModel = LaunchAtLoginModel()) {
+        self.launchAtLogin = launchAtLogin
         self.saveURL = resolution.saveURL
         self.migratedFromJSON = resolution.migratedFromJSON
         self.modifiers = config.modifiers
@@ -560,6 +562,7 @@ func resolveAppDisplay(bundleID: String) -> IgnoredAppDisplay {
 }
 
 enum SettingsTab: String, CaseIterable, Identifiable {
+    case general
     case layout
     case rules
     case menubar
@@ -567,6 +570,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var label: String {
         switch self {
+        case .general: return "通用"
         case .layout: return "快捷键与布局"
         case .rules: return "应用规则"
         case .menubar: return "菜单栏"
@@ -574,6 +578,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     }
     var symbol: String {
         switch self {
+        case .general: return "gearshape"
         case .layout: return "rectangle.split.2x1"
         case .rules: return "macwindow.on.rectangle"
         case .menubar: return "menubar.rectangle"
@@ -596,7 +601,7 @@ struct SettingsRootView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 390)
+                .frame(width: 480)
                 Spacer()
             }
             .padding(.vertical, 10)
@@ -611,6 +616,8 @@ struct SettingsRootView: View {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 14) {
                         switch model.selectedTab {
+                        case .general:
+                            GeneralSettingsView(model: model.launchAtLogin)
                         case .layout:
                             ShortcutsAndLayoutView(model: model)
                         case .rules:
@@ -628,52 +635,68 @@ struct SettingsRootView: View {
 
             Divider()
 
-            // Persistent dotfile footer bar
-            HStack(spacing: 10) {
-                Image(systemName: model.validationMessage == nil ? "doc.text" : "exclamationmark.triangle.fill")
-                    .foregroundStyle(model.validationMessage == nil ? .secondary : Color.orange)
-                    .font(.system(size: 12))
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(abbreviatedPath(model.saveURL))
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    if let warning = model.validationMessage {
-                        Text(warning)
-                            .font(.system(size: 11))
-                            .foregroundStyle(Color.orange)
-                            .lineLimit(1)
-                    } else {
-                        Text(model.statusBanner)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
+            if model.selectedTab == .general {
+                HStack(spacing: 8) {
+                    Image(systemName: "person.crop.circle")
+                    Text("自动启动由 macOS 管理，仅对当前用户生效")
+                    Spacer()
                 }
-
-                Spacer()
-
-                Button("重置默认") {
-                    model.resetToDefaults()
-                }
-                .controlSize(.small)
-                .buttonStyle(.borderless)
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+                .background(.bar)
+            } else {
+                // Persistent dotfile footer bar
+                HStack(spacing: 10) {
+                    Image(systemName: model.validationMessage == nil ? "doc.text" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(model.validationMessage == nil ? .secondary : Color.orange)
+                        .font(.system(size: 12))
 
-                Button("在 Finder 中显示") {
-                    model.revealConfigInFinder()
-                }
-                .controlSize(.small)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(abbreviatedPath(model.saveURL))
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        if let warning = model.validationMessage {
+                            Text(warning)
+                                .font(.system(size: 11))
+                                .foregroundStyle(Color.orange)
+                                .lineLimit(1)
+                        } else {
+                            Text(model.statusBanner)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
 
-                Button("打开配置文件") {
-                    model.openConfigInEditor()
+                    Spacer()
+
+                    Button("重置默认") {
+                        model.resetToDefaults()
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+
+                    Button("在 Finder 中显示") {
+                        model.revealConfigInFinder()
+                    }
+                    .controlSize(.small)
+
+                    Button("打开配置文件") {
+                        model.openConfigInEditor()
+                    }
+                    .controlSize(.small)
                 }
-                .controlSize(.small)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(.bar)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            .background(.bar)
         }
         .frame(minWidth: 600, idealWidth: 640, minHeight: 560, idealHeight: 660)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.launchAtLogin.refresh()
+        }
     }
 }
 
@@ -757,6 +780,39 @@ private struct SectionCard<Content: View>: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
         )
+    }
+}
+
+private struct GeneralSettingsView: View {
+    @ObservedObject var model: LaunchAtLoginModel
+
+    var body: some View {
+        SectionCard(title: "启动", subtitle: "登录这台 Mac 后自动运行 Talus。") {
+            Toggle("登录后自动启动", isOn: Binding(
+                get: { model.isEnabled },
+                set: { model.setEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+
+            if model.needsApproval {
+                Label("尚未启用：请在系统设置中允许 Talus 自动启动。", systemImage: "exclamationmark.circle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                HStack {
+                    Button("打开登录项设置") { model.openSystemSettings() }
+                    Button("取消请求") { model.setEnabled(false) }
+                }
+                .controlSize(.small)
+            }
+
+            if let error = model.errorMessage {
+                Text(error)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+            }
+        }
     }
 }
 
@@ -1893,6 +1949,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     func show() {
+        viewModel.launchAtLogin.refresh()
         ensureEditMenuInstalled()
         if let existing = window {
             NSApp.activate(ignoringOtherApps: true)
