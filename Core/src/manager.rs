@@ -1207,6 +1207,12 @@ impl ManagerCore {
         self.update_live_frames(live_frames);
         if trusted && !locked {
             self.remember_focus(now, app_focused_key);
+            // An empty workspace has no target window to acknowledge. The
+            // shell verifies that this activation is currently frontmost, so
+            // it is new intent rather than an old AX focus echo.
+            if self.windows.is_empty() && self.programmatic_focus_key.is_none() {
+                self.suppress_external_focus_until = 0.0;
+            }
         }
         if !self.is_virtual_mode()
             || self.paused
@@ -1828,6 +1834,13 @@ mod tests {
         // Confirmation must work through application activation as well as AX focus.
         mgr.handle_application_activated(1002, 12.05, true, false, Some(2), &HashMap::new());
         let next = mgr.handle_ax_focus_notification(12.06, true, false, Some(1), &HashMap::new());
+        assert_eq!(next.active_workspace, 1);
+        assert!(next.status_changed);
+        mgr.switch_workspace(2, 12.07, true, Some(1), &HashMap::new());
+        let old = mgr.handle_ax_focus_notification(12.08, true, false, Some(1), &HashMap::new());
+        assert_eq!(old.active_workspace, 2);
+        let next =
+            mgr.handle_application_activated(1001, 12.09, true, false, Some(1), &HashMap::new());
         assert_eq!(next.active_workspace, 1);
         assert!(next.status_changed);
     }
