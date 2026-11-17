@@ -8,6 +8,19 @@ Control-Option J/K focuses the next/previous window on the screen; add Shift to 
 
 Current features: Tall, Mirror Tall, and Full layouts; switchable **native Spaces** (`mode = "native"`) or **Talus virtual workspaces** (`mode = "virtual"`, `count = 1..9`) with instant `<Mod>+1..9` workspace switching, `<Mod>+Shift+1..9` window throwing, independent per-workspace layout state, and automatic restoration of parked windows on quit or mode switch.
 
+## Downloads and releases
+
+Apple Silicon (arm64) packages are published on [GitHub Releases](https://github.com/nameoverflow/talus/releases).
+Extract `Talus-macos-arm64.zip` and move `Talus.app` to `/Applications`.
+Release builds are ad-hoc signed, without Apple notarization; macOS Gatekeeper may require explicit approval.
+
+The `macOS CI and Release` workflow builds, runs the existing test suite, layout
+property tests and command cleanup check, and verifies the packaged app on every
+pull request and push to `main`. Pushing a `vMAJOR.MINOR.PATCH` tag (for example,
+`v0.1.0`) runs the same checks and publishes the ZIP and SHA-256 checksum only
+after they pass. The tag supplies the bundle version. Manual workflow runs build
+the selected ref and publish only when that ref is a version tag.
+
 ## Configuration (TOML Dotfile & Graphical Settings UI)
 
 Talus reads its configuration in the following order (unless `TALUS_CONFIG` is set):
