@@ -129,6 +129,16 @@ on exit. `make test` also checks event coalescing and rejection of stale discove
 results. `make virtual-integration-test` exercises real workspace throwing, rapid
 switches, external focus, quit restoration, and the final saved session. Quit other
 window managers before running the interactive integration tests.
+
+`make focus-integration-test` compares the original and optimized focus paths
+using real windows from two test applications. It checks the actual front process
+and focused window rather than relying on activation requests returning success.
+Focus uses two AX operations within an application and a third AXFrontmost write
+when changing applications. A dynamically resolved, read-only process query avoids
+NSWorkspace activation-cache lag; if unavailable, the activation write is retained.
+AX errors fall back to the original focus sequence. `TALUS_LEGACY_FOCUS=1` forces
+that sequence for compatibility comparisons. No SIP changes or process injection
+are required.
 `make xmonad-oracle XMONAD_SRC=/path/to/xmonad/src`
 compares stack wraparound with XMonad and requires GHC.
 
