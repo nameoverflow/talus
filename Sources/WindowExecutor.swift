@@ -8,6 +8,7 @@ struct WindowGeometry {
     // Always a complete goal, including when the core only changed position.
     let target: CGRect
     let resizable: Bool
+    var parking: Bool = false
 }
 
 /// Scheduling and callbacks are main-thread confined. AX writes run serially
@@ -101,6 +102,8 @@ final class WindowExecutor {
                     frames.removeValue(forKey: key)
                 } else if error == .success {
                     frames[key] = request.geometry.target
+                } else {
+                    frames.removeValue(forKey: key)
                 }
                 running = nil
                 lock.unlock()

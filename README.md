@@ -179,3 +179,15 @@ compares stack wraparound with XMonad and requires GHC.
 
 The app icon is generated from vector drawing code in `Scripts/DrawAppIcon.swift`.
 The status image draws the same symbol next to the configured text.
+
+New-window geometry is confirmed by reading the actual frame after AX writes.
+Providers such as Zen can acknowledge before position/size has settled; an
+unapplied target returns a retryable error instead of being cached as complete.
+Foreground window-creation intent also supersedes an older queued focus once the
+new window is discovered, preventing Full layout from raising the older window.
+Explicit pointer or workspace input cancels that creation hint.
+`make xmonad-oracle XMONAD_SRC=/path/to/xmonad/src`
+compares stack wraparound with XMonad and requires GHC.
+
+The app icon is generated from vector drawing code in `Scripts/DrawAppIcon.swift`.
+The status image draws the same symbol next to the configured text.

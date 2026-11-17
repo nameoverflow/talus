@@ -33,57 +33,8 @@ func isSessionScreenLocked() -> Bool {
     return isSessionDictionaryLocked(session, frontmostBundleID: frontBundle)
 }
 
-func axValue(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
-    var result: CFTypeRef?
-    return AXUIElementCopyAttributeValue(element, attribute, &result) == .success ? result : nil
-}
-
-func frame(_ e: AXUIElement) -> CGRect? {
-    var values: CFArray?
-    let error = AXUIElementCopyMultipleAttributeValues(e, [kAXPositionAttribute, kAXSizeAttribute] as CFArray,
-        AXCopyMultipleAttributeOptions(rawValue: 0), &values)
-    if error == .cannotComplete || error == .invalidUIElement { return nil }
-    let attributes = values as? [CFTypeRef]
-    guard let p = attributes?.first ?? axValue(e, kAXPositionAttribute as CFString),
-          let s = (attributes?.count == 2 ? attributes?[1] : nil) ?? axValue(e, kAXSizeAttribute as CFString),
-          CFGetTypeID(p) == AXValueGetTypeID(),
-          CFGetTypeID(s) == AXValueGetTypeID()
-    else { return nil }
-    var point = CGPoint.zero; var size = CGSize.zero
-    guard AXValueGetValue(p as! AXValue, .cgPoint, &point),
-          AXValueGetValue(s as! AXValue, .cgSize, &size)
-    else { return nil }
-    return CGRect(origin: point, size: size)
-}
-
-@discardableResult
-func setFrame(_ e: AXUIElement, _ r: CGRect, current: CGRect? = nil) -> AXError {
-    if let current, abs(current.width - r.width) < 1, abs(current.height - r.height) < 1 {
-        return setPosition(e, r.origin)
-    }
-    var p = r.origin; var s = r.size
-    if let position = AXValueCreate(.cgPoint, &p), let size = AXValueCreate(.cgSize, &s) {
-        // Keep resize-before-move and the final resize for apps which constrain
-        // their frame to the old display, but use one call for position-only work.
-        AXUIElementSetAttributeValue(e, kAXSizeAttribute as CFString, size)
-        let moved = AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, position)
-        let resized = AXUIElementSetAttributeValue(e, kAXSizeAttribute as CFString, size)
-        return moved == .success ? resized : moved
-    }
-    return .failure
-}
-
-@discardableResult
-func setPosition(_ e: AXUIElement, _ origin: CGPoint) -> AXError {
-    var p = origin
-    if let position = AXValueCreate(.cgPoint, &p) {
-        return AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, position)
-    }
-    return .failure
-}
-
 func applyWindowGeometry(_ geometry: WindowGeometry, _ current: CGRect?) -> AXError {
-    let result = geometry.resizable ? setFrame(geometry.element, geometry.target, current: current)
+    let result = geometry.resizable ? setFrame(geometry.element, geometry.target, current: current, parking: geometry.parking)
         : setPosition(geometry.element, geometry.target.origin)
     if ProcessInfo.processInfo.environment["TALUS_TRACE_GEOMETRY"] == "1" {
         fputs("geometry key=\(geometry.key) pid=\(geometry.pid) from=\(String(describing: current)) target=\(geometry.target) result=\(result.rawValue) actual=\(String(describing: frame(geometry.element)))\n", stderr)
@@ -184,6 +135,7 @@ final class Manager {
     private var elementByHandle: [UInt64: AXUIElement] = [:]
     private var pidByHandle: [UInt64: pid_t] = [:]
     private var nextHandle: UInt64 = 1
+    private var foregroundCreation: (key: UInt64, pid: pid_t, until: Date)?
     private var frameByHandle: [UInt64: CGRect] = [:]
     private var dirtyFrameHandles: Set<UInt64> = []
     private var observedWindowHandles: Set<UInt64> = []
@@ -213,6 +165,7 @@ final class Manager {
     private var frameReadPending: Set<UInt64> = []
     private var geometryGeneration: UInt64 = 0
     private var lastSubmittedFrames: [UInt64: CGRect] = [:]
+    private var fullScreenBounds: [CGRect] = []
 
     let ownPID = ProcessInfo.processInfo.processIdentifier
     var ignoredApps: Set<String>
@@ -349,6 +302,12 @@ final class Manager {
         }
     }
 
+    private func geometryRequest(key: UInt64, pid: pid_t, element: AXUIElement, target: CGRect,
+                                 resizable: Bool) -> WindowGeometry {
+        WindowGeometry(key: key, pid: pid, element: element, target: target, resizable: resizable,
+            parking: fullScreenBounds.contains { isParkedWindowFrame(target, screen: $0) })
+    }
+
     private func retryFailedWrite(_ key: UInt64) {
         dirtyFrameHandles.insert(key)
         let attempts = failedWriteAttempts[key, default: 0]
@@ -358,7 +317,7 @@ final class Manager {
         discoveryRevision &+= 1
         // Retry the latest complete goal directly: a core frame cache is
         // optimistic and could otherwise suppress a retry of a failed write.
-        windowExecutor.submit([WindowGeometry(key: key, pid: pid, element: element,
+        windowExecutor.submit([geometryRequest(key: key, pid: pid, element: element,
             target: target, resizable: candidatesByHandle[key]?.isResizable ?? true)])
     }
 
@@ -436,7 +395,7 @@ final class Manager {
                 } else { continue }
                 if authoritativeFrames == nil {
                     discoveryRevision &+= 1
-                    geometries.append(WindowGeometry(key: key, pid: pid, element: element,
+                    geometries.append(geometryRequest(key: key, pid: pid, element: element,
                         target: target, resizable: candidatesByHandle[key]?.isResizable ?? (effect.kind == "setFrame")))
                     lastSubmittedFrames[key] = target
                     cacheFrame(target, for: key, observed: false)
@@ -476,7 +435,7 @@ final class Manager {
                 guard let pid = pidByHandle[key], let element = elementByHandle[key] else { continue }
                 if lastSubmittedFrames[key] != target || explicit.contains(key) {
                     discoveryRevision &+= 1
-                    geometries.append(WindowGeometry(key: key, pid: pid, element: element,
+                    geometries.append(geometryRequest(key: key, pid: pid, element: element,
                         target: target, resizable: candidatesByHandle[key]?.isResizable ?? true))
                     lastSubmittedFrames[key] = target
                 }
@@ -494,6 +453,7 @@ final class Manager {
     // reaches its latest requested position. Subsequent AX events describe that
     // user's intent rather than echoes from the operation we have superseded.
     func notePointerIntent() {
+        foregroundCreation = nil
         guard windowExecutor.hasPendingGeometry || windowExecutor.hasPendingFocus else { return }
         cancelPendingFocus()
     }
@@ -651,6 +611,13 @@ final class Manager {
         DispatchQueue.main.async(execute: work)
     }
 
+    func noteCreatedWindow(_ element: AXUIElement, pid: pid_t) {
+        guard WindowFocus.isFrontmost(pid) else { return }
+        foregroundCreation = (handle(for: element, pid: pid), pid, Date().addingTimeInterval(1.5))
+    }
+
+    func cancelNewWindowFocus() { foregroundCreation = nil }
+
     func observeApplications() {
         guard AXIsProcessTrusted(), !isSessionScreenLocked() else { return }
         let applications = NSWorkspace.shared.runningApplications.filter {
@@ -682,6 +649,9 @@ final class Manager {
                 }
                 var pid: pid_t = 0
                 AXUIElementGetPid(element, &pid)
+                if name == kAXWindowCreatedNotification as String, pid != 0 {
+                    manager.noteCreatedWindow(element, pid: pid)
+                }
                 manager.rememberFocus()
                 manager.scheduleRefresh(pid: pid == 0 ? nil : pid,
                     created: name == kAXWindowCreatedNotification as String ? element : nil)
@@ -798,6 +768,7 @@ final class Manager {
         if discoveryInFlight || windowExecutor.hasPendingGeometry { pendingDiscovery = true; return }
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return }
+        fullScreenBounds = screens.map(fullScreenRect)
         let wireScreens = screens.enumerated().map { idx, scr in
             WireScreenSpec(id: idx, visibleFrame: WireRect(screenRect(scr)), fullFrame: WireRect(fullScreenRect(scr)))
         }
@@ -857,12 +828,24 @@ final class Manager {
                     if self.confirmedFocusKey == key { self.confirmedFocusKey = nil }
                 }
                 if result.staleAPIDisabled { self.onStaleSandboxTCCDetected?() }
+                var frontmost = self.currentFrontmostWindowHandle()
+                if let created = self.foregroundCreation {
+                    if created.until < Date() || !WindowFocus.isFrontmost(created.pid) {
+                        self.foregroundCreation = nil
+                    } else if self.candidatesByHandle[created.key] != nil {
+                        // A queued activation of an older window must not beat
+                        // the foreground app's newly created window.
+                        _ = self.dispatchJSON(["op": "cancelFocusDelivery"])
+                        frontmost = created.key
+                        self.foregroundCreation = nil
+                    }
+                }
                 let payload = WireRefreshPayload(force: requestedForce, now: Date().timeIntervalSince1970,
                     screens: wireScreens, candidates: self.candidatesByHandle.values.sorted { $0.key < $1.key },
                     busyPids: Array(result.busyPIDs), visibleWindowIds: result.visibleWindowIDs,
                     allExistingCgWindowIds: result.existingWindowIDs, deadHistoryKeys: result.deadHandles,
                     eligibleVisibleWindowExists: result.eligibleVisibleWindowExists,
-                    frontmostKey: self.currentFrontmostWindowHandle(),
+                    frontmostKey: frontmost,
                     traceEvents: ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1")
                 if let data = try? JSONEncoder().encode(payload) { _ = self.dispatchData(data) }
                 self.statusChanged?()
@@ -887,6 +870,7 @@ final class Manager {
     }
 
     func switchWorkspace(_ index: Int) {
+        foregroundCreation = nil
         var req: [String: Any] = [
             "op": "switchWorkspace",
             "index": index,
@@ -902,6 +886,7 @@ final class Manager {
     }
 
     func moveWindowToWorkspace(_ index: Int) {
+        foregroundCreation = nil
         var req: [String: Any] = [
             "op": "moveWindowToWorkspace",
             "index": index,
@@ -917,6 +902,7 @@ final class Manager {
     }
 
     func key(_ code: UInt32, shift: Bool) {
+        foregroundCreation = nil
         var req: [String: Any] = [
             "op": "handleKey",
             "code": code,

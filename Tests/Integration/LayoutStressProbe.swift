@@ -101,8 +101,12 @@ if CommandLine.arguments.contains("--restored") {
     exit(0)
 }
 wait("seeded workspace") { workspace() == 1 && state("status.json")?["count"] as? Int == 6 }
+// Put the unmanaged target directly behind the managed test windows rather
+// than assuming launch-time activation ordered it above the user's other apps.
+focus(clickWindow, pid: clickPID)
+wait("external target prepared") { WindowFocus.frontmostPID() == clickPID }
 focus(a, pid: fastPID)
-wait("focus fast app") { focused(a, pid: fastPID) }
+wait("focus fast app") { focused(a, pid: fastPID) && WindowFocus.frontmostPID() == fastPID }
 usleep(50_000)
 key(kVK_Return)
 wait("fast app is master") { rect(a).map { abs($0.width - area.width * 0.5) < 3 && abs($0.minX - area.minX) < 3 } ?? false }

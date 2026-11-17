@@ -1920,6 +1920,55 @@ mod tests {
     }
 
     #[test]
+    fn foreground_creation_can_replace_an_older_full_layout_focus() {
+        let cfg = Configuration {
+            workspace_mode: "virtual".into(),
+            ..Configuration::default()
+        };
+        let mut mgr = ManagerCore::new(&cfg, None);
+        let first = candidate(1, 101, 1001, "app.zen-browser.zen", "old");
+        mgr.refresh(
+            false,
+            10.0,
+            vec![sample_screen()],
+            vec![first.clone()],
+            &[],
+            &[101],
+            &[101],
+            &[],
+            &[],
+            true,
+            Some(1),
+            false,
+        );
+        mgr.set_current_layout_mode(2);
+        mgr.switch_workspace(0, 10.1, true, Some(1), &HashMap::new());
+        mgr.cancel_focus_delivery();
+        let created = mgr.refresh(
+            false,
+            10.2,
+            vec![sample_screen()],
+            vec![first, candidate(2, 102, 1001, "app.zen-browser.zen", "new")],
+            &[],
+            &[101, 102],
+            &[101, 102],
+            &[],
+            &[],
+            true,
+            Some(2),
+            false,
+        );
+        assert!(created
+            .effects
+            .iter()
+            .any(|e| matches!(e, WindowEffect::Focus { key: 2, .. })));
+        assert!(!created
+            .effects
+            .iter()
+            .any(|e| matches!(e, WindowEffect::Focus { key: 1, .. })));
+    }
+
+    #[test]
     fn confirmed_focus_accepts_next_workspace_activation_without_waiting() {
         let cfg = Configuration {
             workspace_mode: "virtual".into(),
