@@ -30,6 +30,25 @@ struct WindowGeometryIOTests {
         precondition(matchesFrame(CGRect(x: 1709, y: 1075, width: 500, height: 332),
             CGRect(x: 1709, y: 1106, width: 500, height: 332), parking: true))
         precondition(!matchesFrame(CGRect(x: 20, y: 54, width: 1690, height: 1053), target))
+        var enhanced = true
+        var toggles: [Bool] = []
+        let animations = AnimationAccess(read: { enhanced }, write: { value in
+            enhanced = value; toggles.append(value); return .success
+        })
+        let failure: AXError = withoutAXAnimations(element, access: animations) {
+            precondition(!enhanced, "Geometry ran with enhanced-UI animations enabled")
+            return .cannotComplete
+        }
+        precondition(failure == .cannotComplete && enhanced && toggles == [false, true])
+        enhanced = false; toggles.removeAll()
+        withoutAXAnimations(element, access: animations) { precondition(!enhanced) }
+        precondition(toggles.isEmpty && !enhanced, "An originally disabled flag was changed")
+        enhanced = true
+        let delayed = AnimationAccess(read: { enhanced }, write: { value in
+            enhanced = value; return value ? .success : .cannotComplete
+        })
+        withoutAXAnimations(element, access: delayed) {}
+        precondition(enhanced, "A timed-out disable was not followed by restoration")
         print("Ignored AX writes return retryable errors; position-only and parked frames validate correctly")
     }
 }
