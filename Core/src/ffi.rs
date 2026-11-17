@@ -1,5 +1,8 @@
 use crate::config::{ConfigResolution, Configuration, FloatWindowRule, StatusCommand};
-use crate::layout::{mirror_tall_layout, tall_layout, Rect};
+use crate::layout::{
+    inset_area, mirror_tall_layout, mirror_tall_layout_with_gaps, tall_layout,
+    tall_layout_with_gaps, Rect,
+};
 use crate::manager::{CandidateWindow, ManagerActionOutput, ManagerCore, ScreenSpec, WindowEffect};
 use crate::screen_geometry::{
     accessibility_frame, is_parked_window_frame, is_session_locked, matches_visible_window,
@@ -54,6 +57,11 @@ pub extern "C" fn talus_string_free(ptr: *mut c_char) {
 // MARK: - Layout & Screen Geometry FFI
 
 #[no_mangle]
+pub extern "C" fn talus_inset_area(area: Rect, outer_gap: f64) -> Rect {
+    inset_area(area, outer_gap)
+}
+
+#[no_mangle]
 pub extern "C" fn talus_tall_layout(
     area: Rect,
     count: usize,
@@ -73,6 +81,27 @@ pub extern "C" fn talus_tall_layout(
 }
 
 #[no_mangle]
+pub extern "C" fn talus_tall_layout_with_gaps(
+    area: Rect,
+    count: usize,
+    masters: usize,
+    ratio: f64,
+    outer_gap: f64,
+    inner_gap: f64,
+    out_rects: *mut Rect,
+) -> usize {
+    let rects = tall_layout_with_gaps(area, count, masters, ratio, outer_gap, inner_gap);
+    if !out_rects.is_null() {
+        for (i, r) in rects.iter().enumerate() {
+            unsafe {
+                *out_rects.add(i) = *r;
+            }
+        }
+    }
+    rects.len()
+}
+
+#[no_mangle]
 pub extern "C" fn talus_mirror_tall_layout(
     area: Rect,
     count: usize,
@@ -81,6 +110,27 @@ pub extern "C" fn talus_mirror_tall_layout(
     out_rects: *mut Rect,
 ) -> usize {
     let rects = mirror_tall_layout(area, count, masters, ratio);
+    if !out_rects.is_null() {
+        for (i, r) in rects.iter().enumerate() {
+            unsafe {
+                *out_rects.add(i) = *r;
+            }
+        }
+    }
+    rects.len()
+}
+
+#[no_mangle]
+pub extern "C" fn talus_mirror_tall_layout_with_gaps(
+    area: Rect,
+    count: usize,
+    masters: usize,
+    ratio: f64,
+    outer_gap: f64,
+    inner_gap: f64,
+    out_rects: *mut Rect,
+) -> usize {
+    let rects = mirror_tall_layout_with_gaps(area, count, masters, ratio, outer_gap, inner_gap);
     if !out_rects.is_null() {
         for (i, r) in rects.iter().enumerate() {
             unsafe {
@@ -730,9 +780,7 @@ enum ManagerRequest {
         frontmost_key: Option<u64>,
     },
     #[serde(rename_all = "camelCase")]
-    SetPaused {
-        paused: bool,
-    },
+    SetPaused { paused: bool },
     #[serde(rename_all = "camelCase")]
     GetStatusSnapshot {
         now: f64,
@@ -980,8 +1028,10 @@ mod tests {
         cfg.workspace_count = 5;
         cfg.app_workspaces
             .insert("com.apple.Terminal".to_string(), WorkspaceTarget::Index(2));
-        cfg.app_workspaces
-            .insert("com.google.Chrome".to_string(), WorkspaceTarget::Label("网页".to_string()));
+        cfg.app_workspaces.insert(
+            "com.google.Chrome".to_string(),
+            WorkspaceTarget::Label("网页".to_string()),
+        );
         let cfg_c = CString::new(serde_json::to_string(&cfg).unwrap()).unwrap();
         let empty = CString::new("").unwrap();
         let handle = talus_manager_new(cfg_c.as_ptr(), empty.as_ptr());

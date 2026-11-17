@@ -84,6 +84,8 @@ struct Configuration: Codable, Equatable {
     var masterRatio: Double = 0.5
     var ratioStep: Double = 0.03
     var masterCount: Int = 1
+    var outerGap: Double = 0
+    var innerGap: Double = 0
     var ignoreApps: [String] = []
     var appWorkspaces: [String: WorkspaceTarget] = [:]
     var floatWindows: [FloatWindowRule] = []
@@ -102,7 +104,7 @@ struct Configuration: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case modifiers, workspaceMode, workspaceCount
-        case masterRatio, ratioStep, masterCount, ignoreApps, appWorkspaces, floatWindows
+        case masterRatio, ratioStep, masterCount, outerGap, innerGap, ignoreApps, appWorkspaces, floatWindows
         case statusFormat, statusTextFile, statusStateFile, statusTemplate
         case statusShowIcon, workspaceCurrent, workspaceOther, statusFonts
         case statusFontSize, statusCommands, spaceLabels, workspaceIcons
@@ -118,6 +120,8 @@ struct Configuration: Codable, Equatable {
         masterRatio = try values.decodeIfPresent(Double.self, forKey: .masterRatio) ?? masterRatio
         ratioStep = try values.decodeIfPresent(Double.self, forKey: .ratioStep) ?? ratioStep
         masterCount = try values.decodeIfPresent(Int.self, forKey: .masterCount) ?? masterCount
+        outerGap = try values.decodeIfPresent(Double.self, forKey: .outerGap) ?? outerGap
+        innerGap = try values.decodeIfPresent(Double.self, forKey: .innerGap) ?? innerGap
         ignoreApps = try values.decodeIfPresent([String].self, forKey: .ignoreApps) ?? ignoreApps
         appWorkspaces = try values.decodeIfPresent([String: WorkspaceTarget].self, forKey: .appWorkspaces) ?? appWorkspaces
         floatWindows = try values.decodeIfPresent([FloatWindowRule].self, forKey: .floatWindows) ?? floatWindows
@@ -287,5 +291,6 @@ enum ConfigError: String, Error, CustomStringConvertible {
     case conflictingStatusFiles = "statusTextFile and statusStateFile must be different files"
     case invalidStatusFormat = "invalid status template, workspace format, labels or fonts"
     case invalidCount = "masterCount must be between 1 and 20"
+    case invalidGaps = "outerGap and innerGap must be between 0 and 64"
     var description: String { rawValue }
 }

@@ -1,5 +1,8 @@
 use crate::config::{Configuration, FloatWindowRule, WorkspaceTarget};
-use crate::layout::{centered_frame, centered_origin, mirror_tall_layout, tall_layout, Rect};
+use crate::layout::{
+    centered_frame, centered_origin, inset_area, mirror_tall_layout_with_gaps,
+    tall_layout_with_gaps, Rect,
+};
 use crate::screen_geometry::{is_parked_window_frame, parked_window_origin};
 use crate::status_markup::SpaceEntry;
 use crate::virtual_workspaces::{
@@ -129,6 +132,8 @@ pub struct ManagerCore {
     pub float_windows: Vec<FloatWindowRule>,
     pub space_labels: Vec<String>,
     pub ratio_step: f64,
+    pub outer_gap: f64,
+    pub inner_gap: f64,
     pub last_focused: Option<u64>,
 }
 
@@ -171,6 +176,8 @@ impl ManagerCore {
             float_windows: config.float_windows.clone(),
             space_labels: config.space_labels.clone(),
             ratio_step: config.ratio_step,
+            outer_gap: config.outer_gap,
+            inner_gap: config.inner_gap,
             last_focused: None,
         };
         if config.workspace_mode == "virtual" {
@@ -519,11 +526,10 @@ impl ManagerCore {
                     || is_parked_window_frame(w.frame, scr.full_frame)
                 {
                     if w.is_resizable {
-                        let restored = self
-                            .saved_frames
-                            .get(&w.key)
-                            .copied()
-                            .unwrap_or_else(|| centered_frame(w.frame.w, w.frame.h, scr.visible_frame));
+                        let restored =
+                            self.saved_frames.get(&w.key).copied().unwrap_or_else(|| {
+                                centered_frame(w.frame.w, w.frame.h, scr.visible_frame)
+                            });
                         effects.push(WindowEffect::SetFrame {
                             key: w.key,
                             rect: restored,
@@ -536,7 +542,9 @@ impl ManagerCore {
                             .saved_frames
                             .get(&w.key)
                             .map(|r| (r.x, r.y))
-                            .unwrap_or_else(|| centered_origin(w.frame.w, w.frame.h, scr.visible_frame));
+                            .unwrap_or_else(|| {
+                                centered_origin(w.frame.w, w.frame.h, scr.visible_frame)
+                            });
                         effects.push(WindowEffect::SetPosition {
                             key: w.key,
                             x: ox,
@@ -569,9 +577,23 @@ impl ManagerCore {
             }
             let rect = scr.visible_frame;
             let rects = match mode {
-                1 => mirror_tall_layout(rect, group.len(), masters, ratio),
-                2 => vec![rect; group.len()],
-                _ => tall_layout(rect, group.len(), masters, ratio),
+                1 => mirror_tall_layout_with_gaps(
+                    rect,
+                    group.len(),
+                    masters,
+                    ratio,
+                    self.outer_gap,
+                    self.inner_gap,
+                ),
+                2 => vec![inset_area(rect, self.outer_gap); group.len()],
+                _ => tall_layout_with_gaps(
+                    rect,
+                    group.len(),
+                    masters,
+                    ratio,
+                    self.outer_gap,
+                    self.inner_gap,
+                ),
             };
             for (w, target_rect) in group.iter().zip(rects.into_iter()) {
                 let cur = self
@@ -579,10 +601,10 @@ impl ManagerCore {
                     .get(&w.key)
                     .map(|e| e.frame)
                     .unwrap_or(w.frame);
-                if (cur.x - target_rect.x).abs() <= 1.0
-                    && (cur.y - target_rect.y).abs() <= 1.0
-                    && (cur.w - target_rect.w).abs() <= 1.0
-                    && (cur.h - target_rect.h).abs() <= 1.0
+                if (cur.x - target_rect.x).abs() < 1.0
+                    && (cur.y - target_rect.y).abs() < 1.0
+                    && (cur.w - target_rect.w).abs() < 1.0
+                    && (cur.h - target_rect.h).abs() < 1.0
                 {
                     // Already at target frame
                 } else {
@@ -622,12 +644,8 @@ impl ManagerCore {
                     {
                         self.saved_frames.insert(key, w.frame);
                     }
-                    let (ox, oy) = parked_window_origin(
-                        w.frame.w,
-                        w.frame.h,
-                        scr.full_frame,
-                        &all_full_rects,
-                    );
+                    let (ox, oy) =
+                        parked_window_origin(w.frame.w, w.frame.h, scr.full_frame, &all_full_rects);
                     effects.push(WindowEffect::SetPosition { key, x: ox, y: oy });
                     if let Some(entry) = self.window_by_key.get_mut(&key) {
                         entry.frame.x = ox;
@@ -858,10 +876,11 @@ impl ManagerCore {
                     || !cand.is_resizable
                 {
                     let area = screen.visible_frame;
-                    if newly_auto_floated_on_active.contains(&cand.key)
-                        && (f.w - area.w).abs() <= 4.0
-                        && (f.h - area.h).abs() <= 4.0
-                    {
+                    let inset = inset_area(area, self.outer_gap);
+                    let matches_full_tiled = ((f.w - area.w).abs() <= 4.0
+                        && (f.h - area.h).abs() <= 4.0)
+                        || ((f.w - inset.w).abs() <= 4.0 && (f.h - inset.h).abs() <= 4.0);
+                    if newly_auto_floated_on_active.contains(&cand.key) && matches_full_tiled {
                         let fallback = centered_frame(
                             (area.w * 0.72).min(960.0),
                             (area.h * 0.76).min(720.0),
@@ -947,7 +966,9 @@ impl ManagerCore {
                         let target_wid = *focus_map.get(&ws)?;
                         candidates
                             .iter()
-                            .find(|k| next_map.get(*k).and_then(|w| w.window_id) == Some(target_wid))
+                            .find(|k| {
+                                next_map.get(*k).and_then(|w| w.window_id) == Some(target_wid)
+                            })
                             .copied()
                     },
                 );
@@ -1376,9 +1397,16 @@ impl ManagerCore {
                     self.floating.insert(win.key);
                     self.tile(now, frontmost_key, &mut effects);
                     let area = scr.visible_frame;
+                    let inset = inset_area(area, self.outer_gap);
                     let saved = self.saved_frames.get(&win.key).copied();
                     let use_saved = saved
-                        .map(|s| (s.w - area.w).abs() > 4.0 || (s.h - area.h).abs() > 4.0)
+                        .map(|s| {
+                            let is_full =
+                                (s.w - area.w).abs() <= 4.0 && (s.h - area.h).abs() <= 4.0;
+                            let is_inset =
+                                (s.w - inset.w).abs() <= 4.0 && (s.h - inset.h).abs() <= 4.0;
+                            !is_full && !is_inset
+                        })
                         .unwrap_or(false);
                     let restored = if use_saved {
                         saved.unwrap()
@@ -1557,6 +1585,8 @@ impl ManagerCore {
         self.native_ratio = config.master_ratio;
         self.native_masters = config.master_count;
         self.ratio_step = config.ratio_step;
+        self.outer_gap = config.outer_gap;
+        self.inner_gap = config.inner_gap;
         self.ignored_apps = config.ignore_apps.iter().cloned().collect();
         self.app_workspaces = config.app_workspaces.clone();
         self.float_windows = config.float_windows.clone();
@@ -1736,6 +1766,84 @@ mod tests {
     }
 
     #[test]
+    fn gap_changes_retile_all_layouts_without_moving_floating_windows() {
+        for workspace_mode in ["native", "virtual"] {
+            let mut cfg = Configuration {
+                workspace_mode: workspace_mode.to_string(),
+                ..Configuration::default()
+            };
+            let mut mgr = ManagerCore::new(&cfg, None);
+            let candidates = vec![
+                candidate(1, 101, 1001, "com.apple.Terminal", "term-1"),
+                candidate(2, 102, 1002, "com.apple.Safari", "web-1"),
+                candidate(3, 103, 1003, "com.example.Float", "floating"),
+            ];
+            mgr.refresh(
+                false,
+                10.0,
+                vec![sample_screen()],
+                candidates,
+                &[],
+                &[101, 102, 103],
+                &[101, 102, 103],
+                &[],
+                &[],
+                true,
+                Some(1),
+                false,
+            );
+            mgr.floating.insert(3);
+            let mut effects = Vec::new();
+            mgr.tile(11.0, Some(1), &mut effects);
+
+            // A one-point gap must resize the master even when its edge moves by just one point.
+            cfg.inner_gap = 1.0;
+            let live_frames = mgr
+                .window_by_key
+                .iter()
+                .map(|(k, w)| (*k, w.frame))
+                .collect();
+            mgr.apply_config(&cfg, 12.0, true, Some(1), &live_frames);
+            effects.clear();
+            mgr.tile(13.0, Some(1), &mut effects);
+            assert!(effects.iter().any(|e| matches!(e,
+                WindowEffect::SetFrame { key: 1, rect } if rect.w == 719.0)));
+            let left = mgr.window_by_key[&1].frame;
+            let right = mgr.window_by_key[&2].frame;
+            assert_eq!(right.x - left.max_x(), 1.0);
+
+            cfg.outer_gap = 12.0;
+            cfg.inner_gap = 8.0;
+            let live_frames = mgr
+                .window_by_key
+                .iter()
+                .map(|(k, w)| (*k, w.frame))
+                .collect();
+            mgr.apply_config(&cfg, 14.0, true, Some(1), &live_frames);
+            let area = sample_screen().visible_frame;
+            let inset = inset_area(area, 12.0);
+            for mode in 0..=2 {
+                mgr.set_current_layout_mode(mode);
+                effects.clear();
+                mgr.tile(15.0 + mode as f64, Some(1), &mut effects);
+                assert!(!effects.iter().any(|e| matches!(
+                    e,
+                    WindowEffect::SetFrame { key: 3, .. }
+                        | WindowEffect::SetPosition { key: 3, .. }
+                )));
+                let first = mgr.window_by_key[&1].frame;
+                let second = mgr.window_by_key[&2].frame;
+                assert_eq!((first.x, first.y), (inset.x, inset.y));
+                match mode {
+                    0 => assert_eq!(second.x - first.max_x(), 8.0),
+                    1 => assert_eq!(second.y - first.max_y(), 8.0),
+                    _ => assert_eq!((first, second), (inset, inset)),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn keybindings_cycle_layout_float_and_pause() {
         let cfg = Configuration::default();
         let mut mgr = ManagerCore::new(&cfg, None);
@@ -1778,4 +1886,3 @@ mod tests {
         assert_eq!(out_p.layout_name, "Full");
     }
 }
-

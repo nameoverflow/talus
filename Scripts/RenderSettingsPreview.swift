@@ -5,7 +5,7 @@ import SwiftUI
     @MainActor
     static func main() throws {
         guard CommandLine.arguments.count >= 2 else {
-            fputs("Usage: RenderSettingsPreview <output-directory>\n", stderr)
+            fputs("Usage: RenderSettingsPreview <output-directory> [outer-gap inner-gap]\n", stderr)
             exit(1)
         }
         let outDir = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
@@ -41,7 +41,16 @@ import SwiftUI
         workspace_current = "<fc=#FFFFFF,#0F766E> %index%:%label%%fullscreen% </fc>"
         workspace_other = " %index%:%label%%fullscreen% "
         """
-        let config = try Configuration.decodeTOML(sampleTOML)
+        var config = try Configuration.decodeTOML(sampleTOML)
+        if CommandLine.arguments.count >= 4 {
+            guard let outer = Double(CommandLine.arguments[2]),
+                  let inner = Double(CommandLine.arguments[3]) else {
+                fatalError("Gap arguments must be numbers")
+            }
+            config.outerGap = outer
+            config.innerGap = inner
+            try config.validate()
+        }
         let fakeDotfile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".talus.toml")
         let resolution = ConfigResolution(loadURL: fakeDotfile, saveURL: fakeDotfile, migratedFromJSON: false)
 

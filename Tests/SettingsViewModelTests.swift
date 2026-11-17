@@ -23,6 +23,8 @@ import Foundation
         vm.workspaceMode = "virtual"
         vm.workspaceCount = 6
         vm.masterRatioPercent = 58
+        vm.outerGap = 12
+        vm.innerGap = 8
         vm.spaceLabels = ["终端", "网页", "聊天"]
         vm.addIgnoredApp("com.apple.systempreferences")
         vm.setAppWorkspace("com.apple.Safari", workspaceOneBased: 2)
@@ -37,6 +39,9 @@ import Foundation
         precondition(saved.modifiers == ["option"])
         precondition(saved.workspaceMode == "virtual" && saved.workspaceCount == 6)
         precondition(abs(saved.masterRatio - 0.58) < 0.001)
+        precondition(saved.outerGap == 12 && saved.innerGap == 8)
+        let reloaded = SettingsViewModel(config: saved, resolution: res)
+        precondition(reloaded.outerGap == 12 && reloaded.innerGap == 8)
         precondition(saved.spaceLabels == ["终端", "网页", "聊天"])
         precondition(saved.ignoreApps == ["com.apple.systempreferences"])
         precondition(saved.appWorkspaces["com.apple.Safari"] == .index(2))

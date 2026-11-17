@@ -33,6 +33,8 @@ final class SettingsViewModel: ObservableObject {
     @Published var masterRatioPercent: Double
     @Published var ratioStepPercent: Double
     @Published var masterCount: Int
+    @Published var outerGap: Double
+    @Published var innerGap: Double
 
     @Published var ignoreApps: [String]
     @Published var manualBundleID: String = ""
@@ -98,6 +100,8 @@ final class SettingsViewModel: ObservableObject {
         self.masterRatioPercent = (config.masterRatio * 100).rounded()
         self.ratioStepPercent = (config.ratioStep * 1000).rounded() / 10
         self.masterCount = config.masterCount
+        self.outerGap = config.outerGap.rounded()
+        self.innerGap = config.innerGap.rounded()
         self.ignoreApps = config.ignoreApps
         self.appWorkspaces = config.appWorkspaces
         self.floatWindows = config.floatWindows
@@ -171,6 +175,8 @@ final class SettingsViewModel: ObservableObject {
         masterRatioPercent = (config.masterRatio * 100).rounded()
         ratioStepPercent = (config.ratioStep * 1000).rounded() / 10
         masterCount = config.masterCount
+        outerGap = config.outerGap.rounded()
+        innerGap = config.innerGap.rounded()
         ignoreApps = config.ignoreApps
         appWorkspaces = config.appWorkspaces
         floatWindows = config.floatWindows
@@ -218,6 +224,8 @@ final class SettingsViewModel: ObservableObject {
         config.masterRatio = min(0.8, max(0.2, (masterRatioPercent.rounded() / 100.0)))
         config.ratioStep = min(0.2, max(0.01, ((ratioStepPercent * 10).rounded() / 1000.0)))
         config.masterCount = min(20, max(1, masterCount))
+        config.outerGap = min(64, max(0, outerGap.rounded()))
+        config.innerGap = min(64, max(0, innerGap.rounded()))
         config.ignoreApps = ignoreApps
         config.appWorkspaces = appWorkspaces
         config.floatWindows = floatWindows
@@ -499,6 +507,7 @@ final class SettingsViewModel: ObservableObject {
             case .invalidRatio: return "主窗口占比需在 20% 到 80% 之间"
             case .invalidStep: return "每次调整步长需在 1% 到 20% 之间"
             case .invalidCount: return "主区窗口数需在 1 到 20 之间"
+            case .invalidGaps: return "屏幕外边距与窗口间距需在 0 到 64 点之间"
             case .invalidStatusCommand: return "请检查命令：名称仅限字母数字（不能与内置变量重名），程序路径需为以 / 开头的绝对路径"
             case .conflictingStatusFiles: return "输入文本文件与状态导出文件不能是同一个路径"
             case .invalidStatusFormat: return "请检查工作区名称（1–16 字）、字号（8–14）或模板长度"
@@ -848,16 +857,18 @@ private struct ShortcutsAndLayoutView: View {
 
         SectionCard(
             title: "主副分栏布局",
-            subtitle: "设置平铺时的初始主窗口占比与数量。"
+            subtitle: "设置平铺时的初始主窗口占比、数量以及屏幕外边距与窗口间距。"
         ) {
             HStack(alignment: .center, spacing: 18) {
                 TilingPreviewDiagram(
                     ratio: model.masterRatioPercent / 100.0,
-                    masterCount: model.masterCount
+                    masterCount: model.masterCount,
+                    outerGap: model.outerGap,
+                    innerGap: model.innerGap
                 )
-                .frame(width: 148, height: 94)
+                .frame(width: 148, height: 118)
 
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 11) {
                     HStack {
                         Text("默认主区宽度")
                             .font(.system(size: 12.5))
@@ -872,7 +883,41 @@ private struct ShortcutsAndLayoutView: View {
                             }
                         Text("\(Int(model.masterRatioPercent.rounded()))%")
                             .font(.system(size: 12, weight: .medium, design: .monospaced))
-                            .frame(width: 38, alignment: .trailing)
+                            .frame(width: 44, alignment: .trailing)
+                    }
+
+                    HStack {
+                        Text("屏幕外边距")
+                            .font(.system(size: 12.5))
+                            .frame(width: 86, alignment: .leading)
+                        Slider(value: $model.outerGap, in: 0...64)
+                            .onChange(of: model.outerGap) { _, newVal in
+                                let rounded = newVal.rounded()
+                                if abs(newVal - rounded) > 0.001 {
+                                    model.outerGap = rounded
+                                }
+                                model.notifyChanged()
+                            }
+                        Text("\(Int(model.outerGap.rounded())) pt")
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .frame(width: 44, alignment: .trailing)
+                    }
+
+                    HStack {
+                        Text("窗口间距")
+                            .font(.system(size: 12.5))
+                            .frame(width: 86, alignment: .leading)
+                        Slider(value: $model.innerGap, in: 0...64)
+                            .onChange(of: model.innerGap) { _, newVal in
+                                let rounded = newVal.rounded()
+                                if abs(newVal - rounded) > 0.001 {
+                                    model.innerGap = rounded
+                                }
+                                model.notifyChanged()
+                            }
+                        Text("\(Int(model.innerGap.rounded())) pt")
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .frame(width: 44, alignment: .trailing)
                     }
 
                     HStack {
@@ -978,11 +1023,13 @@ private struct ShortcutRow: View {
 private struct TilingPreviewDiagram: View {
     let ratio: Double
     let masterCount: Int
+    var outerGap: Double = 0
+    var innerGap: Double = 0
 
     var body: some View {
         GeometryReader { geo in
-            let pad: CGFloat = 6
-            let gap: CGFloat = 4
+            let pad = min(18, max(2, 2 + CGFloat(outerGap) * 0.32))
+            let gap = min(14, max(1.5, 1.5 + CGFloat(innerGap) * 0.25))
             let innerW = geo.size.width - pad * 2
             let innerH = geo.size.height - pad * 2
             let masterW = max(24, (innerW - gap) * CGFloat(ratio))

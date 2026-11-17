@@ -18,5 +18,25 @@ import Foundation
             }}
         }
         print("100,000 randomized layouts passed coverage and overlap checks")
+        for _ in 0..<100_000 {
+            let area = Rect(x: Double(random(4000) - 2000), y: Double(random(2000) - 1000),
+                            w: Double(200 + random(3000)), h: Double(200 + random(2000)))
+            let count = 1 + random(20), masters = random(21)
+            let outer = Double(random(65)), inner = Double(random(65))
+            let ratio = Double(20 + random(61)) / 100
+            let inset = insetArea(area, outerGap: outer)
+            for boxes in [tallLayout(area, count, masters, ratio, outerGap: outer, innerGap: inner)!,
+                          mirrorTallLayout(area, count, masters, ratio, outerGap: outer, innerGap: inner)!] {
+                precondition(boxes.count == count)
+                precondition(boxes.allSatisfy { $0.w > 0 && $0.h > 0 &&
+                    $0.x >= inset.x && $0.y >= inset.y &&
+                    $0.x + $0.w <= inset.x + inset.w && $0.y + $0.h <= inset.y + inset.h })
+                for i in boxes.indices { for j in boxes.indices where j > i {
+                    let a = boxes[i], b = boxes[j]
+                    precondition(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y)
+                }}
+            }
+        }
+        print("100,000 randomized gap configurations passed bounds and overlap checks in Tall and Mirror")
     }
 }

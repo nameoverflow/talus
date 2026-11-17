@@ -22,6 +22,8 @@ typedef struct TalusManagerHandle TalusManagerHandle;
 void talus_string_free(char *ptr);
 
 // Layout & Screen Geometry
+CTalusRect talus_inset_area(CTalusRect area, double outer_gap);
+
 size_t talus_tall_layout(
     CTalusRect area,
     size_t count,
@@ -30,11 +32,31 @@ size_t talus_tall_layout(
     CTalusRect *out_rects
 );
 
+size_t talus_tall_layout_with_gaps(
+    CTalusRect area,
+    size_t count,
+    size_t masters,
+    double ratio,
+    double outer_gap,
+    double inner_gap,
+    CTalusRect *out_rects
+);
+
 size_t talus_mirror_tall_layout(
     CTalusRect area,
     size_t count,
     size_t masters,
     double ratio,
+    CTalusRect *out_rects
+);
+
+size_t talus_mirror_tall_layout_with_gaps(
+    CTalusRect area,
+    size_t count,
+    size_t masters,
+    double ratio,
+    double outer_gap,
+    double inner_gap,
     CTalusRect *out_rects
 );
 

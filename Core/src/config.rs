@@ -251,6 +251,8 @@ pub struct Configuration {
     pub master_ratio: f64,
     pub ratio_step: f64,
     pub master_count: usize,
+    pub outer_gap: f64,
+    pub inner_gap: f64,
     pub ignore_apps: Vec<String>,
     pub app_workspaces: BTreeMap<String, WorkspaceTarget>,
     pub float_windows: Vec<FloatWindowRule>,
@@ -280,6 +282,8 @@ impl Default for Configuration {
             master_ratio: 0.5,
             ratio_step: 0.03,
             master_count: 1,
+            outer_gap: 0.0,
+            inner_gap: 0.0,
             ignore_apps: Vec::new(),
             app_workspaces: BTreeMap::new(),
             float_windows: Vec::new(),
@@ -465,13 +469,16 @@ impl Configuration {
             if !input.is_empty() && !output.is_empty() {
                 if normalize_lexical_path(input) == normalize_lexical_path(output) {
                     return Err(
-                        "statusTextFile and statusStateFile must be different files".to_string(),
+                        "statusTextFile and statusStateFile must be different files".to_string()
                     );
                 }
             }
         }
         if !(1..=20).contains(&self.master_count) {
             return Err("masterCount must be between 1 and 20".to_string());
+        }
+        if !(0.0..=64.0).contains(&self.outer_gap) || !(0.0..=64.0).contains(&self.inner_gap) {
+            return Err("outerGap and innerGap must be between 0 and 64".to_string());
         }
         Ok(())
     }
@@ -634,7 +641,10 @@ impl Configuration {
             }
             Ok(out)
         }
-        fn parse_command_table(table: &dyn toml_edit::TableLike, prefix: &str) -> Result<StatusCommand, String> {
+        fn parse_command_table(
+            table: &dyn toml_edit::TableLike,
+            prefix: &str,
+        ) -> Result<StatusCommand, String> {
             let mut name: Option<String> = None;
             let mut executable: Option<String> = None;
             let mut arguments: Option<Vec<String>> = None;
@@ -691,9 +701,9 @@ impl Configuration {
                 arr.iter()
                     .enumerate()
                     .map(|(idx, val)| {
-                        let tbl = val.as_inline_table().ok_or_else(|| {
-                            format!("'{}[{}]' entry must be a table", key, idx)
-                        })?;
+                        let tbl = val
+                            .as_inline_table()
+                            .ok_or_else(|| format!("'{}[{}]' entry must be a table", key, idx))?;
                         parse_command_table(tbl, &format!("{}[{}]", key, idx))
                     })
                     .collect()
@@ -774,9 +784,9 @@ impl Configuration {
                 arr.iter()
                     .enumerate()
                     .map(|(idx, val)| {
-                        let tbl = val.as_inline_table().ok_or_else(|| {
-                            format!("'{}[{}]' entry must be a table", key, idx)
-                        })?;
+                        let tbl = val
+                            .as_inline_table()
+                            .ok_or_else(|| format!("'{}[{}]' entry must be a table", key, idx))?;
                         parse_float_rule_table(tbl, &format!("{}[{}]", key, idx))
                     })
                     .collect()
@@ -812,6 +822,15 @@ impl Configuration {
                     claim("masterCount", key)?;
                     let n = req_int(value, key)?;
                     config.master_count = n.max(0) as usize;
+                }
+                "outer_gap" | "outerGap" | "screen_padding" | "screenPadding" | "margin"
+                | "padding" => {
+                    claim("outerGap", key)?;
+                    config.outer_gap = req_double(value, key)?;
+                }
+                "inner_gap" | "innerGap" | "window_gap" | "windowGap" | "gap" | "spacing" => {
+                    claim("innerGap", key)?;
+                    config.inner_gap = req_double(value, key)?;
                 }
                 "ignore_apps" | "ignoreApps" => {
                     claim("ignoreApps", key)?;
@@ -931,6 +950,16 @@ impl Configuration {
                                 claim("masterCount", &format!("layout.{}", sk))?;
                                 let n = req_int(sv, &format!("layout.{}", sk))?;
                                 config.master_count = n.max(0) as usize;
+                            }
+                            "outer_gap" | "outerGap" | "screen_padding" | "screenPadding"
+                            | "margin" | "padding" => {
+                                claim("outerGap", &format!("layout.{}", sk))?;
+                                config.outer_gap = req_double(sv, &format!("layout.{}", sk))?;
+                            }
+                            "inner_gap" | "innerGap" | "window_gap" | "windowGap" | "gap"
+                            | "spacing" => {
+                                claim("innerGap", &format!("layout.{}", sk))?;
+                                config.inner_gap = req_double(sv, &format!("layout.{}", sk))?;
                             }
                             _ => return Err(format!("unknown key 'layout.{}'", sk)),
                         }
@@ -1064,6 +1093,21 @@ impl Configuration {
         fn clean_float(val: f64) -> f64 {
             ((val * 10000.0).round()) / 10000.0
         }
+        fn set_gap(layout: &mut Table, key: &str, gap: f64) {
+            if gap == 0.0 && !layout.contains_key(key) {
+                return;
+            }
+            let mut value = if gap.fract().abs() < 0.0001 {
+                Value::from(gap.round() as i64)
+            } else {
+                Value::from(clean_float(gap))
+            };
+            // Keep comments on the line being edited, as well as its surrounding whitespace.
+            if let Some(previous) = layout.get(key).and_then(Item::as_value) {
+                *value.decor_mut() = previous.decor().clone();
+            }
+            layout[key] = Item::Value(value);
+        }
 
         // Clean any legacy flat root keys before updating canonical sections
         for flat in [
@@ -1077,6 +1121,18 @@ impl Configuration {
             "ratioStep",
             "master_count",
             "masterCount",
+            "outer_gap",
+            "outerGap",
+            "screen_padding",
+            "screenPadding",
+            "margin",
+            "padding",
+            "inner_gap",
+            "innerGap",
+            "window_gap",
+            "windowGap",
+            "gap",
+            "spacing",
             "ignore_apps",
             "ignoreApps",
             "app_workspaces",
@@ -1136,9 +1192,25 @@ impl Configuration {
             doc["layout"] = Item::Table(Table::new());
         }
         if let Some(layout) = doc["layout"].as_table_mut() {
+            for alias in [
+                "outerGap",
+                "screen_padding",
+                "screenPadding",
+                "margin",
+                "padding",
+                "innerGap",
+                "window_gap",
+                "windowGap",
+                "gap",
+                "spacing",
+            ] {
+                layout.remove(alias);
+            }
             layout["master_ratio"] = toml_edit::value(clean_float(self.master_ratio));
             layout["ratio_step"] = toml_edit::value(clean_float(self.ratio_step));
             layout["master_count"] = toml_edit::value(self.master_count as i64);
+            set_gap(layout, "outer_gap", self.outer_gap);
+            set_gap(layout, "inner_gap", self.inner_gap);
         }
 
         if !self.ignore_apps.is_empty()
@@ -1290,6 +1362,79 @@ impl Configuration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gaps_decode_validate_and_preserve_comments_on_save() {
+        let old_json: Configuration = serde_json::from_str("{}").unwrap();
+        assert_eq!((old_json.outer_gap, old_json.inner_gap), (0.0, 0.0));
+        let source = "# My layout\n[layout]\n# Leave room around the screen\nouter_gap = 12 # screen edge\ninner_gap = 8 # between windows\n";
+        let mut cfg = Configuration::decode_toml(source).unwrap();
+        assert_eq!((cfg.outer_gap, cfg.inner_gap), (12.0, 8.0));
+        cfg.outer_gap = 24.0;
+        cfg.inner_gap = 0.0;
+        let saved = cfg.to_toml_preserving_comments(Some(source));
+        assert!(saved.contains("# My layout"));
+        assert!(saved.contains("# Leave room around the screen"));
+        assert!(saved.contains("outer_gap = 24 # screen edge"));
+        assert!(saved.contains("inner_gap = 0 # between windows"));
+        assert_eq!(Configuration::decode_toml(&saved).unwrap(), cfg);
+
+        for section in ["", "[layout]\n"] {
+            for alias in [
+                "outer_gap",
+                "outerGap",
+                "screen_padding",
+                "screenPadding",
+                "margin",
+                "padding",
+            ] {
+                let input = format!("{section}{alias} = 16\n");
+                let parsed = Configuration::decode_toml(&input).unwrap();
+                assert_eq!(parsed.outer_gap, 16.0);
+                assert_eq!(
+                    Configuration::decode_toml(&parsed.to_toml_preserving_comments(Some(&input)))
+                        .unwrap(),
+                    parsed
+                );
+            }
+            for alias in [
+                "inner_gap",
+                "innerGap",
+                "window_gap",
+                "windowGap",
+                "gap",
+                "spacing",
+            ] {
+                let input = format!("{section}{alias} = 7.5\n");
+                let parsed = Configuration::decode_toml(&input).unwrap();
+                assert_eq!(parsed.inner_gap, 7.5);
+                assert_eq!(
+                    Configuration::decode_toml(&parsed.to_toml_preserving_comments(Some(&input)))
+                        .unwrap(),
+                    parsed
+                );
+            }
+        }
+        for input in [
+            "outer_gap = -1",
+            "inner_gap = 65",
+            "outer_gap = nan",
+            "inner_gap = inf",
+            "outer_gap = '12'",
+            "inner_gap = true",
+            "outer_gap = 12\n[layout]\nmargin = 12",
+            "[layout]\ninner_gap = 8\ngap = 8",
+        ] {
+            assert!(
+                Configuration::decode_toml(input)
+                    .and_then(|cfg| cfg.validate())
+                    .is_err(),
+                "{input}"
+            );
+        }
+        let max = Configuration::decode_toml("[layout]\nouter_gap = 64\ninner_gap = 64").unwrap();
+        max.validate().unwrap();
+    }
 
     #[test]
     fn test_config_toml_roundtrip_and_comment_preservation() {

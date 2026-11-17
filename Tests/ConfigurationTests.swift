@@ -9,6 +9,7 @@ import Foundation
 
         let emptyTOML = try Configuration.decodeTOML("# empty config\n"); try emptyTOML.validate()
         precondition(emptyTOML == empty)
+        precondition(empty.outerGap == 0 && empty.innerGap == 0)
 
         let withoutIcon = try d.decode(Configuration.self, from: Data("{\"statusShowIcon\":false}".utf8)); try withoutIcon.validate()
         precondition(!withoutIcon.statusShowIcon)
@@ -34,6 +35,8 @@ import Foundation
         master_ratio = 0.6
         ratio_step = 0.05
         master_count = 2
+        outer_gap = 12
+        inner_gap = 8
 
         [rules]
         ignore_apps = ["com.apple.systempreferences"]
@@ -67,6 +70,7 @@ import Foundation
         """
         let parsedTOML = try Configuration.decodeTOML(tomlInput)
         try parsedTOML.validate()
+        precondition(parsedTOML.outerGap == 12 && parsedTOML.innerGap == 8)
         precondition(parsedTOML.modifiers == ["option"])
         precondition(parsedTOML.workspaceMode == "virtual" && parsedTOML.workspaceCount == 6)
         precondition(parsedTOML.masterRatio == 0.6 && parsedTOML.ratioStep == 0.05 && parsedTOML.masterCount == 2)
@@ -157,6 +161,8 @@ import Foundation
             "{\"appWorkspaces\":{\"\":2}}",
             "{\"masterRatio\":0.9}",
             "{\"masterCount\":0}",
+            "{\"outerGap\":-1}",
+            "{\"innerGap\":65}",
             "{\"ratioStep\":0}",
             "{\"statusCommands\":[{\"name\":\"spaces\",\"executable\":\"/bin/echo\"}]}",
             "{\"statusCommands\":[{\"name\":\"a\",\"executable\":\"echo\"}]}"

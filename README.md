@@ -33,6 +33,8 @@ labels = ["term", "web", "code", "chat", "misc"]
 master_ratio = 0.5
 ratio_step = 0.03
 master_count = 1
+outer_gap = 12
+inner_gap = 8
 
 [rules]
 ignore_apps = ["com.example.SomeApp"]
@@ -43,6 +45,15 @@ ignore_apps = ["com.example.SomeApp"]
 ```
 
 Every key is optional. Modifier names are `control`, `option`, and `command`; at least one is required, and Shift is reserved for swap shortcuts. Ratio must be 0.2–0.8, ratio step greater than zero and at most 0.2, and master count 1–20. `ignore_apps` contains application bundle identifiers. Invalid configuration at startup is reported on standard error (or via an alert when launched as an app); invalid edits while running are logged without crashing the running session.
+
+`outer_gap` leaves space between tiled windows and the display's usable edges;
+`inner_gap` separates columns and stacked windows in Tall and Mirror Tall.
+Both default to `0`, accept values from `0` to `64`, and use macOS logical points
+(one point is two physical pixels on a 2× Retina display), rounded to whole points
+when laying out windows. Full layout applies only the outer gap. Floating windows
+keep their own frames. Gaps shrink on small displays or crowded stacks to keep
+windows inside the usable area. Adjust them live in **快捷键与布局** in Settings,
+or edit `[layout]` in the dotfile.
 
 ## Menu-bar status
 
