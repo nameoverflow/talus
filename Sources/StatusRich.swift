@@ -33,7 +33,7 @@ private struct SegmentMetrics {
     let part: StatusPart
     let font: NSFont
     let symbolImage: NSImage?
-    let displayText: String
+    var displayText: String
     var contentWidth: CGFloat
     var leftPad: CGFloat = 0
     var rightPad: CGFloat = 0
@@ -127,7 +127,29 @@ func renderConfiguredStatus(
         let lastText = segments[lastIdx].displayText
         let isSymbolOnlyRun = slice.contains { $0.symbolImage != nil }
             && slice.allSatisfy { $0.symbolImage != nil || $0.displayText.trimmingCharacters(in: .whitespaces).isEmpty }
-        if isSymbolOnlyRun {
+        let symbolIndices = run.range.filter { segments[$0].symbolImage != nil }
+        let text = slice.filter { $0.symbolImage == nil }.map(\.displayText).joined().trimmingCharacters(in: .whitespaces)
+        let isIconWorkspaceRun = run.key.workspaceIndex != nil && symbolIndices.count == 1
+            && (text.isEmpty || text == "•")
+            && run.range.prefix(while: { $0 != symbolIndices.first }).allSatisfy {
+                segments[$0].displayText.trimmingCharacters(in: .whitespaces).isEmpty
+            }
+        if isIconWorkspaceRun, let symbolIndex = symbolIndices.first {
+            // Keep the symbol centered and reserve the same side space even when its dot is absent.
+            // The dot draws into the trailing inset, so it never changes the pill or hit-region width.
+            let symbol = segments[symbolIndex]
+            let size = CGFloat(symbol.part.style?.fontSize ?? 11.5)
+            let probeFont = symbol.part.style?.font.flatMap { NSFont(name: $0, size: size) }
+                ?? NSFont.monospacedDigitSystemFont(ofSize: size, weight: .semibold)
+            let indicatorWidth = ceil(("•" as NSString).size(withAttributes: [.font: probeFont]).width)
+            for i in run.range where segments[i].symbolImage == nil {
+                segments[i].displayText = segments[i].displayText.trimmingCharacters(in: .whitespaces)
+                segments[i].contentWidth = 0
+            }
+            let inset = 3.5 + indicatorWidth / 2
+            segments[firstIdx].leftPad = inset
+            segments[lastIdx].rightPad = inset
+        } else if isSymbolOnlyRun {
             if segments[firstIdx].symbolImage == nil && firstText.trimmingCharacters(in: .whitespaces).isEmpty {
                 segments[firstIdx].contentWidth = 0
             }

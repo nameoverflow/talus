@@ -102,7 +102,27 @@ import AppKit
     precondition(out0.image.size.width == out2.image.size.width)
     precondition(out0.workspaceRegions == out2.workspaceRegions)
     precondition(Set(out0.workspaceRegions.map { $0.rect.width }).count == 1)
-    precondition((out0.workspaceRegions.first?.rect.width ?? 999) <= 22)
+    precondition((out0.workspaceRegions.first?.rect.width ?? 999) <= 28)
+
+    // Full/occupied dots must keep the same pill widths and clickable regions as bare icons.
+    func renderWithIndicators(_ full: Set<Int>, active: Int = 2, fontSize: Double = 11.5) -> StatusRenderOutput {
+        var cfg = fullIconCfg
+        cfg.statusFontSize = fontSize
+        let spaces = (0..<5).map {
+            SpaceEntry(id: UInt64($0 + 1), isCurrent: $0 == active, isFullscreen: full.contains($0), windowCount: 1)
+        }
+        let vals = StatusValues(spaces: spaces, layout: "Full", title: "", count: 1, custom: "", paused: false, spaceIcons: cfg.workspaceIcons)
+        return renderConfiguredStatus(parts: templateStatusParts(config: cfg, values: vals), dark: true)
+    }
+    for size in [8.0, 11.5, 14.0] {
+        let bare = renderWithIndicators([], fontSize: size)
+        let mixed = renderWithIndicators([0, 1, 2, 4], fontSize: size)
+        let all = renderWithIndicators(Set(0..<5), active: 4, fontSize: size)
+        precondition(mixed.workspaceRegions == bare.workspaceRegions, "Dots must not resize or shift workspace pills")
+        precondition(all.workspaceRegions == bare.workspaceRegions, "Focus and Full state must not move hit regions")
+        precondition(mixed.image.size == bare.image.size && all.image.size == bare.image.size)
+        precondition(Set(mixed.workspaceRegions.map(\.rect.width)).count == 1)
+    }
 
     print("Status templates, colours, fonts and command markup tests passed")
  }
