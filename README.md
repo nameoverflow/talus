@@ -2,7 +2,7 @@
 
 Experimental macOS window manager inspired by XMonad. Written in **Rust (`Core/` / `libtalus_core.a`)** for all tiling geometry, virtual workspaces, session persistence, TOML configuration (`serde` + `toml_edit`, preserving user comments on save), status markup/template rendering, subprocess status command scheduling, and the core window-manager state machine (`ManagerCore`), paired with a thin **Swift/AppKit/SwiftUI shell (`Sources/`)** for macOS Accessibility (`AXUIElement`), Carbon hotkeys, menu-bar `NSStatusItem` rendering, and the Settings window; no X11. This is not yet a daily-use release.
 
-Build and test with `make all test` on macOS with Xcode Command Line Tools and a Rust toolchain (`cargo`). `make app` builds `build/Talus.app` (automatically signing with `Developer ID Application`, `Apple Development`, or `Talus Local Code Signing` if present, and falling back to ad-hoc `-` otherwise), with a menu-bar control to pause, open Settings (`⌘,`), reload configuration, and quit. Run `make setup-cert` once locally to create a persistent `Code Signing`-only self-signed certificate so macOS Accessibility permission survives rebuilds (`make install` updates `/Applications/Talus.app`), and use `make dist` to build a clean ad-hoc `build/Talus-macos.zip` for sharing with other Macs. The program will move visible windows. Quit other window managers before starting and save your work. Control-C quits. Control-Option-P pauses/resumes.
+Build and test with `make all test` on macOS 15 or later with Xcode Command Line Tools and a Rust toolchain (`cargo`). `make app` builds `build/Talus.app` (automatically signing with `Developer ID Application`, `Apple Development`, or `Talus Local Code Signing` if present, and falling back to ad-hoc `-` otherwise), with a menu-bar control to pause, open Settings (`⌘,`), reload configuration, and quit. Run `make setup-cert` once locally to create a persistent `Code Signing`-only self-signed certificate so macOS Accessibility permission survives rebuilds (`make install` updates `/Applications/Talus.app`), and use `make dist` to build a clean ad-hoc `build/Talus-macos.zip` for sharing with other Macs. The program will move visible windows. Quit other window managers before starting and save your work. Control-C quits. Control-Option-P pauses/resumes.
 
 Control-Option J/K focuses the next/previous window on the screen; add Shift to swap. Return swaps the focused window with master. H/L changes the master width. Comma/period changes the master count; Space cycles Tall, Mirror Tall, and Full; T toggles floating for the focused window. Window creation/destruction uses Accessibility notifications with a two-second fallback reconciliation.
 
@@ -11,7 +11,7 @@ Current features: Tall, Mirror Tall, and Full layouts; switchable **native Space
 ## Downloads and releases
 
 Apple Silicon (arm64) packages are published on [GitHub Releases](https://github.com/nameoverflow/talus/releases).
-Extract `Talus-macos-arm64.zip` and move `Talus.app` to `/Applications`.
+Extract `Talus-macos-arm64.zip` and move `Talus.app` to `/Applications`. Builds explicitly target macOS 15.0 so newer local toolchains do not silently raise the minimum supported system version.
 Release builds are ad-hoc signed, without Apple notarization; macOS Gatekeeper may require explicit approval.
 
 The `macOS CI and Release` workflow builds, runs the existing test suite, layout
