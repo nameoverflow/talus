@@ -595,21 +595,24 @@ struct SettingsRootView: View {
 
             Divider()
 
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 14) {
-                    switch model.selectedTab {
-                    case .layout:
-                        ShortcutsAndLayoutView(model: model)
-                    case .rules:
-                        AppRulesView(model: model)
-                    case .menubar:
-                        MenuBarSettingsView(model: model)
+            // Read the available width outside the ScrollView. Asking its content
+            // for a container-relative width can collapse the hosted viewport to zero.
+            GeometryReader { viewport in
+                ScrollView(.vertical) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        switch model.selectedTab {
+                        case .layout:
+                            ShortcutsAndLayoutView(model: model)
+                        case .rules:
+                            AppRulesView(model: model)
+                        case .menubar:
+                            MenuBarSettingsView(model: model)
+                        }
                     }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 14)
+                    .frame(width: viewport.size.width, alignment: .leading)
                 }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .containerRelativeFrame(.horizontal, alignment: .leading)
             }
 
             Divider()

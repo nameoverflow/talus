@@ -92,6 +92,11 @@ settings-ui-test: $(CORE_LIB)
 	mkdir -p build
 	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/SettingsWindow.swift Tests/SettingsViewModelTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework CoreGraphics -o build/settings-ui-tests
 	build/settings-ui-tests
+settings-window-test: $(CORE_LIB)
+	mkdir -p build
+	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/SettingsWindow.swift Tests/SettingsWindowLayoutTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework CoreGraphics -o build/settings-window-tests
+	build/settings-window-tests
+test: settings-window-test
 integration-test: all
 	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
 	swiftc Tests/Integration/Probe.swift -o build/integration-probe
