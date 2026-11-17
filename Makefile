@@ -11,7 +11,7 @@ all: build/talus
 $(CORE_LIB): $(CORE_SOURCES)
 	cargo build --release --manifest-path Core/Cargo.toml
 
-APP_SOURCES = Sources/main.swift Sources/WindowGeometryIO.swift Sources/WindowFocus.swift Sources/WindowDiscovery.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/SettingsWindow.swift
+APP_SOURCES = Sources/main.swift Sources/WindowGeometryIO.swift Sources/WindowServerFrames.swift Sources/WindowExecutor.swift Sources/MainLoopUpdate.swift Sources/WindowFocus.swift Sources/WindowDiscovery.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/SettingsWindow.swift
 build/talus: $(APP_SOURCES) $(CORE_LIB) $(CORE_HEADER)
 	mkdir -p build
 	swiftc -O $(APP_SOURCES) $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework Carbon -framework ApplicationServices -o $@
@@ -153,7 +153,7 @@ status-cleanup-test: all
 manager-responsiveness-test: $(CORE_LIB)
 	mkdir -p build
 	awk '/^final class HotkeyRegistry/ { exit } { print }' Sources/main.swift > build/ManagerUnderTest.swift
-	swiftc -O -parse-as-library build/ManagerUnderTest.swift Sources/WindowGeometryIO.swift Sources/WindowFocus.swift Sources/WindowDiscovery.swift Sources/Layout.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/Spaces.swift Sources/StatusConfiguration.swift Tests/ManagerResponsivenessTests.swift $(CORE_FLAGS) -framework Cocoa -framework Carbon -framework ApplicationServices -o build/manager-responsiveness-tests
+	swiftc -O -parse-as-library build/ManagerUnderTest.swift Sources/WindowGeometryIO.swift Sources/WindowServerFrames.swift Sources/WindowExecutor.swift Sources/MainLoopUpdate.swift Sources/WindowFocus.swift Sources/WindowDiscovery.swift Sources/Layout.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/Spaces.swift Sources/StatusConfiguration.swift Tests/ManagerResponsivenessTests.swift $(CORE_FLAGS) -framework Cocoa -framework Carbon -framework ApplicationServices -o build/manager-responsiveness-tests
 	TALUS_TEST_PID=0 build/manager-responsiveness-tests
 test: manager-responsiveness-test
 
@@ -168,6 +168,21 @@ focus-integration-test:
 	cp Tests/Integration/FocusProbe.swift build/focus-probe/main.swift
 	swiftc -O Sources/WindowFocus.swift build/focus-probe/main.swift -framework Carbon -o build/focus-probe/probe
 	sh Tests/Integration/focus.sh
+
+window-executor-test:
+	mkdir -p build
+	swiftc -O Sources/WindowExecutor.swift Sources/MainLoopUpdate.swift Tests/WindowExecutorTests.swift -framework ApplicationServices -o build/window-executor-tests
+	build/window-executor-tests
+test: window-executor-test
+
+layout-stress-build: all
+	mkdir -p build/layout-stress
+	swiftc Tests/Integration/Fixture.swift -o build/integration-fixture
+	swiftc Tests/Integration/ClickFixture.swift -o build/click-fixture
+	cp Tests/Integration/LayoutStressProbe.swift build/layout-stress/main.swift
+	swiftc -O Sources/WindowFocus.swift build/layout-stress/main.swift -framework Carbon -o build/layout-stress/probe
+layout-stress-test: layout-stress-build
+	sh Tests/Integration/layout-stress.sh
 
 geometry-io-test:
 	mkdir -p build

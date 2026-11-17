@@ -33,6 +33,15 @@ func isSessionScreenLocked() -> Bool {
     return isSessionDictionaryLocked(session, frontmostBundleID: frontBundle)
 }
 
+func applyWindowGeometry(_ geometry: WindowGeometry, _ current: CGRect?) -> AXError {
+    let result = geometry.resizable ? setFrame(geometry.element, geometry.target, current: current, parking: geometry.parking)
+        : setPosition(geometry.element, geometry.target.origin)
+    if ProcessInfo.processInfo.environment["TALUS_TRACE_GEOMETRY"] == "1" {
+        fputs("geometry key=\(geometry.key) pid=\(geometry.pid) from=\(String(describing: current)) target=\(geometry.target) result=\(result.rawValue) actual=\(String(describing: frame(geometry.element)))\n", stderr)
+    }
+    return result
+}
+
 func screenRect(_ screen: NSScreen) -> CGRect {
     let r = screen.visibleFrame
     let top = NSScreen.screens.first?.frame.maxY ?? 0
@@ -91,6 +100,8 @@ private struct WireWindowEffect: Decodable {
 }
 
 private struct WireManagerActionOutput: Decodable {
+    let geometryGeneration: UInt64?
+    let windowFrames: [String: WireRect]?
     let effects: [WireWindowEffect]?
     let activeWindowKeys: [UInt64]?
     let observeWindowKeys: [UInt64]?
@@ -143,8 +154,18 @@ final class Manager {
     private var readinessRetry: DispatchWorkItem?
     private var pendingCreations: [AXWindowKey: (pid: pid_t, until: Date)] = [:]
     private var failedWriteAttempts: [UInt64: Int] = [:]
-    private var writeRetryPIDs: Set<pid_t> = []
-    private var writeRetry: DispatchWorkItem?
+    private let windowExecutor: WindowExecutor
+    private var confirmedFocusKey: UInt64?
+    private var focusOriginKey: UInt64?
+    private var externalFocusAllowedDuringLayout = false
+    private var focusJustDelivered = false
+    private var titlesByHandle: [UInt64: String] = [:]
+    private var titleReadPending: Set<UInt64> = []
+    private var titleReadAt: [UInt64: Date] = [:]
+    private var frameReadPending: Set<UInt64> = []
+    private var geometryGeneration: UInt64 = 0
+    private var lastSubmittedFrames: [UInt64: CGRect] = [:]
+    private var fullScreenBounds: [CGRect] = []
 
     let ownPID = ProcessInfo.processInfo.processIdentifier
     var ignoredApps: Set<String>
@@ -157,6 +178,10 @@ final class Manager {
     var paused: Bool = false {
         didSet {
             guard oldValue != paused else { return }
+            if paused {
+                windowExecutor.cancelQueued()
+                _ = dispatchJSON(["op": "cancelFocusDelivery"])
+            }
             _ = dispatchJSON(["op": "setPaused", "paused": paused])
         }
     }
@@ -166,7 +191,9 @@ final class Manager {
     var onStaleSandboxTCCDetected: (() -> Void)?
 
     init(config: Configuration, discover: @escaping WindowDiscoveryFunction = discoverWindows,
-         canDiscover: @escaping () -> Bool = { AXIsProcessTrusted() && !isSessionScreenLocked() }) {
+         canDiscover: @escaping () -> Bool = { AXIsProcessTrusted() && !isSessionScreenLocked() },
+         applyGeometry: @escaping WindowExecutor.Apply = applyWindowGeometry) {
+        self.windowExecutor = WindowExecutor(apply: applyGeometry)
         self.discoverSnapshot = discover
         self.canDiscover = canDiscover
         self.ignoredApps = Set(config.ignoreApps)
@@ -181,6 +208,30 @@ final class Manager {
                 }
             }
             return talus_manager_new(cCfg, nil)
+        }
+        windowExecutor.onResult = { [weak self] key, error in
+            guard let self else { return }
+            self.discoveryRevision &+= 1
+            if error == .success {
+                self.failedWriteAttempts.removeValue(forKey: key)
+            } else {
+                self.retryFailedWrite(key)
+            }
+        }
+        windowExecutor.onSettled = { [weak self] in
+            guard let self else { return }
+            if ProcessInfo.processInfo.environment["TALUS_TRACE_EVENTS"] == "1" {
+                fputs("execution settled submitted=\(self.windowExecutor.submittedCount) applied=\(self.windowExecutor.appliedCount)\n", stderr)
+            }
+            if self.focusJustDelivered {
+                self.focusJustDelivered = false
+                self.rememberFocus()
+            }
+            if self.pendingDiscovery {
+                let scope = self.pendingFullDiscovery ? nil : self.pendingDiscoveryPIDs
+                self.refresh(onlyPIDs: scope)
+            }
+            self.statusChanged?()
         }
         syncSnapshotFromCore()
     }
@@ -208,13 +259,29 @@ final class Manager {
 
     private func collectLiveFrames(readAll: Bool = false) -> [String: Any] {
         let keys = readAll ? Set(elementByHandle.keys) : dirtyFrameHandles.intersection(activeWindowHandles)
-        for key in keys {
-            if let element = elementByHandle[key], let rect = frame(element) {
+        for key in keys where !windowExecutor.isPending(key) {
+            guard let element = elementByHandle[key] else { continue }
+            let serverFrame = candidatesByHandle[key]?.windowId.flatMap { WindowServerFrames.shared.frame($0) }
+            if let rect = serverFrame ?? (readAll ? frame(element) : nil) {
                 frameByHandle[key] = rect
+                if let pid = pidByHandle[key] { windowExecutor.observe(key: key, pid: pid, frame: rect) }
                 dirtyFrameHandles.remove(key)
                 if var candidate = candidatesByHandle[key] {
                     candidate.frame = WireRect(rect)
                     candidatesByHandle[key] = candidate
+                }
+            } else if !readAll, !frameReadPending.contains(key) {
+                frameReadPending.insert(key)
+                let revision = discoveryRevision
+                discoveryQueue.async { [weak self] in
+                    let rect = frame(element)
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.frameReadPending.remove(key)
+                        guard revision == self.discoveryRevision, !self.windowExecutor.isPending(key),
+                              self.elementByHandle[key] != nil, let rect else { return }
+                        self.cacheFrame(rect, for: key)
+                    }
                 }
             }
         }
@@ -224,8 +291,10 @@ final class Manager {
         })
     }
 
-    private func cacheFrame(_ rect: CGRect, for key: UInt64) {
+    private func cacheFrame(_ rect: CGRect, for key: UInt64, observed: Bool = true) {
         frameByHandle[key] = rect
+        if observed, lastSubmittedFrames[key] == nil { lastSubmittedFrames[key] = rect }
+        if observed, let pid = pidByHandle[key] { windowExecutor.observe(key: key, pid: pid, frame: rect) }
         dirtyFrameHandles.remove(key)
         if var candidate = candidatesByHandle[key] {
             candidate.frame = WireRect(rect)
@@ -233,22 +302,23 @@ final class Manager {
         }
     }
 
+    private func geometryRequest(key: UInt64, pid: pid_t, element: AXUIElement, target: CGRect,
+                                 resizable: Bool) -> WindowGeometry {
+        WindowGeometry(key: key, pid: pid, element: element, target: target, resizable: resizable,
+            parking: fullScreenBounds.contains { isParkedWindowFrame(target, screen: $0) })
+    }
+
     private func retryFailedWrite(_ key: UInt64) {
         dirtyFrameHandles.insert(key)
         let attempts = failedWriteAttempts[key, default: 0]
-        guard attempts < 2, let pid = pidByHandle[key] else { return }
+        guard !paused, attempts < 2, let pid = pidByHandle[key], let element = elementByHandle[key],
+              let target = frameByHandle[key], canDiscover() else { return }
         failedWriteAttempts[key] = attempts + 1
-        writeRetryPIDs.insert(pid)
-        guard writeRetry == nil else { return }
-        let retry = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.writeRetry = nil
-            let pids = self.writeRetryPIDs
-            self.writeRetryPIDs.removeAll()
-            self.refresh(force: true, onlyPIDs: pids)
-        }
-        writeRetry = retry
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: retry)
+        discoveryRevision &+= 1
+        // Retry the latest complete goal directly: a core frame cache is
+        // optimistic and could otherwise suppress a retry of a failed write.
+        windowExecutor.submit([geometryRequest(key: key, pid: pid, element: element,
+            target: target, resizable: candidatesByHandle[key]?.isResizable ?? true)])
     }
 
     @discardableResult
@@ -290,9 +360,15 @@ final class Manager {
                 }
             }
         }
-        if let effects = decoded.effects {
-            executeEffects(effects)
+        var authoritativeFrames: [UInt64: CGRect]?
+        if let generation = decoded.geometryGeneration, generation > geometryGeneration,
+           let frames = decoded.windowFrames {
+            geometryGeneration = generation
+            authoritativeFrames = Dictionary(uniqueKeysWithValues: frames.compactMap { key, rect in
+                UInt64(key).map { ($0, rect.cgRect) }
+            })
         }
+        executeEffects(decoded.effects ?? [], authoritativeFrames: authoritativeFrames)
         return decoded
     }
 
@@ -302,43 +378,123 @@ final class Manager {
         return dispatchData(data)
     }
 
-    private func executeEffects(_ effects: [WireWindowEffect]) {
+    private func executeEffects(_ effects: [WireWindowEffect], authoritativeFrames: [UInt64: CGRect]? = nil) {
+        var geometries: [WindowGeometry] = []
+        var focusAction: (() -> Void)?
+        var focusKey: UInt64?
+        var focusPID: pid_t?
         for effect in effects {
             switch effect.kind {
-            case "setFrame":
-                if let k = effect.key, let r = effect.rect, let el = elementByHandle[k] {
+            case "setFrame", "setPosition":
+                guard let key = effect.key, let pid = pidByHandle[key], let element = elementByHandle[key] else { continue }
+                let target: CGRect
+                if let rect = effect.rect {
+                    target = rect.cgRect
+                } else if let x = effect.x, let y = effect.y, let current = frameByHandle[key] {
+                    target = CGRect(origin: CGPoint(x: x, y: y), size: current.size)
+                } else { continue }
+                if authoritativeFrames == nil {
                     discoveryRevision &+= 1
-                    let target = r.cgRect
-                    if setFrame(el, target, current: frameByHandle[k]) == .success {
-                        failedWriteAttempts.removeValue(forKey: k)
-                        cacheFrame(target, for: k)
-                    } else {
-                        retryFailedWrite(k)
-                    }
-                }
-            case "setPosition":
-                if let k = effect.key, let x = effect.x, let y = effect.y, let el = elementByHandle[k] {
-                    discoveryRevision &+= 1
-                    if setPosition(el, CGPoint(x: x, y: y)) == .success {
-                        failedWriteAttempts.removeValue(forKey: k)
-                        if let current = frameByHandle[k] {
-                            cacheFrame(CGRect(origin: CGPoint(x: x, y: y), size: current.size), for: k)
-                        }
-                    } else {
-                        retryFailedWrite(k)
-                    }
+                    geometries.append(geometryRequest(key: key, pid: pid, element: element,
+                        target: target, resizable: candidatesByHandle[key]?.isResizable ?? (effect.kind == "setFrame")))
+                    lastSubmittedFrames[key] = target
+                    cacheFrame(target, for: key, observed: false)
                 }
             case "focus":
-                if let k = effect.key, let pid = effect.pid, let el = elementByHandle[k] {
-                    WindowFocus.request(window: el, app: axApplication(pid), pid: pid,
+                guard let key = effect.key, let pid = effect.pid, let element = elementByHandle[key] else { continue }
+                focusKey = key
+                focusPID = pid
+                focusAction = { [weak self] in
+                    guard let self, !self.paused, AXIsProcessTrusted(), !isSessionScreenLocked(),
+                          self.elementByHandle[key] != nil else { return }
+                    _ = self.dispatchJSON(["op": "beginFocusDelivery", "now": Date().timeIntervalSince1970, "key": key])
+                    WindowFocus.request(window: element, app: axApplication(pid), pid: pid,
                         legacy: ProcessInfo.processInfo.environment["TALUS_LEGACY_FOCUS"] == "1")
+                    self.focusJustDelivered = true
                 }
             case "relinquishFocus":
-                NSApp.activate(ignoringOtherApps: true)
+                focusKey = nil
+                focusPID = nil
+                focusAction = { [weak self] in
+                    guard let self, !self.paused, !isSessionScreenLocked() else { return }
+                    _ = self.dispatchJSON(["op": "beginFocusDelivery", "now": Date().timeIntervalSince1970])
+                    NSApp.activate(ignoringOtherApps: true)
+                    self.confirmedFocusKey = nil
+                }
             default:
                 break
             }
         }
+        if let frames = authoritativeFrames {
+            let explicit = Set(effects.filter { $0.kind == "setFrame" || $0.kind == "setPosition" }.compactMap(\.key))
+            for key in Array(lastSubmittedFrames.keys) where frames[key] == nil {
+                windowExecutor.forget(key)
+                lastSubmittedFrames.removeValue(forKey: key)
+            }
+            for (key, target) in frames {
+                guard let pid = pidByHandle[key], let element = elementByHandle[key] else { continue }
+                if lastSubmittedFrames[key] != target || explicit.contains(key) {
+                    discoveryRevision &+= 1
+                    geometries.append(geometryRequest(key: key, pid: pid, element: element,
+                        target: target, resizable: candidatesByHandle[key]?.isResizable ?? true))
+                    lastSubmittedFrames[key] = target
+                }
+                cacheFrame(target, for: key, observed: false)
+            }
+        }
+        if !geometries.isEmpty || focusAction != nil {
+            focusOriginKey = confirmedFocusKey
+            externalFocusAllowedDuringLayout = false
+        }
+        windowExecutor.submit(geometries, focusKey: focusKey, focusPID: focusPID, focusAction: focusAction)
+    }
+
+    // A real click supersedes a queued programmatic focus, while geometry still
+    // reaches its latest requested position. Subsequent AX events describe that
+    // user's intent rather than echoes from the operation we have superseded.
+    func notePointerIntent() {
+        foregroundCreation = nil
+        guard windowExecutor.hasPendingGeometry || windowExecutor.hasPendingFocus else { return }
+        cancelPendingFocus()
+    }
+
+    private func cancelPendingFocus() {
+        windowExecutor.cancelFocus()
+        externalFocusAllowedDuringLayout = true
+        _ = dispatchJSON(["op": "cancelFocusDelivery"])
+    }
+
+    private func deferFocusEvent(key: UInt64?, pid: pid_t?) -> Bool {
+        guard windowExecutor.hasPendingGeometry || windowExecutor.hasPendingFocus,
+              !externalFocusAllowedDuringLayout else { return false }
+        if let key, key == windowExecutor.focusKey { return false }
+        if let pid, pid == windowExecutor.focusPID { return true }
+        if let key, key == focusOriginKey { return true }
+        if key == nil, pid == nil || pid == focusOriginKey.flatMap({ pidByHandle[$0] }) { return true }
+        cancelPendingFocus()
+        return false
+    }
+
+    func statusTitle() -> String {
+        guard let key = windowExecutor.focusKey ?? confirmedFocusKey else { return "" }
+        let title = titlesByHandle[key] ?? candidatesByHandle[key]?.title ?? ""
+        guard !titleReadPending.contains(key),
+              Date().timeIntervalSince(titleReadAt[key] ?? .distantPast) > 0.2,
+              let element = elementByHandle[key] else { return title }
+        titleReadPending.insert(key)
+        titleReadAt[key] = Date()
+        discoveryQueue.async { [weak self] in
+            let value = axValue(element, kAXTitleAttribute as CFString) as? String ?? ""
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.titleReadPending.remove(key)
+                guard self.elementByHandle[key] != nil else { return }
+                let changed = self.titlesByHandle[key] != value
+                self.titlesByHandle[key] = value
+                if changed, (self.windowExecutor.focusKey ?? self.confirmedFocusKey) == key { self.statusChanged?() }
+            }
+        }
+        return title
     }
 
     func statusSnapshot() -> (
@@ -352,7 +508,7 @@ final class Manager {
         virtualSpaces: [SpaceEntry]
     ) {
         let now = Date().timeIntervalSince1970
-        let frontKey = currentFrontmostWindowHandle()
+        let frontKey = windowExecutor.focusKey ?? confirmedFocusKey
         var req: [String: Any] = ["op": "getStatusSnapshot", "now": now]
         if let frontKey { req["frontmostKey"] = frontKey }
         guard let coreHandle,
@@ -400,14 +556,17 @@ final class Manager {
     }
 
     func restoreAllParkedWindows() {
+        windowExecutor.finishSynchronously()
         _ = dispatchJSON([
             "op": "restoreAllParkedWindows",
             "trusted": AXIsProcessTrusted(),
             "liveFrames": collectLiveFrames(readAll: true),
         ])
+        windowExecutor.finishSynchronously()
     }
 
     func apply(config: Configuration) {
+        if (config.workspaceMode == "virtual") != isVirtualMode { cancelPendingFocus() }
         discoveryRevision &+= 1
         ignoredApps = Set(config.ignoreApps)
         guard let cfgData = try? JSONEncoder().encode(config),
@@ -465,6 +624,7 @@ final class Manager {
             $0.activationPolicy == .regular && $0.processIdentifier != ownPID
         }
         let live = Set(applications.map(\.processIdentifier))
+        windowExecutor.retainApplications(live)
         for pid in observers.keys where !live.contains(pid) {
             if let observer = observers.removeValue(forKey: pid) {
                 CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
@@ -508,18 +668,18 @@ final class Manager {
         }
     }
 
-    private func currentFrontmostWindowHandle() -> UInt64? {
+    private func currentFrontmostWindowHandle(includePending: Bool = true, cache: Bool = true) -> UInt64? {
+        if includePending, let key = windowExecutor.focusKey { return key }
         guard AXIsProcessTrusted(), !isSessionScreenLocked(),
-              let app = NSWorkspace.shared.frontmostApplication,
-              app.processIdentifier != ownPID,
-              let focused = axValue(axApplication(app.processIdentifier), kAXFocusedWindowAttribute as CFString),
-              CFGetTypeID(focused) == AXUIElementGetTypeID()
-        else { return nil }
-        let el = focused as! AXUIElement
-        if let role = axValue(el, kAXRoleAttribute as CFString) as? String, role != (kAXWindowRole as String) {
-            return nil
-        }
-        return handle(for: el, pid: app.processIdentifier)
+              let pid = WindowFocus.frontmostPID() ?? NSWorkspace.shared.frontmostApplication?.processIdentifier,
+              pid != ownPID,
+              let focused = axValue(axApplication(pid), kAXFocusedWindowAttribute as CFString),
+              CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
+        let element = focused as! AXUIElement
+        if let role = axValue(element, kAXRoleAttribute as CFString) as? String, role != kAXWindowRole as String { return nil }
+        let key = handle(for: element, pid: pid)
+        if cache { confirmedFocusKey = key }
+        return key
     }
 
     func rememberFocus() {
@@ -541,7 +701,10 @@ final class Manager {
             "locked": isSessionScreenLocked(),
             "liveFrames": [:],
         ]
-        if let fk = currentFrontmostWindowHandle() {
+        let actual = currentFrontmostWindowHandle(includePending: false, cache: false)
+        if deferFocusEvent(key: actual, pid: actual.flatMap({ pidByHandle[$0] })) { return }
+        confirmedFocusKey = actual
+        if let fk = actual {
             req["frontmostKey"] = fk
             if !activeWindowHandles.contains(fk) { req["liveFrames"] = collectLiveFrames() }
             if candidatesByHandle[fk] == nil, let pid = pidByHandle[fk] { scheduleRefresh(pid: pid) }
@@ -552,6 +715,7 @@ final class Manager {
     }
 
     func handleApplicationActivated(_ app: NSRunningApplication) {
+        if app.processIdentifier == ownPID { confirmedFocusKey = nil; return }
         // Activation notifications can arrive after another application became
         // frontmost. Such an old notification must not undo a confirmed switch.
         guard app.processIdentifier != ownPID,
@@ -563,6 +727,8 @@ final class Manager {
            (axValue(axFocused as! AXUIElement, kAXRoleAttribute as CFString) as? String ?? (kAXWindowRole as String)) == (kAXWindowRole as String) {
             appFocusedKey = handle(for: axFocused as! AXUIElement, pid: app.processIdentifier)
         }
+        if deferFocusEvent(key: appFocusedKey, pid: app.processIdentifier) { return }
+        confirmedFocusKey = appFocusedKey
         var req: [String: Any] = [
             "op": "handleApplicationActivated",
             "pid": app.processIdentifier,
@@ -599,9 +765,10 @@ final class Manager {
         guard !paused, canDiscover() else { return }
         pendingForce = pendingForce || force
         if let onlyPIDs { pendingDiscoveryPIDs.formUnion(onlyPIDs) } else { pendingFullDiscovery = true }
-        if discoveryInFlight { pendingDiscovery = true; return }
+        if discoveryInFlight || windowExecutor.hasPendingGeometry { pendingDiscovery = true; return }
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return }
+        fullScreenBounds = screens.map(fullScreenRect)
         let wireScreens = screens.enumerated().map { idx, scr in
             WireScreenSpec(id: idx, visibleFrame: WireRect(screenRect(scr)), fullFrame: WireRect(fullScreenRect(scr)))
         }
@@ -627,7 +794,7 @@ final class Manager {
                 guard !self.paused, self.canDiscover() else { return }
                 // A key, config change or newer structural event wins over an
                 // older scan; never feed stale parked geometry back to the core.
-                guard revision == self.discoveryRevision else {
+                guard revision == self.discoveryRevision, !self.windowExecutor.hasPendingGeometry else {
                     self.refresh(force: requestedForce, onlyPIDs: scope)
                     return
                 }
@@ -638,6 +805,7 @@ final class Manager {
                 for window in result.windows {
                     let key = self.handle(for: window.element, pid: window.pid)
                     self.cacheFrame(window.rect, for: key)
+                    self.titlesByHandle[key] = window.title
                     self.candidatesByHandle[key] = WireCandidateWindow(key: key, pid: window.pid,
                         bundleId: window.bundleID, windowId: window.windowID, title: window.title,
                         frame: WireRect(window.rect), isResizable: window.isResizable)
@@ -649,10 +817,15 @@ final class Manager {
                     }
                     self.pidByHandle.removeValue(forKey: key)
                     self.frameByHandle.removeValue(forKey: key)
+                    self.lastSubmittedFrames.removeValue(forKey: key)
                     self.candidatesByHandle.removeValue(forKey: key)
                     self.observedWindowHandles.remove(key)
                     self.dirtyFrameHandles.remove(key)
                     self.failedWriteAttempts.removeValue(forKey: key)
+                    self.windowExecutor.forget(key)
+                    self.titlesByHandle.removeValue(forKey: key)
+                    self.titleReadAt.removeValue(forKey: key)
+                    if self.confirmedFocusKey == key { self.confirmedFocusKey = nil }
                 }
                 if result.staleAPIDisabled { self.onStaleSandboxTCCDetected?() }
                 var frontmost = self.currentFrontmostWindowHandle()
@@ -1051,6 +1224,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     private func openDropdownMenu() {
+        statusUpdate.flush()
         if hoveredWorkspace != nil {
             hoveredWorkspace = nil
             updateToolTip()
@@ -1078,7 +1252,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         updateStatus()
     }
 
-    func updateStatus() {
+    private lazy var statusUpdate = MainLoopUpdate { [weak self] in self?.updateStatusNow() }
+
+    func updateStatus() { statusUpdate.request() }
+
+    private func updateStatusNow() {
         let trusted = AXIsProcessTrusted()
         axWarningItem.isHidden = trusted
         axSeparator.isHidden = trusted
@@ -1088,14 +1266,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let needsTitle = (config.statusTemplate ?? "").contains("%title%")
             || config.statusFormat.contains("{title}") || !config.statusCommands.isEmpty
             || !(config.statusStateFile ?? "").isEmpty
-        let frontmost = locked || !needsTitle ? nil : NSWorkspace.shared.frontmostApplication
-        let frontWindow = (trusted && !locked) ? frontmost.flatMap { axValue(axApplication($0.processIdentifier), kAXFocusedWindowAttribute as CFString) } : nil
-        let title: String
-        if let frontWindow, CFGetTypeID(frontWindow) == AXUIElementGetTypeID() {
-            title = axValue(frontWindow as! AXUIElement, kAXTitleAttribute as CFString) as? String ?? ""
-        } else {
-            title = ""
-        }
+        let title = trusted && !locked && needsTitle
+            ? (NSApp.isActive ? NSApp.keyWindow?.title ?? "" : manager.statusTitle()) : ""
         let custom = config.statusTextFile.map(readCustomStatus(at:)) ?? ""
         let spaceList = snap.isVirtualMode ? snap.virtualSpaces : spaces.spaces(for: snap.focusedScreen)
         let values = StatusValues(
@@ -1424,12 +1596,17 @@ let unlockObserver = DistributedNotificationCenter.default().addObserver(
         statusMenu.updateStatus()
     }
 }
-let creationPointerMask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
-let creationGlobalPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: creationPointerMask) { _ in manager.cancelNewWindowFocus() }
-let creationLocalPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: creationPointerMask) { event in
-    manager.cancelNewWindowFocus()
+// Mouse intent cancels a queued focus before AppKit delivers its AX/activation
+// notifications. No key logging or additional input-monitoring permission.
+let pointerMask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+let globalPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: pointerMask) { _ in
+    manager.notePointerIntent()
+}
+let localPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: pointerMask) { event in
+    manager.notePointerIntent()
     return event
 }
+
 let activationToken = workspace.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification,
     object: nil,

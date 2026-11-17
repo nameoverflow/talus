@@ -24,14 +24,19 @@ private final class FrontProcess {
     deinit { if let library { dlclose(library) } }
 
     func isFrontmost(_ pid: pid_t) -> Bool {
-        guard let getFront, let getPID else { return false }
+        processID() == pid
+    }
+
+    func processID() -> pid_t? {
+        guard let getFront, let getPID else { return nil }
         var psn = ProcessSerialNumber(highLongOfPSN: 0, lowLongOfPSN: 0), actual: pid_t = 0
-        return getFront(&psn) == 0 && getPID(&psn, &actual) == 0 && actual == pid
+        return getFront(&psn) == 0 && getPID(&psn, &actual) == 0 ? actual : nil
     }
 }
 
 enum WindowFocus {
     static func isFrontmost(_ pid: pid_t) -> Bool { FrontProcess.shared.isFrontmost(pid) }
+    static func frontmostPID() -> pid_t? { FrontProcess.shared.processID() }
     /// AXFrontmost runs the application's activation path. Merely activating
     /// its WindowServer process can leave a different window holding key focus.
     /// Keep the original sequence as a compatibility fallback for AX providers

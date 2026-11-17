@@ -153,6 +153,33 @@ AX errors fall back to the original focus sequence. `TALUS_LEGACY_FOCUS=1` force
 that sequence for compatibility comparisons. No SIP changes or process injection
 are required.
 
+Geometry writes run on a separate serial queue per application. Each window keeps
+its latest complete target, so a superseded move cannot lose an earlier resize.
+Each layout publishes its complete target snapshot, even when its sparse effect
+list is empty; this supersedes any older queued target despite delayed physical
+snapshots. The shell compares submitted goals rather than treating observed bounds
+as proof that an asynchronous request has completed.
+Logical input is processed in order; obsolete geometry and focus requests are
+coalesced. Focus waits for the remaining geometry, and an explicit mouse click can
+cancel queued focus. Pausing cancels queued writes; exit drains writes before
+restoring parked windows. Main-thread status updates are coalesced and use cached
+focus/title data. Read-only WindowServer bounds avoid a stalled application's AX
+frame queries; unavailable bounds are refreshed through AX in the background.
+
+`make window-executor-test` checks parallel applications, superseded goals, focus
+barriers, cancellation, shutdown, and coalesced UI updates without moving windows.
+`make layout-stress-test` uses two managed test applications and an unmanaged click
+target. It briefly stops one fixture, issues resize/switch bursts, and verifies
+that the other app progresses, an external click keeps focus, and quit restores
+every parked window. It requires an unlocked desktop; quit other window managers
+before running it. `TALUS_STRESS_BASELINE=1 TALUS_BIN=/path/to/old/talus` measures
+the old path's resize delay without requiring it to pass the new concurrency checks.
+`make xmonad-oracle XMONAD_SRC=/path/to/xmonad/src`
+compares stack wraparound with XMonad and requires GHC.
+
+The app icon is generated from vector drawing code in `Scripts/DrawAppIcon.swift`.
+The status image draws the same symbol next to the configured text.
+
 New-window geometry is confirmed by reading the actual frame after AX writes.
 Providers such as Zen can acknowledge before position/size has settled; an
 unapplied target returns a retryable error instead of being cached as complete.

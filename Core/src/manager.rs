@@ -83,6 +83,8 @@ pub enum WindowEffect {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerActionOutput {
+    pub geometry_generation: u64,
+    pub window_frames: BTreeMap<u64, Rect>,
     pub effects: Vec<WindowEffect>,
     pub active_window_keys: Vec<u64>,
     pub observe_window_keys: Vec<u64>,
@@ -127,6 +129,7 @@ pub struct ManagerCore {
     native_ratio: f64,
     native_masters: usize,
     native_layout_mode: i32,
+    geometry_generation: u64,
 
     pub paused: bool,
     pub ignored_apps: HashSet<String>,
@@ -173,6 +176,7 @@ impl ManagerCore {
             native_ratio: config.master_ratio,
             native_masters: config.master_count,
             native_layout_mode: 0,
+            geometry_generation: 0,
             paused: false,
             ignored_apps: config.ignore_apps.iter().cloned().collect(),
             app_workspaces: config.app_workspaces.clone(),
@@ -472,6 +476,14 @@ impl ManagerCore {
         }
     }
 
+    /// Geometry may finish after the original input-time guard expired. Start
+    /// the echo guard when the shell is actually ready to submit focus.
+    pub fn begin_focus_delivery(&mut self, now: f64, key: Option<u64>) {
+        self.programmatic_focus_key = key;
+        self.programmatic_focus_until = if key.is_some() { now + 0.45 } else { 0.0 };
+        self.suppress_external_focus_until = now + 0.45;
+    }
+
     pub fn cancel_focus_delivery(&mut self) {
         self.programmatic_focus_key = None;
         self.programmatic_focus_until = 0.0;
@@ -524,6 +536,7 @@ impl ManagerCore {
     }
 
     fn tile(&mut self, now: f64, frontmost_key: Option<u64>, effects: &mut Vec<WindowEffect>) {
+        self.geometry_generation += 1;
         let screens = self.last_screens.clone();
         let mode = self.current_layout_mode();
         let ratio = self.current_ratio();
@@ -701,7 +714,31 @@ impl ManagerCore {
     }
 
     fn make_output(&self, effects: Vec<WindowEffect>) -> ManagerActionOutput {
+        let mut window_frames: BTreeMap<u64, Rect> = self
+            .window_by_key
+            .iter()
+            .map(|(&key, window)| (key, window.frame))
+            .collect();
+        for window in &self.windows {
+            window_frames.insert(window.key, window.frame);
+        }
+        for effect in &effects {
+            match effect {
+                WindowEffect::SetFrame { key, rect } => {
+                    window_frames.insert(*key, *rect);
+                }
+                WindowEffect::SetPosition { key, x, y } => {
+                    if let Some(rect) = window_frames.get_mut(key) {
+                        rect.x = *x;
+                        rect.y = *y;
+                    }
+                }
+                _ => {}
+            }
+        }
         ManagerActionOutput {
+            geometry_generation: self.geometry_generation,
+            window_frames,
             effects,
             active_window_keys: self.windows.iter().map(|w| w.key).collect(),
             observe_window_keys: self.window_by_key.keys().copied().collect(),
@@ -1798,6 +1835,88 @@ mod tests {
             .effects
             .iter()
             .any(|e| matches!(e, WindowEffect::Focus { key: 1, .. })));
+    }
+
+    #[test]
+    fn an_effectless_layout_still_publishes_every_complete_geometry_target() {
+        let cfg = Configuration {
+            workspace_mode: "virtual".into(),
+            workspace_count: 3,
+            ..Configuration::default()
+        };
+        let mut mgr = ManagerCore::new(&cfg, None);
+        let initial = mgr.refresh(
+            false,
+            10.0,
+            vec![sample_screen()],
+            vec![
+                candidate(1, 101, 1001, "com.apple.Terminal", "term"),
+                candidate(2, 102, 1002, "com.apple.Safari", "web"),
+            ],
+            &[],
+            &[101, 102],
+            &[101, 102],
+            &[],
+            &[],
+            true,
+            Some(1),
+            false,
+        );
+        // A physical snapshot may still look parked while an earlier show
+        // request is queued in the shell. Sparse effects alone are insufficient.
+        let stale = HashMap::from([
+            (1, Rect::new(1439.0, 899.0, 720.0, 866.0)),
+            (2, Rect::new(1439.0, 899.0, 720.0, 866.0)),
+        ]);
+        let hidden = mgr.switch_workspace(2, 11.0, true, Some(1), &stale);
+        assert!(hidden.geometry_generation > initial.geometry_generation);
+        assert!(!hidden.effects.iter().any(|effect| matches!(
+            effect,
+            WindowEffect::SetFrame { .. } | WindowEffect::SetPosition { .. }
+        )));
+        assert_eq!(hidden.window_frames.len(), 2);
+        assert_eq!(hidden.window_frames[&1].x, 1439.0);
+        assert_eq!(hidden.window_frames[&2].x, 1439.0);
+    }
+
+    #[test]
+    fn delayed_focus_delivery_renews_guard_and_user_cancellation_releases_it() {
+        let cfg = Configuration {
+            workspace_mode: "virtual".into(),
+            workspace_count: 3,
+            ..Configuration::default()
+        };
+        let mut mgr = ManagerCore::new(&cfg, None);
+        mgr.refresh(
+            false,
+            10.0,
+            vec![sample_screen()],
+            vec![
+                candidate(1, 101, 1001, "com.apple.Terminal", "term"),
+                candidate(2, 102, 1002, "com.apple.Safari", "web"),
+            ],
+            &[],
+            &[101, 102],
+            &[101, 102],
+            &[],
+            &[],
+            true,
+            Some(1),
+            false,
+        );
+        mgr.move_window_to_workspace(1, 11.0, true, Some(1), &HashMap::new());
+        mgr.switch_workspace(1, 12.0, true, Some(2), &HashMap::new());
+        mgr.begin_focus_delivery(13.0, Some(1));
+        let stale = mgr.handle_ax_focus_notification(13.01, true, false, Some(2), &HashMap::new());
+        assert_eq!(stale.active_workspace, 1);
+        assert!(!stale.status_changed);
+        mgr.cancel_focus_delivery();
+        assert_eq!(mgr.programmatic_focus_key, None);
+        assert_eq!(mgr.suppress_external_focus_until, 0.0);
+        let clicked =
+            mgr.handle_ax_focus_notification(13.02, true, false, Some(2), &HashMap::new());
+        assert_eq!(clicked.active_workspace, 0);
+        assert!(clicked.status_changed);
     }
 
     #[test]
