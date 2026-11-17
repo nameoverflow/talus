@@ -1,5 +1,13 @@
 import AppKit
 import Foundation
+import ServiceManagement
+
+private final class SettingsLoginService: LaunchAtLoginService {
+    var status: SMAppService.Status = .notRegistered
+    func register() throws { status = .enabled }
+    func unregister() throws { status = .notRegistered }
+    func openSystemSettings() {}
+}
 
 @main struct SettingsViewModelTests {
     static func main() throws {
@@ -9,7 +17,14 @@ import Foundation
         let res = ConfigResolution(loadURL: saveURL, saveURL: saveURL, migratedFromJSON: false)
 
         // 1. Default config starts in simple mode
-        let vm = SettingsViewModel(config: Configuration(), resolution: res)
+        let login = LaunchAtLoginModel(service: SettingsLoginService())
+        let vm = SettingsViewModel(config: Configuration(), resolution: res, launchAtLogin: login)
+        precondition(vm.selectedTab == .general)
+        var configurationApplies = 0
+        vm.onConfigurationApplied = { _, _ in configurationApplies += 1 }
+        login.setEnabled(true)
+        precondition(login.isEnabled && configurationApplies == 0)
+        precondition(!FileManager.default.fileExists(atPath: saveURL.path), "Login items must not save TOML")
         precondition(vm.statusMode == .simple)
         precondition(vm.modifierSymbolPrefix == "⌃⌥")
 
@@ -75,6 +90,13 @@ import Foundation
             precondition(vm.previewImage(dark: true).size.width > 20)
         }
 
-        print("Settings UI view model tests passed")
+        let beforeLoginChange = try Data(contentsOf: saveURL)
+        let appliesBeforeLoginChange = configurationApplies
+        login.setEnabled(false)
+        precondition(!login.isEnabled && configurationApplies == appliesBeforeLoginChange)
+        let afterLoginChange = try Data(contentsOf: saveURL)
+        precondition(afterLoginChange == beforeLoginChange)
+
+        print("Settings UI view model tests passed, including login items independent of TOML")
     }
 }

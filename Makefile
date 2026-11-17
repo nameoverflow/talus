@@ -11,10 +11,10 @@ all: build/talus
 $(CORE_LIB): $(CORE_SOURCES)
 	cargo build --release --manifest-path Core/Cargo.toml
 
-APP_SOURCES = Sources/main.swift Sources/WindowGeometryIO.swift Sources/WindowServerFrames.swift Sources/WindowExecutor.swift Sources/MainLoopUpdate.swift Sources/WindowFocus.swift Sources/WindowDiscovery.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/SettingsWindow.swift
+APP_SOURCES = Sources/main.swift Sources/WindowGeometryIO.swift Sources/WindowServerFrames.swift Sources/WindowExecutor.swift Sources/MainLoopUpdate.swift Sources/WindowFocus.swift Sources/WindowDiscovery.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/LaunchAtLogin.swift Sources/SettingsWindow.swift
 build/talus: $(APP_SOURCES) $(CORE_LIB) $(CORE_HEADER)
 	mkdir -p build
-	swiftc -O $(APP_SOURCES) $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework Carbon -framework ApplicationServices -o $@
+	swiftc -O $(APP_SOURCES) $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework ServiceManagement -framework Carbon -framework ApplicationServices -o $@
 clean:
 	rm -rf build
 	cargo clean --manifest-path Core/Cargo.toml
@@ -90,11 +90,11 @@ config-test: $(CORE_LIB)
 	build/config-tests
 settings-ui-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/SettingsWindow.swift Tests/SettingsViewModelTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework CoreGraphics -o build/settings-ui-tests
+	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/LaunchAtLogin.swift Sources/SettingsWindow.swift Tests/SettingsViewModelTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework ServiceManagement -framework CoreGraphics -o build/settings-ui-tests
 	build/settings-ui-tests
 settings-window-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/SettingsWindow.swift Tests/SettingsWindowLayoutTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework CoreGraphics -o build/settings-window-tests
+	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/LaunchAtLogin.swift Sources/SettingsWindow.swift Tests/SettingsWindowLayoutTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework ServiceManagement -framework CoreGraphics -o build/settings-window-tests
 	build/settings-window-tests
 test: settings-window-test
 integration-test: all
@@ -189,3 +189,25 @@ geometry-io-test:
 	swiftc Sources/WindowGeometryIO.swift Tests/WindowGeometryIOTests.swift -framework ApplicationServices -o build/geometry-io-tests
 	build/geometry-io-tests
 test: geometry-io-test
+
+launch-at-login-test:
+	mkdir -p build
+	swiftc Sources/LaunchAtLogin.swift Tests/LaunchAtLoginTests.swift -framework ServiceManagement -o build/launch-at-login-tests
+	build/launch-at-login-tests
+test: launch-at-login-test
+
+# Opt-in: briefly registers only an isolated, signed test app, then removes it.
+launch-at-login-integration-test:
+	mkdir -p build/LoginItemProbe.app/Contents/MacOS
+	swiftc Sources/LaunchAtLogin.swift Tests/Integration/LaunchAtLoginProbe.swift -framework ServiceManagement -o build/LoginItemProbe.app/Contents/MacOS/Probe
+	cp Resources/Info.plist build/LoginItemProbe.app/Contents/Info.plist
+	/usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier local.talus.testing.login' build/LoginItemProbe.app/Contents/Info.plist
+	/usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Probe' build/LoginItemProbe.app/Contents/Info.plist
+	/usr/libexec/PlistBuddy -c 'Set :CFBundleName Talus Login Test' build/LoginItemProbe.app/Contents/Info.plist
+	codesign --force --sign - build/LoginItemProbe.app
+	build/LoginItemProbe.app/Contents/MacOS/Probe
+
+settings-preview: $(CORE_LIB)
+	mkdir -p build
+	swiftc Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/LaunchAtLogin.swift Sources/SettingsWindow.swift Scripts/RenderSettingsPreview.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework ServiceManagement -framework CoreGraphics -o build/render-settings-preview
+	build/render-settings-preview build/settings-previews
