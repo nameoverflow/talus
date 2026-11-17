@@ -378,13 +378,8 @@ final class Manager {
                 }
             case "focus":
                 if let k = effect.key, let pid = effect.pid, let el = elementByHandle[k] {
-                    AXUIElementSetAttributeValue(el, kAXMainAttribute as CFString, kCFBooleanTrue)
-                    AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-                    AXUIElementPerformAction(el, kAXRaiseAction as CFString)
-                    let axApp = axApplication(pid)
-                    AXUIElementSetAttributeValue(axApp, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-                    NSRunningApplication(processIdentifier: pid)?.activate()
-                    AXUIElementPerformAction(el, kAXRaiseAction as CFString)
+                    WindowFocus.request(window: el, app: axApplication(pid), pid: pid,
+                        legacy: ProcessInfo.processInfo.environment["TALUS_LEGACY_FOCUS"] == "1")
                 }
             case "relinquishFocus":
                 NSApp.activate(ignoringOtherApps: true)
