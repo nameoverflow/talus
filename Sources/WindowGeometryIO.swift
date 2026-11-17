@@ -34,10 +34,39 @@ func matchesFrame(_ actual: CGRect, _ target: CGRect, parking: Bool = false) -> 
 }
 
 @discardableResult
-func setPosition(_ element: AXUIElement, _ origin: CGPoint) -> AXError {
+private func rawSetPosition(_ element: AXUIElement, _ origin: CGPoint) -> AXError {
     var point = origin
     guard let value = AXValueCreate(.cgPoint, &point) else { return .failure }
     return AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, value)
+}
+
+struct AnimationAccess {
+    let read: () -> Bool?
+    let write: (Bool) -> AXError
+}
+
+func withoutAXAnimations<T>(_ element: AXUIElement, access: AnimationAccess? = nil, _ body: () -> T) -> T {
+    var pid: pid_t = 0
+    AXUIElementGetPid(element, &pid)
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 0.1)
+    let attribute = "AXEnhancedUserInterface" as CFString
+    let io = access ?? AnimationAccess(read: { axValue(app, attribute) as? Bool }, write: { enabled in
+        AXUIElementSetAttributeValue(app, attribute, enabled ? kCFBooleanTrue : kCFBooleanFalse)
+    })
+    let restore = io.read() == true
+    if restore { _ = io.write(false) }
+    defer {
+        // Even a timed-out disable can be applied later by the provider. Queue
+        // the original value last so accessibility state is not left changed.
+        if restore { _ = io.write(true) }
+    }
+    return body()
+}
+
+@discardableResult
+func setPosition(_ element: AXUIElement, _ origin: CGPoint) -> AXError {
+    withoutAXAnimations(element) { rawSetPosition(element, origin) }
 }
 
 struct FrameAccess {
@@ -50,25 +79,28 @@ struct FrameAccess {
 @discardableResult
 func setFrame(_ element: AXUIElement, _ target: CGRect, current: CGRect? = nil, parking: Bool = false,
               access: FrameAccess? = nil) -> AXError {
-    let io = access ?? FrameAccess(read: { frame(element) }, position: { setPosition(element, $0) }, size: { requested in
+    let io = access ?? FrameAccess(read: { frame(element) }, position: { rawSetPosition(element, $0) }, size: { requested in
         var size = requested
         guard let value = AXValueCreate(.cgSize, &size) else { return .failure }
         return AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, value)
     })
-    let error: AXError
-    if let current, abs(current.width - target.width) < 1, abs(current.height - target.height) < 1 {
-        error = io.position(target.origin)
-    } else {
-        _ = io.size(target.size)
-        let moved = io.position(target.origin)
-        let resized = io.size(target.size)
-        error = moved == .success ? resized : moved
+    let apply = { () -> AXError in
+        let error: AXError
+        if let current, abs(current.width - target.width) < 1, abs(current.height - target.height) < 1 {
+            error = io.position(target.origin)
+        } else {
+            _ = io.size(target.size)
+            let moved = io.position(target.origin)
+            let resized = io.size(target.size)
+            error = moved == .success ? resized : moved
+        }
+        guard error == .success else { return error }
+        if let actual = io.read(), matchesFrame(actual, target, parking: parking) { return .success }
+        // An AX provider may acknowledge before its next run-loop turn applies
+        // position/size. Success must describe the real frame, not just the reply.
+        io.settle()
+        guard let actual = io.read(), matchesFrame(actual, target, parking: parking) else { return .cannotComplete }
+        return .success
     }
-    guard error == .success else { return error }
-    if let actual = io.read(), matchesFrame(actual, target, parking: parking) { return .success }
-    // An AX provider may acknowledge before its next run-loop turn applies
-    // position/size. Success must describe the real frame, not just the reply.
-    io.settle()
-    guard let actual = io.read(), matchesFrame(actual, target, parking: parking) else { return .cannotComplete }
-    return .success
+    return access == nil ? withoutAXAnimations(element, apply) : apply()
 }
