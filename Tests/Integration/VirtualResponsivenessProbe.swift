@@ -63,6 +63,12 @@ func focus(_ element: AXUIElement) {
     AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     AXUIElementPerformAction(element, kAXRaiseAction as CFString)
 }
+
+func isFocused(_ element: AXUIElement) -> Bool {
+    guard let focused = value(axApp, kAXFocusedWindowAttribute as CFString),
+          CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
+    return CFEqual(focused, element)
+}
 if CommandLine.arguments.contains("--restored") {
     wait("all parked windows restored") { !parked(a) && !parked(b) && !parked(fixed) }
     print("Quit restored every parked fixture window")
@@ -74,7 +80,7 @@ usleep(100_000)
 key(kVK_ANSI_2, shift: true)
 wait("throw A to workspace 2") { parked(a) && currentWorkspace() == 1 }
 key(kVK_ANSI_2)
-wait("switch to A") { !parked(a) && parked(b) && currentWorkspace() == 2 }
+wait("switch to A") { !parked(a) && parked(b) && currentWorkspace() == 2 && isFocused(a) }
 usleep(20_000)
 let activated = Date()
 focus(b)
@@ -86,7 +92,11 @@ for _ in 0..<10 {
     for (code, workspace) in [(kVK_ANSI_2, 2), (kVK_ANSI_1, 1)] {
         let start = Date()
         key(code)
-        wait("workspace \(workspace)") { currentWorkspace() == workspace && (workspace == 2 ? !parked(a) && parked(b) : parked(a) && !parked(b)) }
+        wait("workspace \(workspace)") {
+            currentWorkspace() == workspace && (workspace == 2
+                ? !parked(a) && parked(b) && isFocused(a)
+                : parked(a) && !parked(b) && isFocused(b))
+        }
         times.append(Date().timeIntervalSince(start) * 1000)
     }
 }

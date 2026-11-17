@@ -1,6 +1,13 @@
 import Cocoa
 import ApplicationServices
 
+private final class Attempts {
+    private let lock = NSLock()
+    private var count = 0
+    func next() -> Int { lock.lock(); defer { lock.unlock() }; count += 1; return count }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+}
+
 @main
 struct ManagerResponsivenessTests {
     static func wait(_ condition: () -> Bool, timeout: TimeInterval = 2) {
@@ -88,6 +95,26 @@ struct ManagerResponsivenessTests {
         incremental.scheduleRefresh(pid: -201)
         wait({ incrementalCompletions == 2 })
         precondition(incremental.activeWindowCount == 2, "Targeted discovery dropped another app's windows")
+
+        let attempts = Attempts()
+        let retrying = Manager(config: Configuration(), discover: { _, _, _, _, _, _ in
+            var result = WindowDiscoveryResult()
+            result.livePIDs = [-301]
+            result.existingWindowIDs = [301]
+            result.visibleWindowIDs = [301]
+            result.windows = [DiscoveredWindow(element: AXUIElementCreateApplication(-301), pid: -301,
+                bundleID: nil, windowID: 301, title: "retry",
+                rect: CGRect(x: 100, y: 100, width: 500, height: 300), isResizable: true)]
+            return result
+        }, canDiscover: { true }, applyGeometry: { geometry, _ in
+            precondition(geometry.target == area, "A failed write lost its complete target")
+            return attempts.next() < 3 ? .cannotComplete : .success
+        })
+        var retryNotifications = 0
+        retrying.statusChanged = { retryNotifications += 1 }
+        retrying.refresh()
+        wait({ retryNotifications >= 2 })
+        precondition(attempts.value == 3, "Optimistic core geometry suppressed a required retry")
         print("Background discovery responsive; stale scans rejected; 100 events coalesced; targeted scans retained other apps")
     }
 }

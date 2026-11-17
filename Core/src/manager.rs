@@ -472,6 +472,20 @@ impl ManagerCore {
         }
     }
 
+    /// Geometry may finish after the original input-time guard expired. Start
+    /// the echo guard when the shell is actually ready to submit focus.
+    pub fn begin_focus_delivery(&mut self, now: f64, key: Option<u64>) {
+        self.programmatic_focus_key = key;
+        self.programmatic_focus_until = if key.is_some() { now + 0.45 } else { 0.0 };
+        self.suppress_external_focus_until = now + 0.45;
+    }
+
+    pub fn cancel_focus_delivery(&mut self) {
+        self.programmatic_focus_key = None;
+        self.programmatic_focus_until = 0.0;
+        self.suppress_external_focus_until = 0.0;
+    }
+
     pub fn focused_index(&self, now: f64, frontmost_key: Option<u64>) -> Option<usize> {
         if now < self.programmatic_focus_until {
             if let Some(target) = self.programmatic_focus_key {
@@ -1792,6 +1806,46 @@ mod tests {
             .effects
             .iter()
             .any(|e| matches!(e, WindowEffect::Focus { key: 1, .. })));
+    }
+
+    #[test]
+    fn delayed_focus_delivery_renews_guard_and_user_cancellation_releases_it() {
+        let cfg = Configuration {
+            workspace_mode: "virtual".into(),
+            workspace_count: 3,
+            ..Configuration::default()
+        };
+        let mut mgr = ManagerCore::new(&cfg, None);
+        mgr.refresh(
+            false,
+            10.0,
+            vec![sample_screen()],
+            vec![
+                candidate(1, 101, 1001, "com.apple.Terminal", "term"),
+                candidate(2, 102, 1002, "com.apple.Safari", "web"),
+            ],
+            &[],
+            &[101, 102],
+            &[101, 102],
+            &[],
+            &[],
+            true,
+            Some(1),
+            false,
+        );
+        mgr.move_window_to_workspace(1, 11.0, true, Some(1), &HashMap::new());
+        mgr.switch_workspace(1, 12.0, true, Some(2), &HashMap::new());
+        mgr.begin_focus_delivery(13.0, Some(1));
+        let stale = mgr.handle_ax_focus_notification(13.01, true, false, Some(2), &HashMap::new());
+        assert_eq!(stale.active_workspace, 1);
+        assert!(!stale.status_changed);
+        mgr.cancel_focus_delivery();
+        assert_eq!(mgr.programmatic_focus_key, None);
+        assert_eq!(mgr.suppress_external_focus_until, 0.0);
+        let clicked =
+            mgr.handle_ax_focus_notification(13.02, true, false, Some(2), &HashMap::new());
+        assert_eq!(clicked.active_workspace, 0);
+        assert!(clicked.status_changed);
     }
 
     #[test]
