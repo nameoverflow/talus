@@ -604,8 +604,9 @@ struct SettingsRootView: View {
 
             Divider()
 
-            // Read the available width outside the ScrollView. Asking its content
-            // for a container-relative width can collapse the hosted viewport to zero.
+            // Constrain the scroll view, not its document: legacy scrollbars need
+            // room inside this width. Container-relative document sizing can also
+            // collapse the hosted viewport to zero.
             GeometryReader { viewport in
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 14) {
@@ -620,8 +621,9 @@ struct SettingsRootView: View {
                     }
                     .padding(.horizontal, 18)
                     .padding(.vertical, 14)
-                    .frame(width: viewport.size.width, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .frame(width: viewport.size.width)
             }
 
             Divider()
