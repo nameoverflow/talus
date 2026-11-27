@@ -1,112 +1,254 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="Talus — Windows, settled by geometry.">
-  <title>Talus — Windows, settled by geometry.</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="Talus — Tiling window manager for macOS">
+  <title>Talus — Tiling window manager for macOS</title>
   <defs>
-    <radialGradient id="terracottaGlow" cx="79%" cy="46%" r="40%">
-      <stop offset="0%" stop-color="#D37859" stop-opacity="0.17"/>
-      <stop offset="55%" stop-color="#89CFC2" stop-opacity="0.06"/>
-      <stop offset="100%" stop-color="#0E171E" stop-opacity="0"/>
+    <!-- Deep Pacific Slate macOS Wallpaper -->
+    <linearGradient id="wallDark" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0C151D"/>
+      <stop offset="52%" stop-color="#13212C"/>
+      <stop offset="100%" stop-color="#1C2C38"/>
+    </linearGradient>
+    <radialGradient id="horizonGlow" cx="28%" cy="78%" r="58%">
+      <stop offset="0%" stop-color="#D37859" stop-opacity="0.22"/>
+      <stop offset="55%" stop-color="#89CFC2" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#0C151D" stop-opacity="0"/>
     </radialGradient>
-    <linearGradient id="stageBg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#1E303E"/>
-      <stop offset="100%" stop-color="#111C24"/>
+    <radialGradient id="topAura" cx="84%" cy="18%" r="44%">
+      <stop offset="0%" stop-color="#89CFC2" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#0C151D" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="winMaster" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#17242E" stop-opacity="0.96"/>
+      <stop offset="100%" stop-color="#101A22" stop-opacity="0.98"/>
+    </linearGradient>
+    <linearGradient id="winStack" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#142029" stop-opacity="0.92"/>
+      <stop offset="100%" stop-color="#0E171F" stop-opacity="0.95"/>
     </linearGradient>
     <linearGradient id="iconBg" x1="29.7%" y1="95.7%" x2="70.3%" y2="4.3%">
       <stop offset="0%" stop-color="#172631"/>
       <stop offset="100%" stop-color="#31495C"/>
     </linearGradient>
-    <linearGradient id="tileM" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#F9F4E8"/>
-      <stop offset="100%" stop-color="#DEE5DB"/>
-    </linearGradient>
-    <linearGradient id="tileT" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#F0F0E6"/>
-      <stop offset="100%" stop-color="#CEDBD4"/>
-    </linearGradient>
-    <linearGradient id="tileB" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#D6E6DD"/>
-      <stop offset="100%" stop-color="#AFCBC2"/>
-    </linearGradient>
-    <filter id="stageShadow" x="-20%" y="-20%" width="140%" height="150%">
-      <feDropShadow dx="0" dy="26" stdDeviation="28" flood-color="#000000" flood-opacity="0.62"/>
+    <filter id="winShadow" x="-8%" y="-8%" width="116%" height="122%">
+      <feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#04080B" flood-opacity="0.52"/>
     </filter>
-    <clipPath id="canvasClip">
-      <rect width="1280" height="640" rx="12"/>
-    </clipPath>
-    <clipPath id="iconClip">
-      <rect x="58" y="58" width="908" height="908" rx="224"/>
+    <clipPath id="frameClip">
+      <rect width="1280" height="640" rx="14"/>
     </clipPath>
   </defs>
 
-  <g clip-path="url(#canvasClip)">
-    <!-- Midnight Slate Canvas -->
-    <rect width="1280" height="640" fill="#0E171E"/>
-    <rect width="1280" height="640" fill="url(#terracottaGlow)"/>
+  <g clip-path="url(#frameClip)">
+    <!-- Wallpaper -->
+    <rect width="1280" height="640" fill="url(#wallDark)"/>
+    <rect width="1280" height="640" fill="url(#horizonGlow)"/>
+    <rect width="1280" height="640" fill="url(#topAura)"/>
 
-    <!-- Subtle Architectural Tiling Hairlines (Right Background) -->
-    <g stroke="#F7F5EE" stroke-opacity="0.055" stroke-width="1" fill="none">
-      <rect x="794" y="48" width="438" height="544" rx="24"/>
-      <line x1="1038" y1="48" x2="1038" y2="592"/>
-      <line x1="1038" y1="320" x2="1232" y2="320"/>
-      <rect x="822" y="76" width="382" height="488" rx="18" stroke-opacity="0.04"/>
+    <!-- Subtle Topographic Contour Curves (Geological Talus Slope Motif) -->
+    <g fill="none" stroke="#F7F5EE" stroke-opacity="0.045" stroke-width="1.2">
+      <path d="M -40 520 Q 280 410, 620 485 T 1320 390"/>
+      <path d="M -40 565 Q 310 460, 650 530 T 1320 445"/>
+      <path d="M -40 610 Q 340 515, 680 578 T 1320 505"/>
     </g>
 
-    <!-- Top Technical Pills -->
-    <g transform="translate(72, 58)">
-      <rect x="0" y="0" width="112" height="28" rx="14" fill="#D37859" fill-opacity="0.16" stroke="#D37859" stroke-opacity="0.62" stroke-width="1"/>
-      <text x="56" y="18" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="11.5" font-weight="500" letter-spacing="0.9" fill="#F0A48A">TALUS v0.2</text>
+    <!-- Native macOS Menu Bar (y=0..38) -->
+    <rect x="0" y="0" width="1280" height="38" fill="#0B131A" fill-opacity="0.88"/>
+    <line x1="0" y1="38" x2="1280" y2="38" stroke="#F7F5EE" stroke-opacity="0.10" stroke-width="1"/>
 
-      <rect x="126" y="0" width="150" height="28" rx="14" fill="#89CFC2" fill-opacity="0.09" stroke="#89CFC2" stroke-opacity="0.34" stroke-width="1"/>
-      <text x="201" y="18" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="11.5" letter-spacing="0.9" fill="#A6DDD3">100% PURE GEISHA</text>
-
-      <rect x="290" y="0" width="146" height="28" rx="14" fill="#F7F5EE" fill-opacity="0.04" stroke="#F7F5EE" stroke-opacity="0.16" stroke-width="1"/>
-      <text x="363" y="18" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="11.5" letter-spacing="0.9" fill="#CBD5DC">MACOS 15+ · ARM64</text>
-
-      <rect x="450" y="0" width="114" height="28" rx="14" fill="#F7F5EE" fill-opacity="0.04" stroke="#F7F5EE" stroke-opacity="0.16" stroke-width="1"/>
-      <text x="507" y="18" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="11.5" letter-spacing="0.9" fill="#CBD5DC">SIP INTACT</text>
+    <!-- Left Menu Bar Items -->
+    <g font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="13" fill="#DDE6EC">
+      <circle cx="26" cy="19" r="5.5" fill="#F7F5EE" fill-opacity="0.86"/>
+      <text x="48" y="23.5" font-weight="700" fill="#F7F5EE">Talus</text>
+      <text x="102" y="23.5" fill="#9BB0BE">Workspaces</text>
+      <text x="192" y="23.5" fill="#9BB0BE">Layout</text>
+      <text x="252" y="23.5" fill="#9BB0BE">Rules</text>
     </g>
 
-    <!-- Main Hero Typography -->
-    <text x="72" y="188" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="18" font-weight="600" letter-spacing="3.2" fill="#8FA3B1">TALUS · MACOS TILING WINDOW MANAGER</text>
-
-    <text x="72" y="272" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="68" font-weight="600" letter-spacing="-2.3" fill="#F7F5EE">Windows,</text>
-    <text x="72" y="344" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="68" font-weight="600" letter-spacing="-2.3" fill="#F7F5EE">settled by <tspan fill="#D37859">geometry.</tspan></text>
-
-    <text x="72" y="398" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="17.5" fill="#AABAC5">
-      <tspan x="72" dy="0" font-weight="600" fill="#F7F5EE">XMonad-inspired tiling, native to macOS—all the way down.</tspan>
-      <tspan x="72" dy="29">Per-app Actor concurrency, virtual workspaces, xmobar-style status bar,</tspan>
-      <tspan x="72" dy="27">and native AppKit Settings—zero Rust, zero Swift, zero SIP changes.</tspan>
-    </text>
-
-    <!-- Bottom Pipeline Strip -->
-    <line x1="72" y1="540" x2="762" y2="540" stroke="#F7F5EE" stroke-opacity="0.12" stroke-width="1"/>
-    <text x="72" y="574" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="12.5" fill="#8FA3B1">
-      <tspan fill="#F7F5EE" font-weight="500">AX / SkyLight</tspan><tspan dx="14">&#8594;</tspan><tspan dx="14" fill="#F7F5EE" font-weight="500">ManagerCore</tspan> (pure)<tspan dx="14">&#8594;</tspan><tspan dx="14" fill="#F7F5EE" font-weight="500">Per-PID Actors</tspan><tspan dx="14">&#8594;</tspan><tspan dx="14" fill="#89CFC2" font-weight="500">AppKit</tspan>
-    </text>
-
-    <!-- Right Emblem Stage (Floating Talus App Mark) -->
-    <g transform="translate(866, 134) scale(0.287109375)" filter="url(#stageShadow)">
-      <rect x="58" y="58" width="908" height="908" rx="224" fill="url(#iconBg)"/>
-      <g clip-path="url(#iconClip)">
-        <polygon points="40,199 1000,-6 1000,249 40,454" fill="#FFFFFF" fill-opacity="0.045"/>
+    <!-- Right Menu Bar: Live Talus NSStatusItem -->
+    <g transform="translate(808, 6)">
+      <rect x="0" y="0" width="376" height="26" rx="6" fill="#182733" stroke="#F7F5EE" stroke-opacity="0.10" stroke-width="1"/>
+      <!-- Mini Talus Monochrome Status Mark -->
+      <g transform="translate(10, 5.5)">
+        <rect x="0" y="0" width="15" height="15" rx="3" fill="none" stroke="#DDE6EC" stroke-width="1.4"/>
+        <rect x="2.4" y="2.5" width="5.2" height="10" rx="1" fill="#DDE6EC"/>
+        <rect x="9" y="2.5" width="3.6" height="4.4" rx="0.8" fill="#DDE6EC" fill-opacity="0.8"/>
+        <rect x="9" y="8.1" width="3.6" height="4.4" rx="0.8" fill="#DDE6EC" fill-opacity="0.55"/>
       </g>
-      <rect x="58" y="58" width="908" height="908" rx="224" fill="none" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="4"/>
+      <!-- Active Workspace Pill -->
+      <rect x="34" y="3.5" width="56" height="19" rx="4.5" fill="#89CFC2"/>
+      <text x="62" y="16.5" text-anchor="middle" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.2" font-weight="600" fill="#10201E">1 term</text>
+      <text x="102" y="16.5" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.2" fill="#8EA5B4">2 web</text>
+      <text x="150" y="16.5" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.2" fill="#8EA5B4">3 code</text>
+      <text x="206" y="16.5" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.2" fill="#8EA5B4">4 chat</text>
+      <text x="268" y="16.5" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.2" font-weight="600" fill="#89CFC2">Tall</text>
+      <line x1="308" y1="6" x2="308" y2="20" stroke="#F7F5EE" stroke-opacity="0.14" stroke-width="1"/>
+      <text x="364" y="16.5" text-anchor="end" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.2" fill="#DDE6EC">17:42</text>
+    </g>
+    <text x="1256" y="23.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12.5" font-weight="500" fill="#C4D3DC">Thu 17:42</text>
+
+    <!-- ================================================================ -->
+    <!-- TILED DESKTOP CANVAS (outer_gap = 24px, inner_gap = 18px)        -->
+    <!-- Master Pane (x=24..726, y=62..616) — 702 x 554                   -->
+    <!-- Stack Top  (x=744..1256, y=62..330) — 512 x 268                  -->
+    <!-- Stack Bot  (x=744..1256, y=348..616) — 512 x 268                 -->
+    <!-- ================================================================ -->
+
+    <!-- MASTER WINDOW (Focused — Terracotta Accent Ring) -->
+    <g filter="url(#winShadow)">
+      <rect x="24" y="62" width="702" height="554" rx="16" fill="url(#winMaster)" stroke="#D37859" stroke-opacity="0.72" stroke-width="1.6"/>
+    </g>
+    <!-- Master Window Chrome -->
+    <circle cx="48" cy="86" r="5.5" fill="#D37859"/>
+    <circle cx="66" cy="86" r="5.5" fill="#E3B36B" fill-opacity="0.75"/>
+    <circle cx="84" cy="86" r="5.5" fill="#89CFC2" fill-opacity="0.75"/>
+    <text x="110" y="90" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.5" fill="#7D95A5">master · pane 1/3 · focused</text>
+    <rect x="614" y="75" width="92" height="22" rx="11" fill="#D37859" fill-opacity="0.16" stroke="#D37859" stroke-opacity="0.45" stroke-width="1"/>
+    <text x="660" y="89.5" text-anchor="middle" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="10.5" font-weight="600" fill="#F0A48A">RATIO 0.56</text>
+    <line x1="24" y1="110" x2="726" y2="110" stroke="#F7F5EE" stroke-opacity="0.08" stroke-width="1"/>
+
+    <!-- Master Window Content: Brand Identity -->
+    <!-- Floating App Icon + Wordmark -->
+    <g transform="translate(60, 146) scale(0.084)">
+      <rect x="58" y="58" width="908" height="908" rx="224" fill="url(#iconBg)" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="12"/>
       <rect x="169" y="184" width="686" height="656" rx="70" fill="#0A1924" fill-opacity="0.40"/>
-      <rect x="191" y="207" width="374" height="610" rx="40" fill="url(#tileM)" stroke="#FFFFFF" stroke-opacity="0.62" stroke-width="2.5"/>
-      <rect x="587" y="207" width="246" height="294" rx="40" fill="url(#tileT)" stroke="#FFFFFF" stroke-opacity="0.62" stroke-width="2.5"/>
-      <rect x="587" y="523" width="246" height="294" rx="40" fill="url(#tileB)" stroke="#FFFFFF" stroke-opacity="0.62" stroke-width="2.5"/>
+      <rect x="191" y="207" width="374" height="610" rx="40" fill="#F9F4E8"/>
+      <rect x="587" y="207" width="246" height="294" rx="40" fill="#DFEAE4"/>
+      <rect x="587" y="523" width="246" height="294" rx="40" fill="#B9D3CA"/>
       <rect x="228" y="250" width="90" height="17" rx="8.5" fill="#D37859"/>
     </g>
 
-    <!-- Mini Menu-Bar Status Pill Below Stage -->
-    <g transform="translate(866, 480)">
-      <rect x="0" y="0" width="294" height="32" rx="8" fill="#172631" stroke="#F7F5EE" stroke-opacity="0.14" stroke-width="1"/>
-      <rect x="12" y="6" width="56" height="20" rx="5" fill="#89CFC2"/>
-      <text x="40" y="20" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="11" font-weight="600" fill="#10201E">1 term</text>
-      <text x="82" y="20" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="11" fill="#8FA3B1">2 web</text>
-      <text x="130" y="20" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="11" fill="#8FA3B1">3 code</text>
-      <text x="196" y="20" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="11" font-weight="600" fill="#D37859">Tall</text>
-      <text x="282" y="20" text-anchor="end" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="11" fill="#CBD5DC">17:42</text>
+    <text x="164" y="202" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', sans-serif" font-size="64" font-weight="700" letter-spacing="-2.2" fill="#F7F5EE">Talus</text>
+    <text x="167" y="232" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="13" letter-spacing="0.4" fill="#89CFC2">macOS 15+ · Apple Silicon · Pure Geisha</text>
+
+    <!-- Primary Tagline -->
+    <text x="64" y="310" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', sans-serif" font-size="31" font-weight="600" letter-spacing="-0.7" fill="#F7F5EE">
+      XMonad-inspired tiling,
+    </text>
+    <text x="64" y="348" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', sans-serif" font-size="31" font-weight="600" letter-spacing="-0.7" fill="#D37859">
+      native to macOS without touching SIP.
+    </text>
+
+    <text x="64" y="394" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', sans-serif" font-size="16" fill="#A6BAC7">
+      <tspan x="64" dy="0">Deterministic Tall, Mirror, and Full layouts with instant virtual workspaces,</tspan>
+      <tspan x="64" dy="25">per-app Actor concurrency, xmobar-style menu bar, and native AppKit Settings.</tspan>
+    </text>
+
+    <!-- Tactile Layout Mode Strip Inside Master Pane -->
+    <g transform="translate(64, 466)">
+      <!-- Tall (Active) -->
+      <rect x="0" y="0" width="184" height="74" rx="10" fill="#1C2E3B" stroke="#D37859" stroke-opacity="0.72" stroke-width="1.2"/>
+      <rect x="14" y="16" width="26" height="42" rx="3" fill="#F7F5EE" fill-opacity="0.90"/>
+      <rect x="44" y="16" width="17" height="19" rx="2.5" fill="#89CFC2" fill-opacity="0.72"/>
+      <rect x="44" y="39" width="17" height="19" rx="2.5" fill="#89CFC2" fill-opacity="0.45"/>
+      <text x="74" y="34" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="14" font-weight="600" fill="#F7F5EE">Tall</text>
+      <text x="74" y="52" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="10.5" fill="#D37859">active</text>
+
+      <!-- Mirror -->
+      <rect x="198" y="0" width="184" height="74" rx="10" fill="#14222D" stroke="#F7F5EE" stroke-opacity="0.11" stroke-width="1"/>
+      <rect x="212" y="16" width="47" height="22" rx="3" fill="#C4D3DC" fill-opacity="0.72"/>
+      <rect x="212" y="42" width="21.5" height="16" rx="2.5" fill="#8EA5B4" fill-opacity="0.45"/>
+      <rect x="237.5" y="42" width="21.5" height="16" rx="2.5" fill="#8EA5B4" fill-opacity="0.32"/>
+      <text x="272" y="34" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="14" font-weight="600" fill="#D4DFE6">Mirror</text>
+      <text x="272" y="52" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="10.5" fill="#7D95A5">top master</text>
+
+      <!-- Full -->
+      <rect x="396" y="0" width="184" height="74" rx="10" fill="#14222D" stroke="#F7F5EE" stroke-opacity="0.11" stroke-width="1"/>
+      <rect x="410" y="16" width="47" height="42" rx="3.5" fill="#C4D3DC" fill-opacity="0.65"/>
+      <rect x="415" y="21" width="14" height="3" rx="1.5" fill="#D37859" fill-opacity="0.85"/>
+      <text x="470" y="34" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="14" font-weight="600" fill="#D4DFE6">Full</text>
+      <text x="470" y="52" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="10.5" fill="#7D95A5">monocle</text>
     </g>
-    <text x="1013" y="538" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'Menlo', monospace" font-size="11" letter-spacing="1.1" fill="#8FA3B1">TALL · MIRROR · FULL · 1PX PARKING</text>
+
+    <!-- Master Bottom Status Strip -->
+    <text x="64" y="586" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.5" fill="#7D95A5">
+      0 Rust · 0 Swift · objc.gsa + AppKit · read-back AX settlement
+    </text>
+
+    <!-- ================================================================ -->
+    <!-- STACK WINDOW 1 (Top Right: ~/.talus.toml Live Config)            -->
+    <!-- ================================================================ -->
+    <g filter="url(#winShadow)">
+      <rect x="744" y="62" width="512" height="268" rx="16" fill="url(#winStack)" stroke="#F7F5EE" stroke-opacity="0.14" stroke-width="1.2"/>
+    </g>
+    <circle cx="768" cy="86" r="5" fill="#465D6D"/>
+    <circle cx="785" cy="86" r="5" fill="#465D6D"/>
+    <circle cx="802" cy="86" r="5" fill="#465D6D"/>
+    <text x="824" y="90" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.5" fill="#8EA5B4">~/.talus.toml</text>
+    <text x="1234" y="90" text-anchor="end" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="10.5" fill="#89CFC2">live reload</text>
+    <line x1="744" y1="110" x2="1256" y2="110" stroke="#F7F5EE" stroke-opacity="0.08" stroke-width="1"/>
+
+    <g font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="12.2" fill="#DCE5EB">
+      <text x="770" y="135"><tspan fill="#E5A287">modifiers</tspan> = [<tspan fill="#9ED6C8">"control"</tspan>, <tspan fill="#9ED6C8">"option"</tspan>]</text>
+      <text x="770" y="160"><tspan fill="#D37859" font-weight="600">[workspaces]</tspan></text>
+      <text x="770" y="179">mode = <tspan fill="#9ED6C8">"virtual"</tspan>   <tspan fill="#6B8393"># instant 1px park</tspan></text>
+      <text x="770" y="198">labels = [<tspan fill="#9ED6C8">"term"</tspan>, <tspan fill="#9ED6C8">"web"</tspan>, <tspan fill="#9ED6C8">"code"</tspan>, <tspan fill="#9ED6C8">"chat"</tspan>]</text>
+      <text x="770" y="223"><tspan fill="#D37859" font-weight="600">[layout]</tspan></text>
+      <text x="770" y="242">master_ratio = <tspan fill="#E5C07B">0.56</tspan></text>
+      <text x="770" y="261">outer_gap = <tspan fill="#E5C07B">10</tspan></text>
+      <text x="936" y="261"><tspan fill="#6B8393"># logical points</tspan></text>
+      <text x="770" y="286"><tspan fill="#D37859" font-weight="600">[status]</tspan></text>
+      <text x="770" y="305">template = <tspan fill="#9ED6C8">"%spaces%  &lt;fc=#89CFC2&gt;%layout%&lt;/fc&gt;  %clock%"</tspan></text>
+    </g>
+
+    <!-- ================================================================ -->
+    <!-- STACK WINDOW 2 (Bottom Right: Keyboard Choreography & Actors)    -->
+    <!-- ================================================================ -->
+    <g filter="url(#winShadow)">
+      <rect x="744" y="348" width="512" height="268" rx="16" fill="url(#winStack)" stroke="#F7F5EE" stroke-opacity="0.14" stroke-width="1.2"/>
+    </g>
+    <circle cx="768" cy="372" r="5" fill="#465D6D"/>
+    <circle cx="785" cy="372" r="5" fill="#465D6D"/>
+    <circle cx="802" cy="372" r="5" fill="#465D6D"/>
+    <text x="824" y="376" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.5" fill="#8EA5B4">keybindings &amp; per-PID actors</text>
+    <line x1="744" y1="396" x2="1256" y2="396" stroke="#F7F5EE" stroke-opacity="0.08" stroke-width="1"/>
+
+    <!-- Keycap Cheat Sheet Grid (2 columns x 3 rows) -->
+    <g font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11.5">
+      <!-- Row 1 -->
+      <rect x="770" y="416" width="76" height="26" rx="6" fill="#1D2F3D" stroke="#F7F5EE" stroke-opacity="0.18" stroke-width="1"/>
+      <text x="808" y="433" text-anchor="middle" fill="#F7F5EE">⌃⌥ J/K</text>
+      <text x="858" y="433" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12.5" fill="#B5C7D3">Focus stack</text>
+
+      <rect x="1012" y="416" width="84" height="26" rx="6" fill="#1D2F3D" stroke="#F7F5EE" stroke-opacity="0.18" stroke-width="1"/>
+      <text x="1054" y="433" text-anchor="middle" fill="#F7F5EE">⌃⌥ Space</text>
+      <text x="1108" y="433" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12.5" fill="#B5C7D3">Cycle layout</text>
+
+      <!-- Row 2 -->
+      <rect x="770" y="454" width="76" height="26" rx="6" fill="#1D2F3D" stroke="#F7F5EE" stroke-opacity="0.18" stroke-width="1"/>
+      <text x="808" y="471" text-anchor="middle" fill="#F7F5EE">⌃⌥ H/L</text>
+      <text x="858" y="471" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12.5" fill="#B5C7D3">Resize master</text>
+
+      <rect x="1012" y="454" width="84" height="26" rx="6" fill="#1D2F3D" stroke="#F7F5EE" stroke-opacity="0.18" stroke-width="1"/>
+      <text x="1054" y="471" text-anchor="middle" fill="#F7F5EE">⌃⌥ 1..9</text>
+      <text x="1108" y="471" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12.5" fill="#B5C7D3">Switch space</text>
+
+      <!-- Row 3 -->
+      <rect x="770" y="492" width="76" height="26" rx="6" fill="#1D2F3D" stroke="#F7F5EE" stroke-opacity="0.18" stroke-width="1"/>
+      <text x="808" y="509" text-anchor="middle" fill="#F7F5EE">⌃⌥ Ret</text>
+      <text x="858" y="509" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12.5" fill="#B5C7D3">Promote master</text>
+
+      <rect x="1012" y="492" width="84" height="26" rx="6" fill="#1D2F3D" stroke="#F7F5EE" stroke-opacity="0.18" stroke-width="1"/>
+      <text x="1054" y="509" text-anchor="middle" fill="#F7F5EE">⌃⌥ T / P</text>
+      <text x="1108" y="509" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12.5" fill="#B5C7D3">Float / Pause</text>
+    </g>
+
+    <!-- Per-PID Actor Lanes Footer -->
+    <line x1="770" y1="540" x2="1230" y2="540" stroke="#F7F5EE" stroke-opacity="0.09" stroke-width="1"/>
+    <g transform="translate(770, 556)" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="11">
+      <rect x="0" y="0" width="136" height="32" rx="7" fill="#182A36" stroke="#89CFC2" stroke-opacity="0.38" stroke-width="1"/>
+      <circle cx="14" cy="16" r="3.5" fill="#89CFC2"/>
+      <text x="26" y="20" fill="#DDE6EC">PID 412 Actor</text>
+
+      <rect x="148" y="0" width="136" height="32" rx="7" fill="#182A36" stroke="#89CFC2" stroke-opacity="0.38" stroke-width="1"/>
+      <circle cx="162" cy="16" r="3.5" fill="#89CFC2"/>
+      <text x="174" y="20" fill="#DDE6EC">PID 809 Actor</text>
+
+      <rect x="296" y="0" width="164" height="32" rx="7" fill="#1E2B35" stroke="#D37859" stroke-opacity="0.48" stroke-width="1"/>
+      <circle cx="310" cy="16" r="3.5" fill="#D37859"/>
+      <text x="322" y="20" fill="#F0A48A">Send-clean AX</text>
+    </g>
+
+    <!-- Subtle Dimension Marker in the Inner Gap (Visualizing Tiling Precision) -->
+    <g stroke="#89CFC2" stroke-opacity="0.32" stroke-width="1">
+      <line x1="726" y1="339" x2="744" y2="339"/>
+    </g>
   </g>
 </svg>
