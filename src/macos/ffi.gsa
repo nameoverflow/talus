@@ -237,24 +237,8 @@ pub extern "AXObserverGetRunLoopSource" def c_AXObserverGetRunLoopSource(obs: Sc
 pub def axIsProcessTrusted(): Bool = c_AXIsProcessTrusted() != 0
 
 pub def axIsProcessTrustedWithPrompt(prompt: Bool): Bool = {
-    let dictCls = objcClass("NSMutableDictionary");
-    let d = idAdopt(msgSend0(dictCls, objcSel("dictionary")));
     let key = resolveGlobalPtr("kAXTrustedCheckOptionPrompt");
     let val = if (prompt) cfBooleanTrue() else cfBooleanFalse();
-    if (!ptrIsNull(key) && !ptrIsNull(val)) {
-        withId(d, (dp) -> {
-            // Use NSMutableDictionary setObject:forKey:
-            let _ = dp;
-            ()
-        });
-        let rawDict = withId(d, (dp) -> {
-            let _ = dp;
-            ptrNull()
-        });
-        let _ = rawDict;
-        ()
-    } else ();
-    // Cleanly call via NSDictionary dictionaryWithObject:forKey:
     if (!ptrIsNull(key) && !ptrIsNull(val)) {
         let nd = msgSend2Ptr(objcClass("NSDictionary"), objcSel("dictionaryWithObject:forKey:"), val, key);
         c_AXIsProcessTrustedWithOptions(nd) != 0

@@ -49,8 +49,8 @@ pub def axCopyBool(el: ForeignPtr, attrName: String): Option Bool =
     }
 
 pub def axGetFrame(el: ForeignPtr): Option Rect = {
-    // Batch read [AXPosition, AXSize] via NSMutableArray (toll-free bridged to CFArray)
-    let attrs = idAdopt(msgSend0(objcClass("NSMutableArray"), objcSel("array")));
+    // Batch read [AXPosition, AXSize] via owned +1 NSMutableArray (toll-free bridged to CFArray)
+    let attrs = idAdopt(msgSend0(msgSend0(objcClass("NSMutableArray"), objcSel("alloc")), objcSel("init")));
     let sPos = nsString("AXPosition");
     let sSize = nsString("AXSize");
     withId(attrs, (ap) -> {
