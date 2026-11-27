@@ -66,9 +66,6 @@ pub data ExecEvent {
 def gMainExecChan: Chan ExecEvent = chanUnbounded()
 def gMainExecHandler: Cell (ExecEvent -> Void) = cellNew((_: ExecEvent) -> ())
 
-pub def setMainExecEventHandler(handler: ExecEvent -> Void): Void =
-    cellSet(gMainExecHandler, handler)
-
 def pumpMainExecImp(_self: Ptr, _cmd: Ptr): Void = withAutoreleasePool(() -> {
     let h = cellGet(gMainExecHandler);
     let running = cellNew(true);
@@ -80,16 +77,23 @@ def pumpMainExecImp(_self: Ptr, _cmd: Ptr): Void = withAutoreleasePool(() -> {
     }
 })
 
-extern init def registerTalusMainEventPump(): Void = {
-    let cls = objcAllocateClass("NSObject", "TalusMainEventPump");
-    if (!ptrIsNull(cls)) {
-        let meta = c_object_getClass(cls);
-        if (!ptrIsNull(meta)) {
-            let _ = objcAddMethod(meta, "pump", cFnPtr(pumpMainExecImp), "v@:");
-            ()
-        } else ();
-        objcRegisterClass(cls)
+pub def ensureTalusMainEventPumpRegistered(): Void = {
+    if (ptrIsNull(objcClass("TalusMainEventPump"))) {
+        let cls = objcAllocateClass("NSObject", "TalusMainEventPump");
+        if (!ptrIsNull(cls)) {
+            let meta = c_object_getClass(cls);
+            if (!ptrIsNull(meta)) {
+                let _ = objcAddMethod(meta, "pump", cFnPtr(pumpMainExecImp), "v@:");
+                ()
+            } else ();
+            objcRegisterClass(cls)
+        } else ()
     } else ()
+}
+
+pub def setMainExecEventHandler(handler: ExecEvent -> Void): Void = {
+    ensureTalusMainEventPumpRegistered();
+    cellSet(gMainExecHandler, handler)
 }
 
 /// Post an `ExecEvent` from any thread to the macOS main thread (100% Send-safe, zero Cell capture).

@@ -445,17 +445,22 @@ def actionTargetInvoke(self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
     } else ()
 }
 
-extern init def registerTalusActionTarget(): Void = {
-    let cls = objcAllocateClass("NSObject", "TalusActionTarget");
-    if (!ptrIsNull(cls)) {
-        let _ = objcAddMethod(cls, "invoke:", cFnPtr(actionTargetInvoke), "v@:@");
-        objcRegisterClass(cls)
-    } else ()
+def ensureActionTargetClass(): Ptr = {
+    let existing = objcClass("TalusActionTarget");
+    if (!ptrIsNull(existing)) existing
+    else {
+        let cls = objcAllocateClass("NSObject", "TalusActionTarget");
+        if (!ptrIsNull(cls)) {
+            let _ = objcAddMethod(cls, "invoke:", cFnPtr(actionTargetInvoke), "v@:@");
+            objcRegisterClass(cls)
+        } else ();
+        objcClass("TalusActionTarget")
+    }
 }
 
 /// Create a GC-managed Objective-C target object whose `invoke:` selector runs `cb(sender)`.
 pub def makeActionTarget(cb: Ptr -> Void): Id NSObject = {
-    let cls = objcClass("TalusActionTarget");
+    let cls = ensureActionTargetClass();
     let raw = msgSend0(msgSend0(cls, objcSel("alloc")), objcSel("init"));
     objcSetAssocHandle(raw, gActionAssocKey, gcHandleNew(cb));
     idAdopt(raw)
@@ -479,16 +484,21 @@ def textDelegateDidChange(self: Ptr, _cmd: Ptr, notif: Ptr): Void = {
     } else ()
 }
 
-extern init def registerTalusTextDelegate(): Void = {
-    let cls = objcAllocateClass("NSObject", "TalusTextFieldDelegate");
-    if (!ptrIsNull(cls)) {
-        let _ = objcAddMethod(cls, "controlTextDidChange:", cFnPtr(textDelegateDidChange), "v@:@");
-        objcRegisterClass(cls)
-    } else ()
+def ensureTextDelegateClass(): Ptr = {
+    let existing = objcClass("TalusTextFieldDelegate");
+    if (!ptrIsNull(existing)) existing
+    else {
+        let cls = objcAllocateClass("NSObject", "TalusTextFieldDelegate");
+        if (!ptrIsNull(cls)) {
+            let _ = objcAddMethod(cls, "controlTextDidChange:", cFnPtr(textDelegateDidChange), "v@:@");
+            objcRegisterClass(cls)
+        } else ();
+        objcClass("TalusTextFieldDelegate")
+    }
 }
 
 pub def makeTextChangeDelegate(cb: Ptr -> Void): Id NSObject = {
-    let cls = objcClass("TalusTextFieldDelegate");
+    let cls = ensureTextDelegateClass();
     let raw = msgSend0(msgSend0(cls, objcSel("alloc")), objcSel("init"));
     objcSetAssocHandle(raw, gTextDelegateAssocKey, gcHandleNew(cb));
     idAdopt(raw)
@@ -510,16 +520,21 @@ def winDelegateWillClose(self: Ptr, _cmd: Ptr, notif: Ptr): Void = {
     } else ()
 }
 
-extern init def registerTalusWindowDelegate(): Void = {
-    let cls = objcAllocateClass("NSObject", "TalusWindowDelegate");
-    if (!ptrIsNull(cls)) {
-        let _ = objcAddMethod(cls, "windowWillClose:", cFnPtr(winDelegateWillClose), "v@:@");
-        objcRegisterClass(cls)
-    } else ()
+def ensureWindowDelegateClass(): Ptr = {
+    let existing = objcClass("TalusWindowDelegate");
+    if (!ptrIsNull(existing)) existing
+    else {
+        let cls = objcAllocateClass("NSObject", "TalusWindowDelegate");
+        if (!ptrIsNull(cls)) {
+            let _ = objcAddMethod(cls, "windowWillClose:", cFnPtr(winDelegateWillClose), "v@:@");
+            objcRegisterClass(cls)
+        } else ();
+        objcClass("TalusWindowDelegate")
+    }
 }
 
 pub def makeWindowCloseDelegate(cb: () -> Void): Id NSObject = {
-    let cls = objcClass("TalusWindowDelegate");
+    let cls = ensureWindowDelegateClass();
     let raw = msgSend0(msgSend0(cls, objcSel("alloc")), objcSel("init"));
     objcSetAssocHandle(raw, gWinDelegateAssocKey, gcHandleNew(cb));
     idAdopt(raw)
@@ -546,26 +561,32 @@ def customDrawViewDrawRect(self: Ptr, _cmd: Ptr, dirtyRect: CGRect): Void = {
     } else ()
 }
 
-extern init def registerTalusViews(): Void = {
-    let fCls = objcAllocateClass("NSView", "TalusFlippedView");
-    if (!ptrIsNull(fCls)) {
-        let _ = objcAddMethod(fCls, "isFlipped", cFnPtr(flippedViewIsFlipped), "B@:");
-        objcRegisterClass(fCls)
+def ensureTalusViewClasses(): Void = {
+    if (ptrIsNull(objcClass("TalusFlippedView"))) {
+        let fCls = objcAllocateClass("NSView", "TalusFlippedView");
+        if (!ptrIsNull(fCls)) {
+            let _ = objcAddMethod(fCls, "isFlipped", cFnPtr(flippedViewIsFlipped), "B@:");
+            objcRegisterClass(fCls)
+        } else ()
     } else ();
-    let dCls = objcAllocateClass("NSView", "TalusCustomDrawView");
-    if (!ptrIsNull(dCls)) {
-        let _ = objcAddMethod(dCls, "drawRect:", cFnPtr(customDrawViewDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
-        objcRegisterClass(dCls)
+    if (ptrIsNull(objcClass("TalusCustomDrawView"))) {
+        let dCls = objcAllocateClass("NSView", "TalusCustomDrawView");
+        if (!ptrIsNull(dCls)) {
+            let _ = objcAddMethod(dCls, "drawRect:", cFnPtr(customDrawViewDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+            objcRegisterClass(dCls)
+        } else ()
     } else ()
 }
 
 pub def makeFlippedView(frame: CGRect): Id NSObject = {
+    ensureTalusViewClasses();
     let cls = objcClass("TalusFlippedView");
     let raw = msgSend1Rect(msgSend0(cls, objcSel("alloc")), objcSel("initWithFrame:"), frame);
     idAdopt(raw)
 }
 
 pub def makeCustomDrawView(frame: CGRect, drawFn: (Ptr, CGRect) -> Void): Id NSObject = {
+    ensureTalusViewClasses();
     let cls = objcClass("TalusCustomDrawView");
     let raw = msgSend1Rect(msgSend0(cls, objcSel("alloc")), objcSel("initWithFrame:"), frame);
     objcSetAssocHandle(raw, gCustomDrawAssocKey, gcHandleNew(drawFn));
@@ -600,17 +621,22 @@ def hoverMouseExited(self: Ptr, _cmd: Ptr, _ev: Ptr): Void = {
     } else ()
 }
 
-extern init def registerTalusHoverTracker(): Void = {
-    let cls = objcAllocateClass("NSObject", "TalusHoverTracker");
-    if (!ptrIsNull(cls)) {
-        let _ = objcAddMethod(cls, "mouseMoved:", cFnPtr(hoverMouseMoved), "v@:@");
-        let _ = objcAddMethod(cls, "mouseExited:", cFnPtr(hoverMouseExited), "v@:@");
-        objcRegisterClass(cls)
-    } else ()
+def ensureHoverTrackerClass(): Ptr = {
+    let existing = objcClass("TalusHoverTracker");
+    if (!ptrIsNull(existing)) existing
+    else {
+        let cls = objcAllocateClass("NSObject", "TalusHoverTracker");
+        if (!ptrIsNull(cls)) {
+            let _ = objcAddMethod(cls, "mouseMoved:", cFnPtr(hoverMouseMoved), "v@:@");
+            let _ = objcAddMethod(cls, "mouseExited:", cFnPtr(hoverMouseExited), "v@:@");
+            objcRegisterClass(cls)
+        } else ();
+        objcClass("TalusHoverTracker")
+    }
 }
 
 pub def makeHoverTracker(onMove: () -> Void, onExit: () -> Void): Id NSObject = {
-    let cls = objcClass("TalusHoverTracker");
+    let cls = ensureHoverTrackerClass();
     let raw = msgSend0(msgSend0(cls, objcSel("alloc")), objcSel("init"));
     objcSetAssocHandle(raw, gHoverAssocKey, gcHandleNew((onMove, onExit)));
     idAdopt(raw)
@@ -632,16 +658,21 @@ def menuDelegateWillOpen(self: Ptr, _cmd: Ptr, _menu: Ptr): Void = {
     } else ()
 }
 
-extern init def registerTalusMenuDelegate(): Void = {
-    let cls = objcAllocateClass("NSObject", "TalusMenuDelegate");
-    if (!ptrIsNull(cls)) {
-        let _ = objcAddMethod(cls, "menuWillOpen:", cFnPtr(menuDelegateWillOpen), "v@:@");
-        objcRegisterClass(cls)
-    } else ()
+def ensureMenuDelegateClass(): Ptr = {
+    let existing = objcClass("TalusMenuDelegate");
+    if (!ptrIsNull(existing)) existing
+    else {
+        let cls = objcAllocateClass("NSObject", "TalusMenuDelegate");
+        if (!ptrIsNull(cls)) {
+            let _ = objcAddMethod(cls, "menuWillOpen:", cFnPtr(menuDelegateWillOpen), "v@:@");
+            objcRegisterClass(cls)
+        } else ();
+        objcClass("TalusMenuDelegate")
+    }
 }
 
 pub def makeMenuWillOpenDelegate(cb: () -> Void): Id NSObject = {
-    let cls = objcClass("TalusMenuDelegate");
+    let cls = ensureMenuDelegateClass();
     let raw = msgSend0(msgSend0(cls, objcSel("alloc")), objcSel("init"));
     objcSetAssocHandle(raw, gMenuDelegateAssocKey, gcHandleNew(cb));
     idAdopt(raw)
