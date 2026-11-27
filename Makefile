@@ -42,9 +42,14 @@ app: build/Talus.app deployment-test
 build/Talus.app: Makefile $(GSA_SOURCES) Resources/Info.plist build/Talus.icns
 	mkdir -p build
 	$(GEISHA) build --target macos-app -o $@
-	@id="$$(sh Scripts/resolve-codesign-identity.sh "$(CODESIGN_IDENTITY)" "$(CERT_NAME)")"; \
-	echo "Signing $@ with identity: $$id"; \
-	codesign --force --sign "$$id" "$@"
+	@if [ "$(CODESIGN_IDENTITY)" != "auto" ]; then \
+	  echo "Signing $@ with explicit identity: $(CODESIGN_IDENTITY)"; \
+	  codesign --force --sign "$(CODESIGN_IDENTITY)" "$@"; \
+	elif [ ! -f geisha.local.toml ]; then \
+	  id="$$(sh Scripts/resolve-codesign-identity.sh "$(CODESIGN_IDENTITY)" "$(CERT_NAME)")"; \
+	  echo "Signing $@ with identity: $$id"; \
+	  codesign --force --sign "$$id" "$@"; \
+	fi
 
 deployment-test: build/Talus.app
 	@actual="$$(xcrun vtool -show-build build/Talus.app/Contents/MacOS/Talus | awk '$$1 == "minos" { print $$2 }')"; \
