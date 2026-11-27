@@ -92,7 +92,8 @@ use macos.executor.{
     executorCancelFocus, executorCancelQueued, executorForget,
     executorRetainApplications, executorFinishSynchronously,
     executorHasPendingGeometry, executorHasPendingFocus, executorIsPending,
-    executorFocusKey, executorFocusPid, executorRequestFocus,
+    executorHasDeferredParks,
+    executorFocusKey, executorFocusPid, executorRaiseWindow, executorRequestFocus,
     executorFocusedKeyForPid, executorLiveFrameForWindow,
     executorSubmittedCount, executorAppliedCount
 }
@@ -449,6 +450,26 @@ def managerApplyOutput(m: Manager, out: ManagerActionOutput): Void = {
                             if (!cellGet(m.paused) && managerCanDiscover()) {
                                 match mapI64Get(cellGet(m.pidByKey), fk) {
                                     Some(_) -> {
+                                        // During a two-phase workspace switch, raise non-focused incoming
+                                        // windows first so the full incoming workspace covers the outgoing
+                                        // workspace cleanly before Phase 2 parks outgoing windows behind it.
+                                        if (executorHasDeferredParks(m.executor)) {
+                                            let ca = cellNew(cellGet(m.activeWindowKeys));
+                                            while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                                                match cellGet(ca) {
+                                                    Cons(ak, ra) -> {
+                                                        if (ak != fk) {
+                                                            match mapI64Get(cellGet(m.pidByKey), ak) {
+                                                                Some(apid) -> executorRaiseWindow(m.executor, apid, ak),
+                                                                None -> (),
+                                                            }
+                                                        } else ();
+                                                        cellSet(ca, ra)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            }
+                                        } else ();
                                         let _ = managerCoreBeginFocusDelivery(m.core, nowSec(), Some(fk));
                                         executorRequestFocus(m.executor, fp, fk, legacyFocus);
                                         cellSet(m.focusJustDelivered, true)

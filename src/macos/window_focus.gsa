@@ -54,6 +54,15 @@ pub def activateRunningAppPid(pid: Int): Void = {
     } else ()
 }
 
+/// Raise a window in Z-order (`AXRaise`) without changing the active application.
+pub def raiseWindowOnly(window: ForeignPtr): Void = {
+    let sRaise = nsString("AXRaise");
+    let _ = withForeignPtr(window, (wp) ->
+        withId(sRaise, (rp) -> c_AXUIElementPerformAction(wp, rp))
+    );
+    ()
+}
+
 /// Request focus for `window` belonging to `app` (`pid`).
 /// Returns `true` if the non-legacy fast path succeeded, `false` if legacy fallback ran.
 pub def requestWindowFocus(

@@ -8,7 +8,7 @@
 ///   `ExecEvent`) via `MVar`/`Chan`/`Actor`.
 
 use std.option.{Option, Some, None}
-use std.list.{listLen, listRev, listFilter, listAny}
+use std.list.{listLen, listRev, listFilter, listAny, listAppend}
 use std.sync.{
     AtomicInt, atomicNew, atomicAdd,
     MVar, mvarNew, mvarTake, mvarPut,
@@ -29,8 +29,8 @@ use macos.ffi.{
     cfAdopt, cfAdoptOpt, cfRetain, cfEqual, cfValueAsString, cfValueAsBool,
     axCreateApplication, dispatchMainQueue, readPtrAt
 }
-use macos.ax_io.{axValue, axCopyString, axCopyBool, axGetFrame, axSetFrame, axSetPosition}
-use macos.window_focus.{requestWindowFocus, activateRunningAppPid}
+use macos.ax_io.{axValue, axCopyString, axCopyBool, axGetFrame, axSetFrameRaw, rawSetPosition, withoutAXAnimationsForApp}
+use macos.window_focus.{requestWindowFocus, raiseWindowOnly, activateRunningAppPid}
 use objc.{
     objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
     nsString, withId, withAutoreleasePool
@@ -54,6 +54,9 @@ pub data ExecEvent {
         pid: Int,
     },
     ExecSettleCheck,
+    ExecPhase1Focused {
+        rev: Int64,
+    },
     ExecLegacyActivate {
         pid: Int,
     },
@@ -133,6 +136,24 @@ pub def scheduleDelayedSignal(delayMs: Int, tag: Int): Void = {
         let _ = chanSend(gDelayedSignalTags, tag);
         let when = c_dispatch_time(kDispatchTimeNow(), intToI64(delayMs) * intToI64(1_000_000));
         c_dispatch_after_f(when, q, ptrNull(), cFnPtr(delayedSignalFromChanTramp))
+    } else ()
+}
+
+def gDelayedPhase1Revs: Chan Int64 = chanUnbounded()
+
+def delayedPhase1FocusTramp(_ctx: Ptr): Void = {
+    match chanTryRecv(gDelayedPhase1Revs) {
+        Some(rev) -> postMainExecEvent(ExecPhase1Focused { rev: rev }),
+        None -> (),
+    }
+}
+
+def schedulePhase1FocusFallback(delayMs: Int, rev: Int64): Void = {
+    let q = dispatchMainQueue();
+    if (!ptrIsNull(q)) {
+        let _ = chanSend(gDelayedPhase1Revs, rev);
+        let when = c_dispatch_time(kDispatchTimeNow(), intToI64(delayMs) * intToI64(1_000_000));
+        c_dispatch_after_f(when, q, ptrNull(), cFnPtr(delayedPhase1FocusTramp))
     } else ()
 }
 
@@ -324,13 +345,14 @@ def applyGoalInActor(st: AppExecState, backend: ApplyBackend, goal: WindowGoal, 
             match lookupElement(st, goal.key) {
                 None -> kAXErrorInvalidUIElement(),
                 Some(el) ->
-                    if (goal.resizable) axSetFrame(el, goal.target, current, goal.parking)
-                    else axSetPosition(el, goal.target.x, goal.target.y),
+                    // Parking only needs a single AXPosition write (no AXSize, no read-back settle stall).
+                    if (goal.parking || !goal.resizable) rawSetPosition(el, goal.target.x, goal.target.y)
+                    else axSetFrameRaw(el, goal.target, current, false),
             }
         ),
     }
 
-def drainActorQueue(
+def drainActorQueueInner(
     st: AppExecState,
     qVar: MVar AppQueueState,
     backend: ApplyBackend,
@@ -404,6 +426,19 @@ def drainActorQueue(
             },
         }
     }
+}
+
+def drainActorQueue(
+    st: AppExecState,
+    qVar: MVar AppQueueState,
+    backend: ApplyBackend,
+    useMainQueue: Bool,
+    eventChan: Chan ExecEvent
+): Void = match backend {
+    ApplyRealAX -> withAutoreleasePool(() ->
+        withoutAXAnimationsForApp(st.axApp, () -> drainActorQueueInner(st, qVar, backend, useMainQueue, eventChan))
+    ),
+    ApplyTestChannel(_) -> drainActorQueueInner(st, qVar, backend, useMainQueue, eventChan),
 }
 
 /// Discover windows for this PID strictly inside its serial Actor thread.
@@ -768,6 +803,9 @@ pub data WindowExecutor {
         localEvents: Chan ExecEvent,
         workers: Cell (List (Int, AppWorker)),
         pending: Cell (List (Int64, ExecRequest)),
+        deferredParks: Cell (List WindowGoal),
+        awaitingFocusAckRev: Cell (Option Int64),
+        phaseRev: Cell Int64,
         sequence: Cell Int64,
         needsSettlement: Cell Bool,
         submittedCount: Cell Int64,
@@ -788,6 +826,9 @@ pub def windowExecutorNew(backend: ApplyBackend, useMainQueue: Bool): WindowExec
         localEvents: chanUnbounded(),
         workers: cellNew(Nil),
         pending: cellNew(Nil),
+        deferredParks: cellNew(Nil),
+        awaitingFocusAckRev: cellNew(None),
+        phaseRev: cellNew(intToI64(0)),
         sequence: cellNew(intToI64(0)),
         needsSettlement: cellNew(false),
         submittedCount: cellNew(intToI64(0)),
@@ -811,15 +852,24 @@ pub def executorAppliedCount(ex: WindowExecutor): Int64 = cellGet(ex.appliedCoun
 pub def executorFocusKey(ex: WindowExecutor): Option Int64 = cellGet(ex.focusKey)
 pub def executorFocusPid(ex: WindowExecutor): Option Int = cellGet(ex.focusPid)
 
-pub def executorHasPendingGeometry(ex: WindowExecutor): Bool =
+def hasInFlightGeometry(ex: WindowExecutor): Bool =
     listLen(cellGet(ex.pending)) > 0
         || listAny(cellGet(ex.workers), (p) -> { let (_, w) = p; workerBusy(w) })
+
+pub def executorHasDeferredParks(ex: WindowExecutor): Bool =
+    listLen(cellGet(ex.deferredParks)) > 0
+
+pub def executorHasPendingGeometry(ex: WindowExecutor): Bool =
+    hasInFlightGeometry(ex)
+        || executorHasDeferredParks(ex)
+        || (match cellGet(ex.awaitingFocusAckRev) { Some(_) -> true, None -> false })
 
 pub def executorHasPendingFocus(ex: WindowExecutor): Bool =
     match cellGet(ex.focusAction) { Some(_) -> true, None -> false }
 
 pub def executorIsPending(ex: WindowExecutor, key: Int64): Bool =
     (match qMapGet(cellGet(ex.pending), key) { Some(_) -> true, None -> false })
+        || listAny(cellGet(ex.deferredParks), (g: WindowGoal) -> g.key == key)
         || listAny(cellGet(ex.workers), (p) -> { let (_, w) = p; workerContains(w, key) })
 
 pub def executorWorker(ex: WindowExecutor, pid: Int): AppWorker =
@@ -842,22 +892,65 @@ pub def executorCancelFocus(ex: WindowExecutor): Void = {
     cellSet(ex.focusPid, None)
 }
 
+def dispatchGoalsNow(ex: WindowExecutor, goals: List WindowGoal): Void = {
+    let cg = cellNew(goals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(g, rg) -> {
+                cellSet(ex.submittedCount, cellGet(ex.submittedCount) + intToI64(1));
+                let nextSeq = cellGet(ex.sequence) + intToI64(1);
+                cellSet(ex.sequence, nextSeq);
+                let req = ExecRequest { sequence: nextSeq, goal: g };
+                cellSet(ex.pending, qMapSet(cellGet(ex.pending), g.key, req));
+                let w = executorWorker(ex, g.pid);
+                workerEnqueue(w, req, ex.backend, ex.useMainQueue, ex.localEvents);
+                cellSet(cg, rg)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def flushDeferredParks(ex: WindowExecutor): Bool = {
+    let parks = cellGet(ex.deferredParks);
+    if (listLen(parks) == 0) false
+    else {
+        cellSet(ex.deferredParks, Nil);
+        cellSet(ex.awaitingFocusAckRev, None);
+        cellSet(ex.needsSettlement, true);
+        dispatchGoalsNow(ex, parks);
+        if (ex.useMainQueue) postMainExecEvent(ExecSettleCheck)
+        else { let _ = chanSend(ex.localEvents, ExecSettleCheck); () };
+        true
+    }
+}
+
 pub def executorSettleIfIdle(ex: WindowExecutor): Void =
-    if (cellGet(ex.needsSettlement) && !executorHasPendingGeometry(ex)) {
-        cellSet(ex.needsSettlement, false);
-        let actionOpt = cellGet(ex.focusAction);
-        let rev = cellGet(ex.focusRevision);
-        match actionOpt {
-            Some(act) -> act(),
-            None -> (),
-        };
-        if (cellGet(ex.focusRevision) == rev) executorCancelFocus(ex) else ();
-        if (!cellGet(ex.needsSettlement)) {
-            match cellGet(ex.onSettled) {
-                Some(cb) -> cb(),
-                None -> (),
-            }
-        } else ()
+    if (cellGet(ex.needsSettlement) && !hasInFlightGeometry(ex)) {
+        match cellGet(ex.awaitingFocusAckRev) {
+            Some(_) -> (),
+            None -> {
+                let actionOpt = cellGet(ex.focusAction);
+                let rev = cellGet(ex.focusRevision);
+                match actionOpt {
+                    Some(act) -> act(),
+                    None -> (),
+                };
+                if (cellGet(ex.focusRevision) == rev) executorCancelFocus(ex) else ();
+                match cellGet(ex.awaitingFocusAckRev) {
+                    Some(_) -> (),
+                    None ->
+                        if (flushDeferredParks(ex)) ()
+                        else {
+                            cellSet(ex.needsSettlement, false);
+                            match cellGet(ex.onSettled) {
+                                Some(cb) -> cb(),
+                                None -> (),
+                            }
+                        },
+                }
+            },
+        }
     } else ()
 
 pub def executorHandleEvent(ex: WindowExecutor, ev: ExecEvent): Bool = match ev {
@@ -882,6 +975,17 @@ pub def executorHandleEvent(ex: WindowExecutor, ev: ExecEvent): Bool = match ev 
     },
     ExecSettleCheck -> {
         executorSettleIfIdle(ex);
+        true
+    },
+    ExecPhase1Focused { rev: rev } -> {
+        match cellGet(ex.awaitingFocusAckRev) {
+            Some(curRev) if (curRev == rev) -> {
+                cellSet(ex.awaitingFocusAckRev, None);
+                if (flushDeferredParks(ex)) ()
+                else executorSettleIfIdle(ex)
+            },
+            _ -> (),
+        };
         true
     },
     ExecLegacyActivate { pid: pid } -> {
@@ -922,22 +1026,26 @@ pub def executorSubmit(
             },
             None -> (),
         };
-        let cg = cellNew(goals);
-        while (match cellGet(cg) { Nil -> false, _ -> true }) {
-            match cellGet(cg) {
-                Cons(g, rg) -> {
-                    cellSet(ex.submittedCount, cellGet(ex.submittedCount) + intToI64(1));
-                    let nextSeq = cellGet(ex.sequence) + intToI64(1);
-                    cellSet(ex.sequence, nextSeq);
-                    let req = ExecRequest { sequence: nextSeq, goal: g };
-                    cellSet(ex.pending, qMapSet(cellGet(ex.pending), g.key, req));
-                    let w = executorWorker(ex, g.pid);
-                    workerEnqueue(w, req, ex.backend, ex.useMainQueue, ex.localEvents);
-                    cellSet(cg, rg)
-                },
-                Nil -> (),
-            }
-        };
+        let activeGoals = listFilter(goals, (g: WindowGoal) -> !g.parking);
+        let parkGoals = listFilter(goals, (g: WindowGoal) -> g.parking);
+        // Any window moving back on-screen supersedes any prior deferred park for that window;
+        // any older un-dispatched deferred parks for other windows remain queued for Phase 2.
+        let keptDeferred = listFilter(cellGet(ex.deferredParks), (dp: WindowGoal) ->
+            !listAny(activeGoals, (ag: WindowGoal) -> ag.key == dp.key)
+            && !listAny(parkGoals, (pg: WindowGoal) -> pg.key == dp.key)
+        );
+        if (listLen(activeGoals) > 0) {
+            // Phase 1: move incoming/active windows first; hold outgoing parks until Phase 1 + focus settle.
+            cellSet(ex.awaitingFocusAckRev, None);
+            cellSet(ex.deferredParks, listAppend(keptDeferred, parkGoals));
+            dispatchGoalsNow(ex, activeGoals)
+        } else if (listLen(parkGoals) > 0) {
+            // Park-only / empty-workspace switch: no incoming curtain, so park immediately.
+            let allParks = listAppend(keptDeferred, parkGoals);
+            cellSet(ex.deferredParks, Nil);
+            cellSet(ex.awaitingFocusAckRev, None);
+            dispatchGoalsNow(ex, allParks)
+        } else ();
         if (ex.useMainQueue) postMainExecEvent(ExecSettleCheck)
         else { let _ = chanSend(ex.localEvents, ExecSettleCheck); () }
     } else ()
@@ -945,6 +1053,8 @@ pub def executorSubmit(
 
 pub def executorCancelQueued(ex: WindowExecutor): Void = {
     executorCancelFocus(ex);
+    cellSet(ex.deferredParks, Nil);
+    cellSet(ex.awaitingFocusAckRev, None);
     let cw = cellNew(cellGet(ex.workers));
     while (match cellGet(cw) { Nil -> false, _ -> true }) {
         match cellGet(cw) {
@@ -957,6 +1067,7 @@ pub def executorCancelQueued(ex: WindowExecutor): Void = {
 
 pub def executorForget(ex: WindowExecutor, key: Int64): Void = {
     cellSet(ex.pending, qMapRemove(cellGet(ex.pending), key));
+    cellSet(ex.deferredParks, listFilter(cellGet(ex.deferredParks), (g: WindowGoal) -> g.key != key));
     let cw = cellNew(cellGet(ex.workers));
     while (match cellGet(cw) { Nil -> false, _ -> true }) {
         match cellGet(cw) {
@@ -992,6 +1103,9 @@ pub def executorRetainApplications(ex: WindowExecutor, livePids: List Int): Void
         let (_, req) = p;
         listContainsBy(livePids, req.goal.pid, eqInt)
     }));
+    cellSet(ex.deferredParks, listFilter(cellGet(ex.deferredParks), (g: WindowGoal) ->
+        listContainsBy(livePids, g.pid, eqInt)
+    ));
     match cellGet(ex.focusPid) {
         Some(fp) if (!listContainsBy(livePids, fp, eqInt)) -> executorCancelFocus(ex),
         _ -> (),
@@ -1002,6 +1116,8 @@ pub def executorRetainApplications(ex: WindowExecutor, livePids: List Int): Void
 /// Workers never block waiting on the main thread, so draining cannot deadlock.
 pub def executorFinishSynchronously(ex: WindowExecutor): Void = {
     executorCancelFocus(ex);
+    cellSet(ex.deferredParks, Nil);
+    cellSet(ex.awaitingFocusAckRev, None);
     let cw = cellNew(cellGet(ex.workers));
     while (match cellGet(cw) { Nil -> false, _ -> true }) {
         match cellGet(cw) {
@@ -1031,13 +1147,36 @@ pub def executorDiscoverAppAsync(
     actorCall(w.actor, (st) -> discoverAppInActor(st, bundleId, appVisible, doEnumerate))
 }
 
+pub def executorRaiseWindow(ex: WindowExecutor, pid: Int, key: Int64): Void = {
+    let w = executorWorker(ex, pid);
+    actorSend(w.actor, (st) -> withAutoreleasePool(() ->
+        match lookupElement(st, key) {
+            Some(el) -> raiseWindowOnly(el),
+            None -> (),
+        }
+    ))
+}
+
 pub def executorRequestFocus(ex: WindowExecutor, pid: Int, key: Int64, legacy: Bool): Void = {
     let w = executorWorker(ex, pid);
     let useMain = ex.useMainQueue;
-    actorSend(w.actor, (st) -> {
-        let _ = focusWindowInActor(st, key, legacy, useMain);
-        ()
-    })
+    if (executorHasDeferredParks(ex)) {
+        let rev = cellGet(ex.phaseRev) + intToI64(1);
+        cellSet(ex.phaseRev, rev);
+        cellSet(ex.awaitingFocusAckRev, Some(rev));
+        let localEv = ex.localEvents;
+        if (useMain) schedulePhase1FocusFallback(60, rev) else ();
+        actorSend(w.actor, (st) -> {
+            let _ = focusWindowInActor(st, key, legacy, useMain);
+            let ev = ExecPhase1Focused { rev: rev };
+            if (useMain) postMainExecEvent(ev) else { let _ = chanSend(localEv, ev); () }
+        })
+    } else {
+        actorSend(w.actor, (st) -> {
+            let _ = focusWindowInActor(st, key, legacy, useMain);
+            ()
+        })
+    }
 }
 
 pub def executorFocusedKeyForPid(ex: WindowExecutor, pid: Int): Option Int64 =
