@@ -2,15 +2,15 @@
 
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
-use std.list.{listLen}
+use std.list.{listLen, listRev}
 use std.str.intToStr
-use std.sync.{Chan, chanUnbounded, chanRecv, mvarPut}
+use std.sync.{Chan, chanUnbounded, chanRecv, chanTryRecv, mvarPut}
 use std.task.{sleepMs}
 use sys.io.eprintLn
 use sys.proc.exit
 use objc.{withAutoreleasePool}
 
-use util.{floatNear, listNthOpt}
+use util.{floatNear, listNthOpt, listEqualsBy}
 use layout.{Rect, rectNew}
 use config.{Configuration, defaultConfig}
 use status_markup.{
@@ -32,7 +32,7 @@ use macos.executor.{
     WindowGoal, TestApplyMsg, ApplyTestChannel,
     windowExecutorNew, executorSubmit, executorCancelFocus,
     executorPumpLocalEvents, executorSetOnSettled, executorFinishSynchronously,
-    executorHasPendingGeometry, executorHasPendingFocus,
+    executorHasPendingGeometry, executorHasPendingFocus, executorHasDeferredParks,
     executorSubmittedCount, executorAppliedCount
 }
 use macos.appkit.{nsImageSize}
@@ -261,6 +261,94 @@ def testActorExecutor(): Result Void String = {
             Ok(())
         },
         _ -> Err("expected parallel actor apply messages"),
+    }?;
+
+    // Two-phase workspace switch test: unpark (Phase 1) -> focus -> park (Phase 2).
+    let ch2: Chan TestApplyMsg = chanUnbounded();
+    let ex2 = windowExecutorNew(ApplyTestChannel(ch2), false);
+    let logRev: Cell (List String) = cellNew(Nil);
+    let settled2 = cellNew(0);
+    executorSetOnSettled(ex2, () -> cellSet(settled2, cellGet(settled2) + 1));
+
+    let incoming = WindowGoal { key: intToI64(301), pid: 7001, target: rectNew(0.0, 0.0, 900.0, 900.0), resizable: true, parking: false };
+    let outgoing = WindowGoal { key: intToI64(302), pid: 7002, target: rectNew(1919.0, 1079.0, 900.0, 900.0), resizable: true, parking: true };
+    executorSubmit(ex2, [outgoing, incoming], Some(intToI64(301)), Some(7001), Some(() -> {
+        cellSet(logRev, Cons("focus", cellGet(logRev)))
+    }));
+
+    match chanRecv(ch2) {
+        None -> Err("expected Phase 1 incoming goal"),
+        Some(mIn) -> {
+            assertTrue("Phase 1 dispatches incoming non-parking goal first", mIn.goal.key == intToI64(301) && !mIn.goal.parking)?;
+            assertTrue("outgoing park is held in deferredParks during Phase 1", executorHasDeferredParks(ex2))?;
+            sleepMs(10);
+            assertTrue("outgoing park has NOT dispatched before Phase 1 completes",
+                match chanTryRecv(ch2) { None -> true, Some(_) -> false })?;
+            cellSet(logRev, Cons("unpark", cellGet(logRev)));
+            mvarPut(mIn.reply, kAXErrorSuccess());
+            sleepMs(20);
+            executorPumpLocalEvents(ex2);
+            // Focus must have executed BEFORE Phase 2 park completes, and Phase 2 park must now be dispatched!
+            assertTrue("deferredParks flushed into Phase 2 after focus", !executorHasDeferredParks(ex2))?;
+            match chanRecv(ch2) {
+                None -> Err("expected Phase 2 outgoing park goal"),
+                Some(mOut) -> {
+                    assertTrue("Phase 2 dispatches outgoing park goal", mOut.goal.key == intToI64(302) && mOut.goal.parking)?;
+                    assertTrue("onSettled waits until Phase 2 park finishes", cellGet(settled2) == 0)?;
+                    cellSet(logRev, Cons("park", cellGet(logRev)));
+                    mvarPut(mOut.reply, kAXErrorSuccess());
+                    sleepMs(20);
+                    executorPumpLocalEvents(ex2);
+                    assertTrue("onSettled fires once after Phase 2 finishes", cellGet(settled2) == 1)?;
+                    assertTrue("no pending geometry after two-phase switch", !executorHasPendingGeometry(ex2))?;
+                    let seq = listRev(cellGet(logRev));
+                    assertTrue("exact sequence is unpark -> focus -> park",
+                        listEqualsBy(seq, ["unpark", "focus", "park"], (a, b) -> a == b))?;
+                    Ok(())
+                },
+            }
+        },
+    }?;
+
+    // Rapid switch back (WS1 -> WS2 -> WS1 while WS2 Phase 1 is in flight):
+    // WS1's deferred park must be cancelled/superseded by WS1's new active goal!
+    let w1Park = WindowGoal { key: intToI64(401), pid: 8001, target: rectNew(1919.0, 1079.0, 800.0, 800.0), resizable: true, parking: true };
+    let w2Unpark = WindowGoal { key: intToI64(402), pid: 8002, target: rectNew(0.0, 0.0, 800.0, 800.0), resizable: true, parking: false };
+    let w1Back = WindowGoal { key: intToI64(401), pid: 8001, target: rectNew(0.0, 0.0, 800.0, 800.0), resizable: true, parking: false };
+    let w2Park = WindowGoal { key: intToI64(402), pid: 8002, target: rectNew(1919.0, 1079.0, 800.0, 800.0), resizable: true, parking: true };
+
+    executorSubmit(ex2, [w1Park, w2Unpark], Some(intToI64(402)), Some(8002), None);
+    match chanRecv(ch2) {
+        None -> Err("expected w2Unpark"),
+        Some(mw2) -> {
+            assertTrue("rapid switch starts with w2Unpark", mw2.goal.key == intToI64(402) && !mw2.goal.parking)?;
+            // Rapidly switch back to WS1 before w2Unpark finishes
+            executorSubmit(ex2, [w1Back, w2Park], Some(intToI64(401)), Some(8001), None);
+            // w1Back should dispatch immediately on PID 8001 without ever parking w1!
+            match chanRecv(ch2) {
+                None -> Err("expected w1Back"),
+                Some(mw1) -> {
+                    assertTrue("w1Back dispatched immediately as non-parking", mw1.goal.key == intToI64(401) && !mw1.goal.parking)?;
+                    mvarPut(mw2.reply, kAXErrorSuccess());
+                    mvarPut(mw1.reply, kAXErrorSuccess());
+                    sleepMs(20);
+                    executorPumpLocalEvents(ex2);
+                    // Now ONLY w2Park should dispatch in Phase 2 (w1Park was superseded!)
+                    match chanRecv(ch2) {
+                        None -> Err("expected w2Park in Phase 2"),
+                        Some(mw2p) -> {
+                            assertTrue("Phase 2 parks w2 only (w1Park superseded)", mw2p.goal.key == intToI64(402) && mw2p.goal.parking)?;
+                            mvarPut(mw2p.reply, kAXErrorSuccess());
+                            sleepMs(20);
+                            executorPumpLocalEvents(ex2);
+                            assertTrue("no stale w1Park dispatched", match chanTryRecv(ch2) { None -> true, Some(_) -> false })?;
+                            executorFinishSynchronously(ex2);
+                            Ok(())
+                        },
+                    }
+                },
+            }
+        },
     }
 }
 

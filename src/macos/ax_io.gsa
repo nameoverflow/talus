@@ -196,15 +196,7 @@ pub def withAnimationGuard(io: AnimationAccess, body: () -> r): r = {
     res
 }
 
-pub def withoutAXAnimations(el: ForeignPtr, body: () -> r): r = {
-    let pid = withForeignPtr(el, (ep) ->
-        withAlloca(4, (buf) -> {
-            scopedPtrWriteI32Le(buf, 0, 0);
-            let _ = c_AXUIElementGetPid(ep, buf);
-            scopedPtrReadI32Le(buf, 0)
-        })
-    );
-    let app = axCreateApplication(pid);
+pub def withoutAXAnimationsForApp(app: ForeignPtr, body: () -> r): r = {
     let attr = nsString("AXEnhancedUserInterface");
     let io = AnimationAccess {
         read: () -> axCopyBool(app, "AXEnhancedUserInterface"),
@@ -216,6 +208,18 @@ pub def withoutAXAnimations(el: ForeignPtr, body: () -> r): r = {
         },
     };
     withAnimationGuard(io, body)
+}
+
+pub def withoutAXAnimations(el: ForeignPtr, body: () -> r): r = {
+    let pid = withForeignPtr(el, (ep) ->
+        withAlloca(4, (buf) -> {
+            scopedPtrWriteI32Le(buf, 0, 0);
+            let _ = c_AXUIElementGetPid(ep, buf);
+            scopedPtrReadI32Le(buf, 0)
+        })
+    );
+    let app = axCreateApplication(pid);
+    withoutAXAnimationsForApp(app, body)
 }
 
 pub def axSetPosition(el: ForeignPtr, x: Float, y: Float): Int =
@@ -266,12 +270,15 @@ pub def axSetFrameWithAccess(
     }
 }
 
-pub def axSetFrame(el: ForeignPtr, target: Rect, current: Option Rect, parking: Bool): Int = {
+pub def axSetFrameRaw(el: ForeignPtr, target: Rect, current: Option Rect, parking: Bool): Int = {
     let io = FrameAccess {
         read: () -> axGetFrame(el),
         position: (x, y) -> rawSetPosition(el, x, y),
         size: (w, h) -> rawSetSize(el, w, h),
         settle: () -> sleepMs(16),
     };
-    withoutAXAnimations(el, () -> axSetFrameWithAccess(target, current, parking, io))
+    axSetFrameWithAccess(target, current, parking, io)
 }
+
+pub def axSetFrame(el: ForeignPtr, target: Rect, current: Option Rect, parking: Bool): Int =
+    withoutAXAnimations(el, () -> axSetFrameRaw(el, target, current, parking))
