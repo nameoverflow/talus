@@ -1,0 +1,164 @@
+/// Tiling layout geometry algorithms (`Tall`, `Mirror`, `Full`, gaps, centering).
+
+use std.list.{listRev, listAppend, listMap}
+use std.math.{floor}
+use util.{minFloat, maxFloat, roundFloat}
+
+pub data Rect {
+    x: Float,
+    y: Float,
+    w: Float,
+    h: Float,
+}
+
+pub instance Eq Rect {
+    def eq(a: Rect, b: Rect): Bool =
+        a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h
+}
+
+pub def rectNew(x: Float, y: Float, w: Float, h: Float): Rect =
+    Rect { x: x, y: y, w: w, h: h }
+
+pub def rectMinX(r: Rect): Float = r.x
+pub def rectMinY(r: Rect): Float = r.y
+pub def rectMaxX(r: Rect): Float = r.x + r.w
+pub def rectMaxY(r: Rect): Float = r.y + r.h
+
+pub def rectIntersects(a: Rect, b: Rect): Bool =
+    if (a.w <= 0.0 || a.h <= 0.0 || b.w <= 0.0 || b.h <= 0.0) false
+    else rectMinX(a) < rectMaxX(b)
+        && rectMaxX(a) > rectMinX(b)
+        && rectMinY(a) < rectMaxY(b)
+        && rectMaxY(a) > rectMinY(b)
+
+pub def rectIntersectionArea(a: Rect, b: Rect): Float = {
+    let x1 = maxFloat(rectMinX(a), rectMinX(b));
+    let y1 = maxFloat(rectMinY(a), rectMinY(b));
+    let x2 = minFloat(rectMaxX(a), rectMaxX(b));
+    let y2 = minFloat(rectMaxY(a), rectMaxY(b));
+    if (x2 > x1 && y2 > y1) (x2 - x1) * (y2 - y1) else 0.0
+}
+
+pub def rectUnion(a: Rect, b: Rect): Rect = {
+    let x1 = minFloat(rectMinX(a), rectMinX(b));
+    let y1 = minFloat(rectMinY(a), rectMinY(b));
+    let x2 = maxFloat(rectMaxX(a), rectMaxX(b));
+    let y2 = maxFloat(rectMaxY(a), rectMaxY(b));
+    Rect { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }
+}
+
+pub def rectContainsPoint(r: Rect, px: Float, py: Float): Bool =
+    px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h
+
+pub def insetArea(area: Rect, outerGap: Float): Rect = {
+    let g = roundFloat(maxFloat(outerGap, 0.0));
+    if (g <= 0.0) area
+    else {
+        let ox = minFloat(g, floor(maxFloat(area.w - 40.0, 0.0) / 2.0));
+        let oy = minFloat(g, floor(maxFloat(area.h - 40.0, 0.0) / 2.0));
+        Rect {
+            x: area.x + ox,
+            y: area.y + oy,
+            w: area.w - 2.0 * ox,
+            h: area.h - 2.0 * oy,
+        }
+    }
+}
+
+def splitVerticalWithGap(rect: Rect, n: Int, innerGap: Float): List Rect =
+    if (n <= 0) Nil
+    else if (n == 1) [rect]
+    else {
+        let nf = intToFloat(n);
+        let nm1 = intToFloat(n - 1);
+        let g = minFloat(
+            roundFloat(maxFloat(innerGap, 0.0)),
+            floor(maxFloat(rect.h - nf * 20.0, 0.0) / nm1)
+        );
+        let outRev: Cell (List Rect) = cellNew(Nil);
+        let y = cellNew(rect.y);
+        let remH = cellNew(rect.h - g * nm1);
+        let rem = cellNew(n);
+        while (cellGet(rem) > 1) {
+            let h = floor(cellGet(remH) / intToFloat(cellGet(rem)));
+            cellSet(outRev, Cons(Rect { x: rect.x, y: cellGet(y), w: rect.w, h: h }, cellGet(outRev)));
+            cellSet(y, cellGet(y) + h + g);
+            cellSet(remH, cellGet(remH) - h);
+            cellSet(rem, cellGet(rem) - 1)
+        };
+        let finalRect = Rect { x: rect.x, y: cellGet(y), w: rect.w, h: cellGet(remH) };
+        listRev(Cons(finalRect, cellGet(outRev)))
+    }
+
+pub def tallLayoutWithGaps(
+    area: Rect,
+    count: Int,
+    masters: Int,
+    ratio: Float,
+    outerGap: Float,
+    innerGap: Float
+): List Rect =
+    if (count <= 0) Nil
+    else {
+        let inset = insetArea(area, outerGap);
+        if (count <= masters || masters <= 0) {
+            splitVerticalWithGap(inset, count, innerGap)
+        } else {
+            let colGap = minFloat(
+                roundFloat(maxFloat(innerGap, 0.0)),
+                floor(maxFloat(inset.w - 40.0, 0.0))
+            );
+            let usableW = inset.w - colGap;
+            let leftW = floor(usableW * ratio);
+            let rightW = usableW - leftW;
+            let left = splitVerticalWithGap(
+                Rect { x: inset.x, y: inset.y, w: leftW, h: inset.h },
+                masters,
+                innerGap
+            );
+            let right = splitVerticalWithGap(
+                Rect { x: inset.x + leftW + colGap, y: inset.y, w: rightW, h: inset.h },
+                count - masters,
+                innerGap
+            );
+            listAppend(left, right)
+        }
+    }
+
+pub def mirrorTallLayoutWithGaps(
+    area: Rect,
+    count: Int,
+    masters: Int,
+    ratio: Float,
+    outerGap: Float,
+    innerGap: Float
+): List Rect = {
+    let rotated = Rect { x: area.y, y: area.x, w: area.h, h: area.w };
+    listMap(
+        tallLayoutWithGaps(rotated, count, masters, ratio, outerGap, innerGap),
+        (r: Rect) -> Rect { x: r.y, y: r.x, w: r.h, h: r.w }
+    )
+}
+
+pub def tallLayout(area: Rect, count: Int, masters: Int, ratio: Float): List Rect =
+    tallLayoutWithGaps(area, count, masters, ratio, 0.0, 0.0)
+
+pub def mirrorTallLayout(area: Rect, count: Int, masters: Int, ratio: Float): List Rect =
+    mirrorTallLayoutWithGaps(area, count, masters, ratio, 0.0, 0.0)
+
+pub def centeredFrame(winW: Float, winH: Float, area: Rect): Rect = {
+    let w = minFloat(maxFloat(winW, 240.0), area.w * 0.9);
+    let h = minFloat(maxFloat(winH, 180.0), area.h * 0.9);
+    Rect {
+        x: rectMinX(area) + roundFloat((area.w - w) / 2.0),
+        y: rectMinY(area) + roundFloat((area.h - h) / 2.0),
+        w: w,
+        h: h,
+    }
+}
+
+pub def centeredOrigin(winW: Float, winH: Float, area: Rect): (Float, Float) = {
+    let x = maxFloat(rectMinX(area), rectMinX(area) + roundFloat((area.w - winW) / 2.0));
+    let y = maxFloat(rectMinY(area), rectMinY(area) + roundFloat((area.h - winH) / 2.0));
+    (x, y)
+}

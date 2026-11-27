@@ -1,0 +1,712 @@
+/// Menu bar vector status icon, rich configured status renderer, and pointer hit-testing.
+///
+/// Preserves exact parity with `StatusIcon.swift` and `StatusRich.swift`, including:
+/// - SF Symbol auto-scaling & semibold slot-width floor (no jitter on workspace switch)
+/// - Unified pill runs & `<box>` borders (full / bottom / top / h_both / v_both)
+/// - Centered icon-only workspace pills with zero-width dot inset
+/// - Hover highlight pill & gloss
+/// - `NSEvent.mouseLocation` hit-testing (`statusWorkspaceIndexUnderPointer`)
+
+use std.option.{Option, Some, None}
+use std.list.{listLen, listRev, listAny, listFilter}
+use std.math.ceil
+use objc.{Id, NSObject, objcSel, withId, msgSend0}
+use util.{minFloat, maxFloat, roundFloat, strTrimSpacesOnly, listNthOpt, listFindBy, optEqBy, eqStr, eqInt}
+use layout.{Rect, rectNew}
+use status_markup.{
+    StatusPart, StatusSegmentStyle, StatusBoxStyle, StatusBoxType,
+    BoxFull, BoxBottom, BoxTop, BoxHBoth, BoxVBoth,
+    StatusWorkspaceHitRegion, statusWorkspaceIndex
+}
+use macos.ffi.{
+    CGPoint, CGSize, CGRect, cgPoint, cgSize, cgRect, cgToRect,
+    msgSendRect0, msgSendPoint1Point, msgSendPoint1Point1Ptr, msgSendRect1Rect
+}
+use macos.appkit.{
+    kFontWeightMedium, kFontWeightSemibold,
+    kNSCompositingOperationSourceOver, kNSCompositingOperationSourceAtop,
+    c_NSRectFillUsingOperation,
+    nsColorBlack, nsColorWhite, nsColorSRGB, nsColorCalibratedWhite, nsColorWithAlpha, nsColorAlpha, nsColorSetFill, nsColorSetStroke,
+    nsFontMonospacedDigit, nsFontByName, nsFontCapHeight, nsFontDescender,
+    nsDrawRoundedRectFill, nsDrawRoundedRectStroke,
+    nsImageDraw, nsImageSetTemplate, nsImageSetAccessibilityDescription,
+    nsImageSize, nsImageSystemSymbol, nsImageWithSymbolConfig, nsImageDrawInRect,
+    nsTextMeasureSize, nsTextDrawAt, nsEventMouseLocation
+}
+
+/// Monochrome template menu-bar icon (AppKit tints for light/dark menu bar).
+pub def makeStatusIcon(): Id NSObject = {
+    let img = nsImageDraw(18.0, 18.0, false, (_rect: CGRect) -> {
+        nsColorSetFill(nsColorBlack());
+        nsDrawRoundedRectFill(1.5, 2.0, 7.75, 14.0, 1.25);
+        nsDrawRoundedRectFill(10.5, 9.625, 6.0, 6.375, 1.25);
+        nsDrawRoundedRectFill(10.5, 2.0, 6.0, 6.375, 1.25);
+        true
+    });
+    nsImageSetTemplate(img, true);
+    nsImageSetAccessibilityDescription(img, "Talus");
+    img
+}
+
+/// Hit-test workspace index under current pointer using `NSEvent.mouseLocation` (never `NSApp.currentEvent.locationInWindow`).
+pub def statusWorkspaceIndexUnderPointer(buttonPtr: Ptr, regions: List StatusWorkspaceHitRegion): Option Int = {
+    if (ptrIsNull(buttonPtr)) None
+    else {
+        let winPtr = msgSend0(buttonPtr, objcSel("window"));
+        let cellPtr = msgSend0(buttonPtr, objcSel("cell"));
+        if (ptrIsNull(winPtr) || ptrIsNull(cellPtr)) None
+        else {
+            let bounds = msgSendRect0(buttonPtr, objcSel("bounds"));
+            let imageRect = msgSendRect1Rect(cellPtr, objcSel("imageRectForBounds:"), bounds);
+            let screenPt = nsEventMouseLocation();
+            let winPt = msgSendPoint1Point(winPtr, objcSel("convertPointFromScreen:"), screenPt);
+            let localPt = msgSendPoint1Point1Ptr(buttonPtr, objcSel("convertPoint:fromView:"), winPt, ptrNull());
+            statusWorkspaceIndex(localPt.x, localPt.y, cgToRect(bounds), cgToRect(imageRect), regions)
+        }
+    }
+}
+
+pub data StatusRenderOutput {
+    StatusRenderOutput {
+        image: Id NSObject,
+        workspaceRegions: List StatusWorkspaceHitRegion,
+    }
+}
+
+def hexDigitVal(b: Int): Int =
+    if (b >= 48 && b <= 57) b - 48
+    else if (b >= 65 && b <= 70) b - 55
+    else if (b >= 97 && b <= 102) b - 87
+    else -1
+
+def parseHexColorOpt(hexOpt: Option String): Option Ptr = match hexOpt {
+    None -> None,
+    Some(hex) -> {
+        let n = strLen(hex);
+        if (n != 7 && n != 9) None
+        else if (strByteAt(hex, 0) != 35) None
+        else {
+            let digits = n - 1;
+            let acc = cellNew(intToI64(0));
+            let ok = cellNew(true);
+            let i = cellNew(1);
+            while (cellGet(i) < n && cellGet(ok)) {
+                let d = hexDigitVal(strByteAt(hex, cellGet(i)));
+                if (d < 0) cellSet(ok, false)
+                else cellSet(acc, (cellGet(acc) << 4) | intToI64(d));
+                cellSet(i, cellGet(i) + 1)
+            };
+            if (!cellGet(ok)) None
+            else {
+                let raw = cellGet(acc);
+                let rgba = if (digits == 8) raw else (raw << 8) | intToI64(0xFF);
+                let r = intToFloat(i64ToInt((rgba >>> 24) & intToI64(255))) / 255.0;
+                let g = intToFloat(i64ToInt((rgba >>> 16) & intToI64(255))) / 255.0;
+                let b = intToFloat(i64ToInt((rgba >>> 8) & intToI64(255))) / 255.0;
+                let a = intToFloat(i64ToInt(rgba & intToI64(255))) / 255.0;
+                Some(nsColorSRGB(r, g, b, a))
+            }
+        }
+    },
+}
+
+data SegmentMetrics {
+    SegmentMetrics {
+        part: StatusPart,
+        font: Ptr,
+        symbolImage: Option (Id NSObject),
+        displayText: Cell String,
+        contentWidth: Cell Float,
+        leftPad: Cell Float,
+        rightPad: Cell Float,
+    }
+}
+
+def segTotalWidth(s: SegmentMetrics): Float =
+    cellGet(s.contentWidth) + cellGet(s.leftPad) + cellGet(s.rightPad)
+
+data ChromeRunKey {
+    ChromeRunKey {
+        background: Option String,
+        box: Option StatusBoxStyle,
+        workspaceIndex: Option Int,
+    }
+}
+
+def boxTypeEq(a: StatusBoxType, b: StatusBoxType): Bool = match (a, b) {
+    (BoxFull, BoxFull) -> true,
+    (BoxBottom, BoxBottom) -> true,
+    (BoxTop, BoxTop) -> true,
+    (BoxHBoth, BoxHBoth) -> true,
+    (BoxVBoth, BoxVBoth) -> true,
+    _ -> false,
+}
+
+def boxStyleEq(a: StatusBoxStyle, b: StatusBoxStyle): Bool =
+    boxTypeEq(a.boxType, b.boxType)
+        && optEqBy(a.color, b.color, eqStr)
+        && a.width == b.width
+        && optEqBy(a.radius, b.radius, (x, y) -> x == y)
+
+def chromeKeyEq(a: ChromeRunKey, b: ChromeRunKey): Bool =
+    optEqBy(a.background, b.background, eqStr)
+        && optEqBy(a.box, b.box, boxStyleEq)
+        && optEqBy(a.workspaceIndex, b.workspaceIndex, eqInt)
+
+def chromeHasChrome(k: ChromeRunKey): Bool =
+    (match k.background { Some(_) -> true, None -> false })
+        || (match k.box { Some(_) -> true, None -> false })
+
+def boxIsFull(boxOpt: Option StatusBoxStyle): Bool = match boxOpt {
+    Some(b) -> boxTypeEq(b.boxType, BoxFull),
+    None -> false,
+}
+
+data ChromeRun {
+    ChromeRun {
+        start: Int,
+        end: Int,
+        key: ChromeRunKey,
+    }
+}
+
+def resolveSymbolImage(name: String, pointSize: Float, current: Bool): Option (Id NSObject) = {
+    let weight = if (current) kFontWeightSemibold() else kFontWeightMedium();
+    let maxW = pointSize * 1.33;
+    let maxH = pointSize * 1.24;
+    match nsImageSystemSymbol(name) {
+        None -> None,
+        Some(base) -> {
+            let boldSize = match nsImageWithSymbolConfig(base, pointSize, kFontWeightSemibold()) {
+                Some(bImg) -> nsImageSize(bImg),
+                None -> cgSize(0.0, 0.0),
+            };
+            let scale = minFloat(1.0, minFloat(maxW / maxFloat(1.0, boldSize.w), maxH / maxFloat(1.0, boldSize.h)));
+            nsImageWithSymbolConfig(base, pointSize * scale, weight)
+        },
+    }
+}
+
+def drawTintedSymbol(symbol: Id NSObject, rect: CGRect, color: Ptr): Void = {
+    let tinted = nsImageDraw(rect.size.w, rect.size.h, false, (bounds: CGRect) -> {
+        nsImageDrawInRect(symbol, bounds, kNSCompositingOperationSourceOver(), 1.0);
+        nsColorSetFill(color);
+        c_NSRectFillUsingOperation(bounds, kNSCompositingOperationSourceAtop());
+        true
+    });
+    nsImageDrawInRect(tinted, rect, kNSCompositingOperationSourceOver(), 1.0)
+}
+
+def rectUnion(a: Rect, b: Rect): Rect = {
+    let x1 = minFloat(a.x, b.x);
+    let y1 = minFloat(a.y, b.y);
+    let x2 = maxFloat(a.x + a.w, b.x + b.w);
+    let y2 = maxFloat(a.y + a.h, b.y + b.h);
+    rectNew(x1, y1, x2 - x1, y2 - y1)
+}
+
+def styleOf(part: StatusPart): Option StatusSegmentStyle = part.style
+def styleBg(sOpt: Option StatusSegmentStyle): Option String = match sOpt { Some(s) -> s.background, None -> None }
+def styleBox(sOpt: Option StatusSegmentStyle): Option StatusBoxStyle = match sOpt { Some(s) -> s.boxStyle, None -> None }
+def styleFontSize(sOpt: Option StatusSegmentStyle): Float = match sOpt {
+    Some(s) -> match s.fontSize { Some(fs) -> fs, None -> 11.5 },
+    None -> 11.5,
+}
+def styleFontName(sOpt: Option StatusSegmentStyle): Option String = match sOpt { Some(s) -> s.font, None -> None }
+def styleFg(sOpt: Option StatusSegmentStyle): Option String = match sOpt { Some(s) -> s.foreground, None -> None }
+def styleDimmed(sOpt: Option StatusSegmentStyle): Bool = match sOpt { Some(s) -> s.dimmed, None -> false }
+
+/// Renders the menu bar item as a crisp vector image and returns clickable workspace hit regions.
+pub def renderConfiguredStatus(
+    parts: List StatusPart,
+    dark: Bool,
+    showIcon: Bool,
+    hoveredWorkspace: Option Int
+): StatusRenderOutput = {
+    let segRev: Cell (List SegmentMetrics) = cellNew(Nil);
+    let cp = cellNew(parts);
+    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+        match cellGet(cp) {
+            Cons(part, rp) -> {
+                let sz = styleFontSize(part.style);
+                let isWsOnly = (match part.symbolName { None -> true, Some(_) -> false })
+                    && strLen(strTrimSpacesOnly(part.text)) == 0;
+                let weight = if (part.isCurrent && !isWsOnly) kFontWeightSemibold() else kFontWeightMedium();
+                let font = match styleFontName(part.style) {
+                    Some(fnName) -> match nsFontByName(fnName, sz) {
+                        Some(f) -> f,
+                        None -> nsFontMonospacedDigit(sz, weight),
+                    },
+                    None -> nsFontMonospacedDigit(sz, weight),
+                };
+                let seg = match part.symbolName {
+                    Some(symName) -> match resolveSymbolImage(symName, sz * 0.98, part.isCurrent) {
+                        Some(symImg) -> {
+                            let curW = nsImageSize(symImg).w;
+                            let boldW = match resolveSymbolImage(symName, sz * 0.98, true) {
+                                Some(bImg) -> nsImageSize(bImg).w,
+                                None -> curW,
+                            };
+                            let minSlotW = ceil(sz * 1.30);
+                            let slotW = maxFloat(minSlotW, ceil(maxFloat(curW, boldW)));
+                            SegmentMetrics {
+                                part: part,
+                                font: font,
+                                symbolImage: Some(symImg),
+                                displayText: cellNew(""),
+                                contentWidth: cellNew(slotW),
+                                leftPad: cellNew(0.0),
+                                rightPad: cellNew(0.0),
+                            }
+                        },
+                        None -> {
+                            let tw = ceil(nsTextMeasureSize(symName, font).w);
+                            SegmentMetrics {
+                                part: part,
+                                font: font,
+                                symbolImage: None,
+                                displayText: cellNew(symName),
+                                contentWidth: cellNew(tw),
+                                leftPad: cellNew(0.0),
+                                rightPad: cellNew(0.0),
+                            }
+                        },
+                    },
+                    None -> {
+                        let tw = ceil(nsTextMeasureSize(part.text, font).w);
+                        SegmentMetrics {
+                            part: part,
+                            font: font,
+                            symbolImage: None,
+                            displayText: cellNew(part.text),
+                            contentWidth: cellNew(tw),
+                            leftPad: cellNew(0.0),
+                            rightPad: cellNew(0.0),
+                        }
+                    },
+                };
+                cellSet(segRev, Cons(seg, cellGet(segRev)));
+                cellSet(cp, rp)
+            },
+            Nil -> (),
+        }
+    };
+    let segments = listRev(cellGet(segRev));
+    let segCount = listLen(segments);
+
+    let anyWsHasPill = listAny(segments, (s: SegmentMetrics) ->
+        (match s.part.workspaceIndex { Some(_) -> true, None -> false })
+            && ((match styleBg(s.part.style) { Some(_) -> true, None -> false }) || boxIsFull(styleBox(s.part.style)))
+    );
+
+    // Group consecutive segments sharing identical background/box/workspace into unified pill runs
+    let runsRev: Cell (List ChromeRun) = cellNew(Nil);
+    let idx = cellNew(0);
+    while (cellGet(idx) < segCount) {
+        let start = cellGet(idx);
+        match listNthOpt(segments, start) {
+            None -> cellSet(idx, segCount),
+            Some(seg0) -> {
+                let key = ChromeRunKey {
+                    background: styleBg(seg0.part.style),
+                    box: styleBox(seg0.part.style),
+                    workspaceIndex: seg0.part.workspaceIndex,
+                };
+                let end = cellNew(start + 1);
+                let mergeable = chromeHasChrome(key) || (anyWsHasPill && (match key.workspaceIndex { Some(_) -> true, None -> false }));
+                if (mergeable) {
+                    let cont = cellNew(true);
+                    while (cellGet(end) < segCount && cellGet(cont)) {
+                        match listNthOpt(segments, cellGet(end)) {
+                            Some(segN) -> {
+                                let nk = ChromeRunKey {
+                                    background: styleBg(segN.part.style),
+                                    box: styleBox(segN.part.style),
+                                    workspaceIndex: segN.part.workspaceIndex,
+                                };
+                                if (chromeKeyEq(nk, key)) cellSet(end, cellGet(end) + 1)
+                                else cellSet(cont, false)
+                            },
+                            None -> cellSet(cont, false),
+                        }
+                    }
+                } else ();
+                let endVal = cellGet(end);
+                cellSet(runsRev, Cons(ChromeRun { start: start, end: endVal, key: key }, cellGet(runsRev)));
+                cellSet(idx, endVal)
+            },
+        }
+    };
+    let runs = listRev(cellGet(runsRev));
+
+    // Apply pill/box/icon padding per run
+    let cr = cellNew(runs);
+    while (match cellGet(cr) { Nil -> false, _ -> true }) {
+        match cellGet(cr) {
+            Cons(run, rr) -> {
+                let qualifies = (match run.key.background { Some(_) -> true, None -> false })
+                    || boxIsFull(run.key.box)
+                    || (anyWsHasPill && (match run.key.workspaceIndex { Some(_) -> true, None -> false }));
+                if (qualifies && run.start < run.end) {
+                    let hasVis = cellNew(false);
+                    let symCount = cellNew(0);
+                    let firstSymIdx = cellNew(-1);
+                    let allSymOrSpace = cellNew(true);
+                    let textAcc = cellNew("");
+                    let k = cellNew(run.start);
+                    while (cellGet(k) < run.end) {
+                        let ki = cellGet(k);
+                        match listNthOpt(segments, ki) {
+                            Some(s) -> {
+                                let dt = cellGet(s.displayText);
+                                let trimmed = strTrimSpacesOnly(dt);
+                                match s.symbolImage {
+                                    Some(_) -> {
+                                        cellSet(hasVis, true);
+                                        if (cellGet(firstSymIdx) < 0) cellSet(firstSymIdx, ki) else ();
+                                        cellSet(symCount, cellGet(symCount) + 1)
+                                    },
+                                    None -> {
+                                        if (strLen(trimmed) > 0) {
+                                            cellSet(hasVis, true);
+                                            cellSet(allSymOrSpace, false)
+                                        } else ();
+                                        cellSet(textAcc, cellGet(textAcc) + dt)
+                                    },
+                                }
+                            },
+                            None -> (),
+                        };
+                        cellSet(k, ki + 1)
+                    };
+                    if (cellGet(hasVis)) {
+                        let firstIdx = run.start;
+                        let lastIdx = run.end - 1;
+                        let isSymOnly = cellGet(symCount) > 0 && cellGet(allSymOrSpace);
+                        let joinedText = strTrimSpacesOnly(cellGet(textAcc));
+                        let prefixSpacesOnly = cellNew(true);
+                        let fsi = cellGet(firstSymIdx);
+                        if (fsi >= 0) {
+                            let p = cellNew(run.start);
+                            while (cellGet(p) < fsi) {
+                                match listNthOpt(segments, cellGet(p)) {
+                                    Some(ps) -> if (strLen(strTrimSpacesOnly(cellGet(ps.displayText))) > 0) cellSet(prefixSpacesOnly, false) else (),
+                                    None -> (),
+                                };
+                                cellSet(p, cellGet(p) + 1)
+                            }
+                        } else ();
+                        let isIconWsRun = (match run.key.workspaceIndex { Some(_) -> true, None -> false })
+                            && cellGet(symCount) == 1
+                            && (strLen(joinedText) == 0 || joinedText == "•")
+                            && cellGet(prefixSpacesOnly);
+
+                        match (listNthOpt(segments, firstIdx), listNthOpt(segments, lastIdx)) {
+                            (Some(firstSeg), Some(lastSeg)) ->
+                                if (isIconWsRun && fsi >= 0) {
+                                    match listNthOpt(segments, fsi) {
+                                        Some(symSeg) -> {
+                                            let sz = styleFontSize(symSeg.part.style);
+                                            let probeFont = match styleFontName(symSeg.part.style) {
+                                                Some(fnName) -> match nsFontByName(fnName, sz) {
+                                                    Some(f) -> f,
+                                                    None -> nsFontMonospacedDigit(sz, kFontWeightSemibold()),
+                                                },
+                                                None -> nsFontMonospacedDigit(sz, kFontWeightSemibold()),
+                                            };
+                                            let indW = ceil(nsTextMeasureSize("•", probeFont).w);
+                                            let m = cellNew(run.start);
+                                            while (cellGet(m) < run.end) {
+                                                match listNthOpt(segments, cellGet(m)) {
+                                                    Some(ms) -> match ms.symbolImage {
+                                                        None -> {
+                                                            cellSet(ms.displayText, strTrimSpacesOnly(cellGet(ms.displayText)));
+                                                            cellSet(ms.contentWidth, 0.0)
+                                                        },
+                                                        Some(_) -> (),
+                                                    },
+                                                    None -> (),
+                                                };
+                                                cellSet(m, cellGet(m) + 1)
+                                            };
+                                            let inset = 3.5 + indW / 2.0;
+                                            cellSet(firstSeg.leftPad, inset);
+                                            cellSet(lastSeg.rightPad, inset)
+                                        },
+                                        None -> (),
+                                    }
+                                } else if (isSymOnly) {
+                                    match firstSeg.symbolImage {
+                                        None -> if (strLen(strTrimSpacesOnly(cellGet(firstSeg.displayText))) == 0) cellSet(firstSeg.contentWidth, 0.0) else (),
+                                        Some(_) -> (),
+                                    };
+                                    match lastSeg.symbolImage {
+                                        None -> if (strLen(strTrimSpacesOnly(cellGet(lastSeg.displayText))) == 0) cellSet(lastSeg.contentWidth, 0.0) else (),
+                                        Some(_) -> (),
+                                    };
+                                    cellSet(firstSeg.leftPad, 3.5);
+                                    cellSet(lastSeg.rightPad, 3.5)
+                                } else {
+                                    let ft = cellGet(firstSeg.displayText);
+                                    let lt = cellGet(lastSeg.displayText);
+                                    let hasLeadSpace = (match firstSeg.symbolImage { None -> true, Some(_) -> false }) && strLen(ft) > 0 && strByteAt(ft, 0) == 32;
+                                    let hasTrailSpace = (match lastSeg.symbolImage { None -> true, Some(_) -> false }) && strLen(lt) > 0 && strByteAt(lt, strLen(lt) - 1) == 32;
+                                    cellSet(firstSeg.leftPad, if (hasLeadSpace) 2.5 else 6.0);
+                                    cellSet(lastSeg.rightPad, if (hasTrailSpace) 2.5 else 6.0)
+                                },
+                            _ -> (),
+                        }
+                    } else ()
+                } else ();
+                cellSet(cr, rr)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Tighten single-space separator between icon workspace pills
+    let hasSymWs = listAny(segments, (s: SegmentMetrics) ->
+        (match s.part.workspaceIndex { Some(_) -> true, None -> false })
+            && (match s.symbolImage { Some(_) -> true, None -> false })
+    );
+    if (hasSymWs && segCount >= 3) {
+        let i = cellNew(1);
+        while (cellGet(i) < segCount - 1) {
+            let ii = cellGet(i);
+            match (listNthOpt(segments, ii - 1), listNthOpt(segments, ii), listNthOpt(segments, ii + 1)) {
+                (Some(prevS), Some(midS), Some(nextS)) -> {
+                    let midPlain = (match midS.part.workspaceIndex { None -> true, Some(_) -> false })
+                        && (match midS.symbolImage { None -> true, Some(_) -> false })
+                        && cellGet(midS.displayText) == " ";
+                    let prevWs = match prevS.part.workspaceIndex { Some(_) -> true, None -> false };
+                    let nextWs = match nextS.part.workspaceIndex { Some(_) -> true, None -> false };
+                    if (midPlain && prevWs && nextWs) {
+                        cellSet(midS.contentWidth, minFloat(cellGet(midS.contentWidth), 2.5))
+                    } else ()
+                },
+                _ -> (),
+            };
+            cellSet(i, ii + 1)
+        }
+    } else ();
+
+    let leading = if (showIcon) 23.0 else 0.0;
+    let totalSegW = cellNew(0.0);
+    let cs = cellNew(segments);
+    while (match cellGet(cs) { Nil -> false, _ -> true }) {
+        match cellGet(cs) {
+            Cons(s, rs) -> { cellSet(totalSegW, cellGet(totalSegW) + segTotalWidth(s)); cellSet(cs, rs) },
+            Nil -> (),
+        }
+    };
+    let width = maxFloat(1.0, minFloat(460.0, ceil(leading + cellGet(totalSegW))));
+
+    // Compute segment start positions & workspace hit regions
+    let startsRev: Cell (List Float) = cellNew(Nil);
+    let regionsRev: Cell (List StatusWorkspaceHitRegion) = cellNew(Nil);
+    let cursorX = cellNew(leading);
+    let cs2 = cellNew(segments);
+    while (match cellGet(cs2) { Nil -> false, _ -> true }) {
+        match cellGet(cs2) {
+            Cons(seg, rs) -> {
+                let cx = cellGet(cursorX);
+                cellSet(startsRev, Cons(cx, cellGet(startsRev)));
+                let tw = segTotalWidth(seg);
+                if (cx < width) {
+                    match seg.part.workspaceIndex {
+                        Some(wsIdx) -> {
+                            let segW = minFloat(tw, width - cx);
+                            let rect = rectNew(cx, 0.0, segW, 18.0);
+                            match cellGet(regionsRev) {
+                                Cons(lastReg, tailReg) if (lastReg.index == wsIdx) ->
+                                    cellSet(regionsRev, Cons(StatusWorkspaceHitRegion {
+                                        index: wsIdx,
+                                        rect: rectUnion(lastReg.rect, rect),
+                                    }, tailReg)),
+                                _ ->
+                                    cellSet(regionsRev, Cons(StatusWorkspaceHitRegion {
+                                        index: wsIdx,
+                                        rect: rect,
+                                    }, cellGet(regionsRev))),
+                            }
+                        },
+                        None -> (),
+                    }
+                } else ();
+                cellSet(cursorX, cx + tw);
+                cellSet(cs2, rs)
+            },
+            Nil -> (),
+        }
+    };
+    let segStarts = listRev(cellGet(startsRev));
+    let workspaceRegions = listRev(cellGet(regionsRev));
+
+    let img = nsImageDraw(width, 18.0, false, (_rect: CGRect) -> {
+        let defaultInk = if (dark) nsColorWhite() else nsColorCalibratedWhite(0.08, 1.0);
+        nsColorSetFill(nsColorWithAlpha(defaultInk, 0.92));
+        if (showIcon) {
+            nsDrawRoundedRectFill(1.5, 3.5, 6.0, 11.0, 1.2);
+            nsDrawRoundedRectFill(8.5, 9.5, 4.5, 5.0, 1.2);
+            nsDrawRoundedRectFill(8.5, 3.5, 4.5, 5.0, 1.2)
+        } else ();
+
+        // Hover pill behind hovered workspace when it has no explicit pill background
+        match hoveredWorkspace {
+            Some(hws) -> match listFindBy(workspaceRegions, (r: StatusWorkspaceHitRegion) -> r.index == hws) {
+                Some(reg) -> {
+                    let hasOwnBg = listAny(segments, (s: SegmentMetrics) ->
+                        optEqBy(s.part.workspaceIndex, Some(hws), eqInt)
+                            && (match styleBg(s.part.style) { Some(_) -> true, None -> false })
+                    );
+                    if (!hasOwnBg) {
+                        let padX = if (anyWsHasPill) 0.0 else 1.0;
+                        let hx = maxFloat(0.0, reg.rect.x - padX);
+                        let hw = minFloat(width - hx, reg.rect.w + padX * 2.0);
+                        let hc = if (dark) nsColorWithAlpha(nsColorWhite(), 0.15)
+                                 else nsColorWithAlpha(nsColorBlack(), 0.08);
+                        nsColorSetFill(hc);
+                        nsDrawRoundedRectFill(hx, 1.0, hw, 16.0, 8.0)
+                    } else ()
+                },
+                None -> (),
+            },
+            None -> (),
+        };
+
+        let resolveFg = (sOpt: Option StatusSegmentStyle) -> {
+            let dimmed = styleDimmed(sOpt);
+            let defaultAlpha = if (dimmed) (if (dark) 0.54 else 0.48) else 0.92;
+            match parseHexColorOpt(styleFg(sOpt)) {
+                Some(fg) -> if (dimmed) nsColorWithAlpha(fg, nsColorAlpha(fg) * 0.62) else fg,
+                None -> nsColorWithAlpha(defaultInk, defaultAlpha),
+            }
+        };
+
+        // 1. Draw unified background pills and <box> chrome per run
+        let crd = cellNew(runs);
+        while (match cellGet(crd) { Nil -> false, _ -> true }) {
+            match cellGet(crd) {
+                Cons(run, rr) -> {
+                    if (chromeHasChrome(run.key) && run.start < run.end) {
+                        match (listNthOpt(segStarts, run.start), listNthOpt(segments, run.start)) {
+                            (Some(runX), Some(firstSeg)) if (runX < width) -> {
+                                let runW = cellNew(0.0);
+                                let j = cellNew(run.start);
+                                while (cellGet(j) < run.end) {
+                                    match listNthOpt(segments, cellGet(j)) {
+                                        Some(sj) -> cellSet(runW, cellGet(runW) + segTotalWidth(sj)),
+                                        None -> (),
+                                    };
+                                    cellSet(j, cellGet(j) + 1)
+                                };
+                                let rw = cellGet(runW);
+                                let pillRadius = minFloat(8.0, match run.key.box {
+                                    Some(bx) -> match bx.radius { Some(r) -> r, None -> 8.0 },
+                                    None -> 8.0,
+                                });
+                                let repFg = resolveFg(firstSeg.part.style);
+
+                                match parseHexColorOpt(run.key.background) {
+                                    Some(bg) -> {
+                                        nsColorSetFill(bg);
+                                        nsDrawRoundedRectFill(runX, 1.0, rw, 16.0, pillRadius);
+                                        match hoveredWorkspace {
+                                            Some(hws) if (optEqBy(run.key.workspaceIndex, Some(hws), eqInt)) -> {
+                                                let gloss = nsColorWithAlpha(nsColorWhite(), if (dark) 0.12 else 0.22);
+                                                nsColorSetFill(gloss);
+                                                nsDrawRoundedRectFill(runX, 1.0, rw, 16.0, pillRadius)
+                                            },
+                                            _ -> (),
+                                        }
+                                    },
+                                    None -> (),
+                                };
+
+                                match run.key.box {
+                                    Some(bx) -> {
+                                        let boxColor = match parseHexColorOpt(bx.color) { Some(c) -> c, None -> repFg };
+                                        let lw = bx.width;
+                                        nsColorSetFill(boxColor);
+                                        nsColorSetStroke(boxColor);
+                                        match bx.boxType {
+                                            BoxFull -> {
+                                                let half = lw / 2.0;
+                                                let r = maxFloat(0.0, pillRadius - half);
+                                                nsDrawRoundedRectStroke(runX + half, 1.0 + half, rw - lw, 16.0 - lw, r, lw)
+                                            },
+                                            BoxBottom -> {
+                                                let barInset = minFloat(3.5, rw * 0.14);
+                                                let barW = maxFloat(2.0, rw - barInset * 2.0);
+                                                let barR = match bx.radius { Some(r) -> r, None -> lw / 2.0 };
+                                                nsDrawRoundedRectFill(runX + barInset, 0.75, barW, lw, barR)
+                                            },
+                                            BoxTop -> {
+                                                let barInset = minFloat(3.5, rw * 0.14);
+                                                let barW = maxFloat(2.0, rw - barInset * 2.0);
+                                                let barR = match bx.radius { Some(r) -> r, None -> lw / 2.0 };
+                                                nsDrawRoundedRectFill(runX + barInset, 17.25 - lw, barW, lw, barR)
+                                            },
+                                            BoxHBoth -> {
+                                                let barInset = minFloat(3.5, rw * 0.14);
+                                                let barW = maxFloat(2.0, rw - barInset * 2.0);
+                                                let barR = match bx.radius { Some(r) -> r, None -> lw / 2.0 };
+                                                nsDrawRoundedRectFill(runX + barInset, 0.75, barW, lw, barR);
+                                                nsDrawRoundedRectFill(runX + barInset, 17.25 - lw, barW, lw, barR)
+                                            },
+                                            BoxVBoth -> {
+                                                let barR = match bx.radius { Some(r) -> r, None -> lw / 2.0 };
+                                                nsDrawRoundedRectFill(runX + 0.5, 3.0, lw, 12.0, barR);
+                                                nsDrawRoundedRectFill(runX + rw - lw - 0.5, 3.0, lw, 12.0, barR)
+                                            },
+                                        }
+                                    },
+                                    None -> (),
+                                }
+                            },
+                            _ -> (),
+                        }
+                    } else ();
+                    cellSet(crd, rr)
+                },
+                Nil -> (),
+            }
+        };
+
+        // 2. Draw text and SF Symbol glyphs per segment
+        let di = cellNew(0);
+        while (cellGet(di) < segCount) {
+            let idxD = cellGet(di);
+            match (listNthOpt(segStarts, idxD), listNthOpt(segments, idxD)) {
+                (Some(x), Some(seg)) if (x < width) -> {
+                    let fg = resolveFg(seg.part.style);
+                    match seg.symbolImage {
+                        Some(sym) -> {
+                            let symSz = nsImageSize(sym);
+                            let drawX = x + cellGet(seg.leftPad) + (cellGet(seg.contentWidth) - symSz.w) / 2.0;
+                            let drawY = 9.0 - symSz.h / 2.0;
+                            drawTintedSymbol(sym, cgRect(drawX, drawY, symSz.w, symSz.h), fg)
+                        },
+                        None -> {
+                            let dt = cellGet(seg.displayText);
+                            if (strLen(dt) > 0) {
+                                let capH = nsFontCapHeight(seg.font);
+                                let desc = nsFontDescender(seg.font);
+                                let drawY = roundFloat((9.0 - capH / 2.0 + desc) * 2.0) / 2.0;
+                                nsTextDrawAt(dt, x + cellGet(seg.leftPad), drawY, seg.font, fg)
+                            } else ()
+                        },
+                    }
+                },
+                _ -> (),
+            };
+            cellSet(di, idxD + 1)
+        };
+        true
+    });
+    nsImageSetTemplate(img, false);
+    StatusRenderOutput {
+        image: img,
+        workspaceRegions: workspaceRegions,
+    }
+}

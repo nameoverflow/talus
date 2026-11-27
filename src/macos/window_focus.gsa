@@ -1,0 +1,110 @@
+/// Window focus activation preserving Talus's macOS focus invariants:
+/// - Read-only `_SLPSGetFrontProcess` + `GetProcessPID` via `sys.ffi` to detect real frontmost PID
+/// - Normal path: `AXMain` + `AXRaise`; omit `AXFrontmost` when target PID is already frontmost
+/// - Fallback / `TALUS_LEGACY_FOCUS=1` path: full sequence including `AXFocused` and `NSRunningApplication.activate`
+
+use std.option.{Option, Some, None}
+use sys.ffi.{dlOpen, dlSym}
+use objc.{objcClass, objcSel, withId, nsString, msgSend1Int, msgSend1I64}
+use macos.ffi.{
+    c_AXUIElementSetAttributeValue, c_AXUIElementPerformAction,
+    kAXErrorSuccess, cfBooleanTrue, msgSendBool1I64
+}
+
+extern ptr def callGetFrontProcess(fp: Ptr, outPsn: ScopedPtr): Int
+extern ptr def callGetProcessPID(fp: Ptr, psn: ScopedPtr, outPid: ScopedPtr): Int
+
+pub def frontmostPid(): Option Int =
+    match dlOpen("/System/Library/Frameworks/Carbon.framework/Carbon") {
+        None -> None,
+        Some(lib) -> match (dlSym(lib, "_SLPSGetFrontProcess"), dlSym(lib, "GetProcessPID")) {
+            (Some(gf), Some(gp)) if (!ptrIsNull(gf) && !ptrIsNull(gp)) ->
+                withAlloca(8, (psnBuf) ->
+                    withAlloca(4, (pidBuf) -> {
+                        scopedPtrWriteI32Le(psnBuf, 0, 0);
+                        scopedPtrWriteI32Le(psnBuf, 4, 0);
+                        scopedPtrWriteI32Le(pidBuf, 0, 0);
+                        let r1 = callGetFrontProcess(gf, psnBuf);
+                        if (r1 == 0) {
+                            let r2 = callGetProcessPID(gp, psnBuf, pidBuf);
+                            if (r2 == 0) Some(scopedPtrReadI32Le(pidBuf, 0)) else None
+                        } else None
+                    })
+                ),
+            _ -> None,
+        },
+    }
+
+pub def isFrontmostPid(pid: Int): Bool =
+    match frontmostPid() {
+        Some(actual) -> actual == pid,
+        None -> false,
+    }
+
+/// Activate an application by PID using `NSRunningApplication.runningApplicationWithProcessIdentifier:`.
+pub def activateRunningAppPid(pid: Int): Void = {
+    let cls = objcClass("NSRunningApplication");
+    if (!ptrIsNull(cls)) {
+        let app = msgSend1Int(cls, objcSel("runningApplicationWithProcessIdentifier:"), pid);
+        if (!ptrIsNull(app)) {
+            // activateWithOptions:0 (standard activate)
+            let _ = msgSendBool1I64(app, objcSel("activateWithOptions:"), intToI64(0));
+            ()
+        } else ()
+    } else ()
+}
+
+/// Request focus for `window` belonging to `app` (`pid`).
+/// Returns `true` if the non-legacy fast path succeeded, `false` if legacy fallback ran.
+pub def requestWindowFocus(
+    window: ForeignPtr,
+    app: ForeignPtr,
+    pid: Int,
+    legacy: Bool,
+    onLegacyActivate: Int -> Void
+): Bool = {
+    let sMain = nsString("AXMain");
+    let sRaise = nsString("AXRaise");
+    let sFront = nsString("AXFrontmost");
+    let sFocused = nsString("AXFocused");
+    let kTrue = cfBooleanTrue();
+
+    let fastOk = if (!legacy) {
+        let mainErr = withForeignPtr(window, (wp) ->
+            withId(sMain, (mp) -> c_AXUIElementSetAttributeValue(wp, mp, kTrue))
+        );
+        let raiseErr = withForeignPtr(window, (wp) ->
+            withId(sRaise, (rp) -> c_AXUIElementPerformAction(wp, rp))
+        );
+        if (mainErr == kAXErrorSuccess() && raiseErr == kAXErrorSuccess()) {
+            if (isFrontmostPid(pid)) true
+            else {
+                let frontErr = withForeignPtr(app, (ap) ->
+                    withId(sFront, (fp) -> c_AXUIElementSetAttributeValue(ap, fp, kTrue))
+                );
+                frontErr == kAXErrorSuccess()
+            }
+        } else false
+    } else false;
+
+    if (fastOk) true
+    else {
+        let _ = withForeignPtr(window, (wp) ->
+            withId(sMain, (mp) -> c_AXUIElementSetAttributeValue(wp, mp, kTrue))
+        );
+        let _ = withForeignPtr(window, (wp) ->
+            withId(sFocused, (fp) -> c_AXUIElementSetAttributeValue(wp, fp, kTrue))
+        );
+        let _ = withForeignPtr(window, (wp) ->
+            withId(sRaise, (rp) -> c_AXUIElementPerformAction(wp, rp))
+        );
+        let _ = withForeignPtr(app, (ap) ->
+            withId(sFront, (fp) -> c_AXUIElementSetAttributeValue(ap, fp, kTrue))
+        );
+        onLegacyActivate(pid);
+        let _ = withForeignPtr(window, (wp) ->
+            withId(sRaise, (rp) -> c_AXUIElementPerformAction(wp, rp))
+        );
+        false
+    }
+}

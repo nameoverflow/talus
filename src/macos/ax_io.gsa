@@ -1,0 +1,277 @@
+/// Accessibility window geometry I/O:
+/// - Batch `AXUIElementCopyMultipleAttributeValues` frame reads with fallback
+/// - `withoutAXAnimations`: temporarily disables/restores `AXEnhancedUserInterface`
+/// - `axSetFrame`: position-only fast path, size->position->size sequence, read-back + 16ms settle retry.
+
+use std.option.{Option, Some, None}
+use std.math.abs
+use std.task.sleepMs
+use objc.{objcClass, objcSel, idAdopt, withId, nsString, msgSend0}
+use layout.{Rect, rectNew}
+use macos.ffi.{
+    c_AXUIElementCopyAttributeValue, c_AXUIElementCopyMultipleAttributeValues,
+    c_AXUIElementSetAttributeValue, c_AXUIElementSetAttributeValueScoped,
+    c_AXUIElementGetPid, c_AXUIElementCreateApplication, c_AXUIElementSetMessagingTimeout,
+    c_AXValueGetTypeID, c_AXValueCreate, c_AXValueGetValue, c_AXValueGetValueRaw,
+    c_CFGetTypeID, c_CFArrayGetCount, c_CFArrayGetValueAtIndex,
+    kAXErrorSuccess, kAXErrorFailure, kAXErrorCannotComplete, kAXErrorInvalidUIElement,
+    kAXValueTypeCGPoint, kAXValueTypeCGSize,
+    cfAdopt, cfAdoptOpt, cfBooleanTrue, cfBooleanFalse, cfValueAsBool, cfValueAsString,
+    readPtrAt, axCreateApplication
+}
+
+extern "objc_msgSend" def c_arrAddScoped(arr: ScopedPtr, sel: Ptr, item: ScopedPtr): Void
+
+pub def axValue(el: ForeignPtr, attrName: String): Option ForeignPtr = {
+    let attr = nsString(attrName);
+    withForeignPtr(el, (ep) ->
+        withId(attr, (ap) ->
+            withAlloca(8, (outBuf) -> {
+                scopedPtrWriteI64Le(outBuf, intToI64(0), intToI64(0));
+                let err = c_AXUIElementCopyAttributeValue(ep, ap, outBuf);
+                if (err == kAXErrorSuccess()) cfAdoptOpt(readPtrAt(outBuf, 0))
+                else None
+            })
+        )
+    )
+}
+
+pub def axCopyString(el: ForeignPtr, attrName: String): Option String =
+    match axValue(el, attrName) {
+        Some(v) -> cfValueAsString(v),
+        None -> None,
+    }
+
+pub def axCopyBool(el: ForeignPtr, attrName: String): Option Bool =
+    match axValue(el, attrName) {
+        Some(v) -> cfValueAsBool(v),
+        None -> None,
+    }
+
+pub def axGetFrame(el: ForeignPtr): Option Rect = {
+    // Batch read [AXPosition, AXSize] via owned +1 NSMutableArray (toll-free bridged to CFArray)
+    let attrs = idAdopt(msgSend0(msgSend0(objcClass("NSMutableArray"), objcSel("alloc")), objcSel("init")));
+    let sPos = nsString("AXPosition");
+    let sSize = nsString("AXSize");
+    withId(attrs, (ap) -> {
+        withId(sPos, (pp) -> c_arrAddScoped(ap, objcSel("addObject:"), pp));
+        withId(sSize, (sp) -> c_arrAddScoped(ap, objcSel("addObject:"), sp))
+    });
+    let batchRes: (Int, Option ForeignPtr) = withForeignPtr(el, (ep) ->
+        withId(attrs, (ap) ->
+            withAlloca(8, (outBuf) -> {
+                scopedPtrWriteI64Le(outBuf, intToI64(0), intToI64(0));
+                let err = c_AXUIElementCopyMultipleAttributeValues(ep, ap, 0, outBuf);
+                (err, cfAdoptOpt(readPtrAt(outBuf, 0)))
+            })
+        )
+    );
+    let (err, batchOpt) = batchRes;
+    if (err == kAXErrorCannotComplete() || err == kAXErrorInvalidUIElement()) None
+    else {
+        let axValType = c_AXValueGetTypeID();
+        let pairFromBatch: Option (Float, Float, Float, Float) = match batchOpt {
+            Some(batchFp) -> withForeignPtr(batchFp, (bp) ->
+                if (c_CFArrayGetCount(bp) == intToI64(2)) {
+                    let p0 = c_CFArrayGetValueAtIndex(bp, intToI64(0));
+                    let p1 = c_CFArrayGetValueAtIndex(bp, intToI64(1));
+                    if (!ptrIsNull(p0) && !ptrIsNull(p1)) {
+                        withAlloca(16, (ptBuf) ->
+                            withAlloca(16, (szBuf) -> {
+                                let okP = c_AXValueGetValueRaw(p0, kAXValueTypeCGPoint(), ptBuf) != 0;
+                                let okS = c_AXValueGetValueRaw(p1, kAXValueTypeCGSize(), szBuf) != 0;
+                                if (okP && okS) {
+                                    Some((
+                                        scopedPtrReadF64Le(ptBuf, 0),
+                                        scopedPtrReadF64Le(ptBuf, 8),
+                                        scopedPtrReadF64Le(szBuf, 0),
+                                        scopedPtrReadF64Le(szBuf, 8)
+                                    ))
+                                } else None
+                            })
+                        )
+                    } else None
+                } else None
+            ),
+            None -> None,
+        };
+        match pairFromBatch {
+            Some((x, y, w, h)) -> Some(rectNew(x, y, w, h)),
+            None -> {
+                // Fallback to individual attribute reads
+                match (axValue(el, "AXPosition"), axValue(el, "AXSize")) {
+                    (Some(pfp), Some(sfp)) -> withForeignPtr(pfp, (pp) ->
+                        withForeignPtr(sfp, (sp) ->
+                            if (c_CFGetTypeID(pp) == axValType && c_CFGetTypeID(sp) == axValType) {
+                                withAlloca(16, (ptBuf) ->
+                                    withAlloca(16, (szBuf) -> {
+                                        let okP = c_AXValueGetValue(pp, kAXValueTypeCGPoint(), ptBuf) != 0;
+                                        let okS = c_AXValueGetValue(sp, kAXValueTypeCGSize(), szBuf) != 0;
+                                        if (okP && okS) {
+                                            Some(rectNew(
+                                                scopedPtrReadF64Le(ptBuf, 0),
+                                                scopedPtrReadF64Le(ptBuf, 8),
+                                                scopedPtrReadF64Le(szBuf, 0),
+                                                scopedPtrReadF64Le(szBuf, 8)
+                                            ))
+                                        } else None
+                                    })
+                                )
+                            } else None
+                        )
+                    ),
+                    _ -> None,
+                }
+            },
+        }
+    }
+}
+
+pub def matchesFrame(actual: Rect, target: Rect, parking: Bool): Bool =
+    abs(actual.x - target.x) < (if (parking) 3.0 else 1.0)
+        && (parking || abs(actual.y - target.y) < 1.0)
+        && abs(actual.w - target.w) < 1.0
+        && abs(actual.h - target.h) < 1.0
+
+pub def rawSetPosition(el: ForeignPtr, x: Float, y: Float): Int = {
+    let valOpt = withAlloca(16, (buf) -> {
+        scopedPtrWriteF64Le(buf, 0, x);
+        scopedPtrWriteF64Le(buf, 8, y);
+        cfAdoptOpt(c_AXValueCreate(kAXValueTypeCGPoint(), buf))
+    });
+    match valOpt {
+        None -> kAXErrorFailure(),
+        Some(vfp) -> {
+            let attr = nsString("AXPosition");
+            withForeignPtr(el, (ep) ->
+                withId(attr, (ap) ->
+                    withForeignPtr(vfp, (vp) -> c_AXUIElementSetAttributeValueScoped(ep, ap, vp))
+                )
+            )
+        },
+    }
+}
+
+pub def rawSetSize(el: ForeignPtr, w: Float, h: Float): Int = {
+    let valOpt = withAlloca(16, (buf) -> {
+        scopedPtrWriteF64Le(buf, 0, w);
+        scopedPtrWriteF64Le(buf, 8, h);
+        cfAdoptOpt(c_AXValueCreate(kAXValueTypeCGSize(), buf))
+    });
+    match valOpt {
+        None -> kAXErrorFailure(),
+        Some(vfp) -> {
+            let attr = nsString("AXSize");
+            withForeignPtr(el, (ep) ->
+                withId(attr, (ap) ->
+                    withForeignPtr(vfp, (vp) -> c_AXUIElementSetAttributeValueScoped(ep, ap, vp))
+                )
+            )
+        },
+    }
+}
+
+pub data AnimationAccess {
+    AnimationAccess {
+        read: () -> Option Bool,
+        write: Bool -> Int,
+    }
+}
+
+pub def withAnimationGuard(io: AnimationAccess, body: () -> r): r = {
+    let restore = match (io.read)() {
+        Some(true) -> true,
+        _ -> false,
+    };
+    if (restore) {
+        let _ = (io.write)(false);
+        ()
+    } else ();
+    let res = body();
+    if (restore) {
+        // Queue the original value last so accessibility state is not left changed.
+        let _ = (io.write)(true);
+        ()
+    } else ();
+    res
+}
+
+pub def withoutAXAnimations(el: ForeignPtr, body: () -> r): r = {
+    let pid = withForeignPtr(el, (ep) ->
+        withAlloca(4, (buf) -> {
+            scopedPtrWriteI32Le(buf, 0, 0);
+            let _ = c_AXUIElementGetPid(ep, buf);
+            scopedPtrReadI32Le(buf, 0)
+        })
+    );
+    let app = axCreateApplication(pid);
+    let attr = nsString("AXEnhancedUserInterface");
+    let io = AnimationAccess {
+        read: () -> axCopyBool(app, "AXEnhancedUserInterface"),
+        write: (enabled) -> {
+            let bVal = if (enabled) cfBooleanTrue() else cfBooleanFalse();
+            withForeignPtr(app, (ap) ->
+                withId(attr, (atp) -> c_AXUIElementSetAttributeValue(ap, atp, bVal))
+            )
+        },
+    };
+    withAnimationGuard(io, body)
+}
+
+pub def axSetPosition(el: ForeignPtr, x: Float, y: Float): Int =
+    withoutAXAnimations(el, () -> rawSetPosition(el, x, y))
+
+pub data FrameAccess {
+    FrameAccess {
+        read: () -> Option Rect,
+        position: (Float, Float) -> Int,
+        size: (Float, Float) -> Int,
+        settle: () -> Void,
+    }
+}
+
+pub def axSetFrameWithAccess(
+    target: Rect,
+    current: Option Rect,
+    parking: Bool,
+    io: FrameAccess
+): Int = {
+    let sameSize = match current {
+        Some(cur) -> abs(cur.w - target.w) < 1.0 && abs(cur.h - target.h) < 1.0,
+        None -> false,
+    };
+    let err = if (sameSize) {
+        (io.position)(target.x, target.y)
+    } else {
+        let _ = (io.size)(target.w, target.h);
+        let moved = (io.position)(target.x, target.y);
+        let resized = (io.size)(target.w, target.h);
+        if (moved == kAXErrorSuccess()) resized else moved
+    };
+    if (err != kAXErrorSuccess()) err
+    else {
+        let matchedFirst = match (io.read)() {
+            Some(actual) -> matchesFrame(actual, target, parking),
+            None -> false,
+        };
+        if (matchedFirst) kAXErrorSuccess()
+        else {
+            // An AX provider may acknowledge before its next run-loop turn applies position/size.
+            (io.settle)();
+            match (io.read)() {
+                Some(actual2) if (matchesFrame(actual2, target, parking)) -> kAXErrorSuccess(),
+                _ -> kAXErrorCannotComplete(),
+            }
+        }
+    }
+}
+
+pub def axSetFrame(el: ForeignPtr, target: Rect, current: Option Rect, parking: Bool): Int = {
+    let io = FrameAccess {
+        read: () -> axGetFrame(el),
+        position: (x, y) -> rawSetPosition(el, x, y),
+        size: (w, h) -> rawSetSize(el, w, h),
+        settle: () -> sleepMs(16),
+    };
+    withoutAXAnimations(el, () -> axSetFrameWithAccess(target, current, parking, io))
+}

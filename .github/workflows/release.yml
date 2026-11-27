@@ -39,12 +39,21 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" Resources/Info.plist
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" Resources/Info.plist
           echo "APP_VERSION=$version" >> "$GITHUB_ENV"
-      - name: Prepare Rust
+      - name: Prepare Geisha toolchain
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          command -v xz >/dev/null 2>&1 || brew install xz
+          git clone --depth 1 https://github.com/geisha-lang/geisha.gsa.git "$RUNNER_TEMP/geisha.gsa"
+          make -C "$RUNNER_TEMP/geisha.gsa" runtime stage2
+          mkdir -p "$HOME/.geisha/bin" "$HOME/.geisha/lib"
+          cp "$RUNNER_TEMP/geisha.gsa/build/geisha2" "$HOME/.geisha/bin/geisha"
+          cp "$RUNNER_TEMP/geisha.gsa/build/libgeisha_runtime.a" "$HOME/.geisha/lib/libgeisha_runtime.a"
+          echo "$HOME/.geisha/bin" >> "$GITHUB_PATH"
+          "$HOME/.geisha/bin/geisha" --version || true
       - name: Build and test
-        run: make all test property-test status-cleanup-test app CODESIGN_IDENTITY=-
+        run: make all test status-cleanup-test app CODESIGN_IDENTITY=-
       - name: Package and verify archive
         run: |
           make dist

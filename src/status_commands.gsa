@@ -1,0 +1,369 @@
+/// Background status command runner using `sys.proc` (`spawn`, process-group signals,
+/// 4KB capped stdout capture with full drain to prevent SIGPIPE/blocking).
+
+use std.option.{Option, Some, None}
+use std.result.{Ok, Err}
+use std.list.{listFilter}
+use std.buf.{bufNew, bufPushPtr, bufToString}
+use std.sync.{
+    MVar, mvarNew, mvarTake, mvarPut, mvarRead,
+    AtomicInt, atomicNew, atomicLoad, atomicStore,
+    Chan, chanSend
+}
+use std.task.{spawn as spawnTask, sleepMs}
+use sys.time.{monotonicMs}
+use sys.proc.{
+    Stdio, Inherit, Null, Piped,
+    Signal, SigTerm, SigKill,
+    Child, Pipe, ExitStatus, Exited,
+    command, cmdEnv, cmdStdio, cmdOwnGroup,
+    spawn as procSpawn, childTryWait, childWait, childSignal,
+    pipeReadPtr, pipeClose
+}
+use config.{StatusCommand, expandTilde}
+use util.{minInt, maxFloat, strTrimCrLf}
+
+data CommandSlot {
+    index: Int,
+    nextRunMs: Option Int64,
+    text: String,
+    runningChild: Option Child,
+}
+
+pub data StatusCommandsEngine {
+    slots: MVar (List CommandSlot),
+    stopped: AtomicInt,
+    stateFile: Option String,
+    stateJson: MVar (Option String),
+    /// Optional `Send` notification channel signaled whenever a command output changes.
+    onChange: MVar (Option (Chan Int)),
+}
+
+pub def statusCommandsNew(stateFile: Option String, onChange: Option (Chan Int)): StatusCommandsEngine =
+    StatusCommandsEngine {
+        slots: mvarNew(Nil),
+        stopped: atomicNew(0),
+        stateFile: stateFile,
+        stateJson: mvarNew(None),
+        onChange: mvarNew(onChange),
+    }
+
+pub def statusCommandsSetOnChange(eng: StatusCommandsEngine, ch: Option (Chan Int)): Void = {
+    let _ = mvarTake(eng.onChange);
+    mvarPut(eng.onChange, ch)
+}
+
+pub def statusCommandsSetStateJson(eng: StatusCommandsEngine, json: Option String): Void = {
+    let _ = mvarTake(eng.stateJson);
+    mvarPut(eng.stateJson, json)
+}
+
+pub def statusCommandsGetStateJson(eng: StatusCommandsEngine): Option String =
+    mvarRead(eng.stateJson)
+
+def findSlot(slots: List CommandSlot, index: Int): Option CommandSlot = {
+    let cur = cellNew(slots);
+    let res: Cell (Option CommandSlot) = cellNew(None);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match cellGet(cur) {
+            Nil -> cellSet(running, false),
+            Cons(s, r) ->
+                if (s.index == index) { cellSet(res, Some(s)); cellSet(running, false) }
+                else cellSet(cur, r),
+        }
+    };
+    cellGet(res)
+}
+
+def upsertSlot(slots: List CommandSlot, slot: CommandSlot): List CommandSlot =
+    Cons(slot, listFilter(slots, (s: CommandSlot) -> s.index != slot.index))
+
+def notifyEngine(cbBox: MVar (Option (Chan Int)), stoppedFlag: AtomicInt): Void =
+    if (atomicLoad(stoppedFlag) != 0) ()
+    else match mvarRead(cbBox) {
+        Some(ch) -> { let _ = chanSend(ch, 1); () },
+        None -> (),
+    }
+
+/// Read up to 4096 bytes from `p` and continue draining until EOF so the child never blocks/SIGPIPEs.
+def readCappedAndDrain(p: Pipe): String = {
+    let chunk = ptrAllocBytes(1024);
+    let out = bufNew();
+    let kept = cellNew(0);
+    let reading = cellNew(true);
+    while (cellGet(reading)) {
+        match pipeReadPtr(p, chunk, 1024) {
+            Ok(n) if (n > 0) -> {
+                let rem = 4096 - cellGet(kept);
+                if (rem > 0) {
+                    let take = minInt(n, rem);
+                    bufPushPtr(out, chunk, take);
+                    cellSet(kept, cellGet(kept) + take)
+                } else ()
+            },
+            _ -> cellSet(reading, false),
+        }
+    };
+    pipeClose(p);
+    bufToString(out)
+}
+
+pub def statusCommandsValue(eng: StatusCommandsEngine, index: Int, block: StatusCommand): String = {
+    let isStopped = atomicLoad(eng.stopped) != 0;
+    let curSlots = mvarTake(eng.slots);
+    let slot = match findSlot(curSlots, index) {
+        Some(s) -> s,
+        None -> CommandSlot { index: index, nextRunMs: None, text: "", runningChild: None },
+    };
+    if (isStopped) {
+        mvarPut(eng.slots, upsertSlot(curSlots, slot));
+        slot.text
+    } else {
+        let nowMs = monotonicMs();
+        let isIdle = match slot.runningChild { None -> true, Some(_) -> false };
+        let due = match slot.nextRunMs {
+            None -> true,
+            Some(nr) -> nowMs >= nr,
+        };
+        let currentText = slot.text;
+        if (isIdle && due) {
+            let intervalSecs = maxFloat(match block.interval { Some(v) -> v, None -> 10.0 }, 0.1);
+            let intervalMs = intToI64(floatToInt(intervalSecs * 1000.0));
+            let timeoutSecs = maxFloat(match block.timeout { Some(v) -> v, None -> 2.0 }, 0.05);
+            let timeoutMs = intToI64(floatToInt(timeoutSecs * 1000.0));
+            let nextDue = nowMs + intervalMs;
+
+            let args = match block.arguments { Some(a) -> a, None -> Nil };
+            let envRev: Cell (List (String, String)) = cellNew(Nil);
+            match eng.stateFile {
+                Some(sf) if (strLen(sf) > 0) ->
+                    cellSet(envRev, Cons(("TALUS_STATUS_FILE", expandTilde(sf, None)), cellGet(envRev))),
+                _ -> (),
+            };
+            match mvarRead(eng.stateJson) {
+                Some(js) -> cellSet(envRev, Cons(("TALUS_STATUS_JSON", js), cellGet(envRev))),
+                None -> (),
+            };
+            let cmd0 = command(block.executable, args);
+            let cmd1 = cmdEnv(cmd0, cellGet(envRev));
+            let cmd2 = cmdStdio(cmd1, Null, Piped, Null);
+            let cmd = cmdOwnGroup(cmd2, true);
+
+            match procSpawn(cmd) {
+                Err(_) -> {
+                    let clearedSlot = CommandSlot {
+                        index: index,
+                        nextRunMs: Some(nextDue),
+                        text: "",
+                        runningChild: None,
+                    };
+                    mvarPut(eng.slots, upsertSlot(curSlots, clearedSlot));
+                    if (strLen(currentText) > 0) notifyEngine(eng.onChange, eng.stopped) else ();
+                    currentText
+                },
+                Ok(child) -> {
+                    let runningSlot = CommandSlot {
+                        index: index,
+                        nextRunMs: Some(nextDue),
+                        text: currentText,
+                        runningChild: Some(child),
+                    };
+                    mvarPut(eng.slots, upsertSlot(curSlots, runningSlot));
+
+                    let capturedBox: MVar String = mvarNew("");
+                    match child.stdout {
+                        Some(p) -> {
+                            let _ = spawnTask(() -> {
+                                let raw = readCappedAndDrain(p);
+                                let _ = mvarTake(capturedBox);
+                                mvarPut(capturedBox, raw)
+                            });
+                            ()
+                        },
+                        None -> (),
+                    };
+
+                    let slotsRef = eng.slots;
+                    let stoppedRef = eng.stopped;
+                    let cbRef = eng.onChange;
+                    let childPid = child.pid;
+                    let _ = spawnTask(() -> {
+                        let startMs = monotonicMs();
+                        let timedOut = cellNew(false);
+                        let exitOpt: Cell (Option ExitStatus) = cellNew(None);
+                        let polling = cellNew(true);
+                        let aborted = cellNew(false);
+
+                        while (cellGet(polling)) {
+                            match childTryWait(child) {
+                                Ok(Some(st)) -> {
+                                    cellSet(exitOpt, Some(st));
+                                    cellSet(polling, false)
+                                },
+                                Ok(None) -> {
+                                    if (atomicLoad(stoppedRef) != 0) {
+                                        let _ = childSignal(child, SigKill);
+                                        let _ = childWait(child);
+                                        cellSet(aborted, true);
+                                        cellSet(polling, false)
+                                    } else {
+                                        let elapsed = monotonicMs() - startMs;
+                                        if (elapsed >= timeoutMs) {
+                                            if (!cellGet(timedOut)) {
+                                                cellSet(timedOut, true);
+                                                let _ = childSignal(child, SigTerm);
+                                                ()
+                                            } else if (elapsed >= timeoutMs + intToI64(500)) {
+                                                let _ = childSignal(child, SigKill);
+                                                let _ = childWait(child);
+                                                cellSet(polling, false)
+                                            } else ()
+                                        } else ();
+                                        if (cellGet(polling)) sleepMs(15) else ()
+                                    }
+                                },
+                                Err(_) -> cellSet(polling, false),
+                            }
+                        };
+
+                        if (cellGet(aborted)) ()
+                        else {
+                            sleepMs(20);
+                            let succeeded = !cellGet(timedOut) && (match cellGet(exitOpt) {
+                                Some(Exited(0)) -> true,
+                                _ -> false,
+                            });
+                            let newText = if (succeeded) strTrimCrLf(mvarRead(capturedBox)) else "";
+
+                            let sList = mvarTake(slotsRef);
+                            let changed = cellNew(false);
+                            let wakeMs: Cell (Option Int64) = cellNew(None);
+                            match findSlot(sList, index) {
+                                Some(sl) -> match sl.runningChild {
+                                    Some(rc) if (rc.pid == childPid) -> {
+                                        if (sl.text != newText) cellSet(changed, true) else ();
+                                        let updatedSlot = CommandSlot {
+                                            index: index,
+                                            nextRunMs: sl.nextRunMs,
+                                            text: newText,
+                                            runningChild: None,
+                                        };
+                                        mvarPut(slotsRef, upsertSlot(sList, updatedSlot));
+                                        let delay = match sl.nextRunMs {
+                                            Some(nr) -> {
+                                                let now2 = monotonicMs();
+                                                if (nr > now2) nr - now2 else intToI64(10)
+                                            },
+                                            None -> intervalMs,
+                                        };
+                                        cellSet(wakeMs, Some(delay))
+                                    },
+                                    _ -> mvarPut(slotsRef, sList),
+                                },
+                                None -> mvarPut(slotsRef, sList),
+                            };
+
+                            if (cellGet(changed)) notifyEngine(cbRef, stoppedRef) else ();
+
+                            match cellGet(wakeMs) {
+                                Some(delay) -> {
+                                    let _ = spawnTask(() -> {
+                                        // Sleep in small increments so stop_all exits quickly
+                                        let target = monotonicMs() + delay;
+                                        while (monotonicMs() < target && atomicLoad(stoppedRef) == 0) {
+                                            let rem = i64ToInt(target - monotonicMs());
+                                            sleepMs(if (rem > 50) 50 else if (rem > 0) rem else 1)
+                                        };
+                                        if (atomicLoad(stoppedRef) == 0) {
+                                            let sList2 = mvarRead(slotsRef);
+                                            let idleNow = match findSlot(sList2, index) {
+                                                Some(sl) -> match sl.runningChild { None -> true, Some(_) -> false },
+                                                None -> false,
+                                            };
+                                            if (idleNow) notifyEngine(cbRef, stoppedRef) else ()
+                                        } else ()
+                                    });
+                                    ()
+                                },
+                                None -> (),
+                            }
+                        }
+                    });
+                    currentText
+                },
+            }
+        } else {
+            mvarPut(eng.slots, upsertSlot(curSlots, slot));
+            currentText
+        }
+    }
+}
+
+pub def statusCommandsStateChanged(eng: StatusCommandsEngine, commands: List StatusCommand): Void = {
+    let sList = mvarTake(eng.slots);
+    let updated = cellNew(sList);
+    let cur = cellNew(commands);
+    let idx = cellNew(0);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(cmd, r) -> {
+                let i = cellGet(idx);
+                match cmd.onChange {
+                    Some(true) -> match findSlot(cellGet(updated), i) {
+                        Some(sl) -> cellSet(updated, upsertSlot(cellGet(updated), CommandSlot {
+                            index: sl.index,
+                            nextRunMs: None,
+                            text: sl.text,
+                            runningChild: sl.runningChild,
+                        })),
+                        None -> (),
+                    },
+                    _ -> (),
+                };
+                cellSet(idx, i + 1);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    mvarPut(eng.slots, cellGet(updated))
+}
+
+pub def statusCommandsIsRunning(eng: StatusCommandsEngine, index: Int): Bool =
+    match findSlot(mvarRead(eng.slots), index) {
+        Some(sl) -> match sl.runningChild { Some(_) -> true, None -> false },
+        None -> false,
+    }
+
+pub def statusCommandsStopAll(eng: StatusCommandsEngine): Void = {
+    atomicStore(eng.stopped, 1);
+    let _ = mvarTake(eng.onChange);
+    mvarPut(eng.onChange, None);
+    let sList = mvarTake(eng.slots);
+    let nextRev: Cell (List CommandSlot) = cellNew(Nil);
+    let cur = cellNew(sList);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(sl, r) -> {
+                match sl.runningChild {
+                    Some(ch) -> {
+                        let _ = childSignal(ch, SigKill);
+                        let _ = childWait(ch);
+                        ()
+                    },
+                    None -> (),
+                };
+                cellSet(nextRev, Cons(CommandSlot {
+                    index: sl.index,
+                    nextRunMs: sl.nextRunMs,
+                    text: sl.text,
+                    runningChild: None,
+                }, cellGet(nextRev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    mvarPut(eng.slots, cellGet(nextRev))
+}

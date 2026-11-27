@@ -1,0 +1,348 @@
+/// Verification suite for Talus macOS native & Actor executor layer (`tests/macos_tests.gsa`).
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listLen}
+use std.str.intToStr
+use std.sync.{Chan, chanUnbounded, chanRecv, mvarPut}
+use std.task.{sleepMs}
+use sys.io.eprintLn
+use sys.proc.exit
+use objc.{withAutoreleasePool}
+
+use util.{floatNear, listNthOpt}
+use layout.{Rect, rectNew}
+use config.{Configuration, defaultConfig}
+use status_markup.{
+    SpaceEntry, StatusValues, templateStatusParts, statusWorkspaceIndex
+}
+use macos.ffi.{kAXErrorSuccess, kAXErrorCannotComplete}
+use macos.ax_io.{
+    AnimationAccess, withAnimationGuard,
+    FrameAccess, axSetFrameWithAccess, matchesFrame
+}
+use macos.spaces.{RawSpaceItem, parseSpaceEntries}
+use macos.launch_at_login.{
+    LoginStatus, LoginNotRegistered, LoginEnabled, LoginRequiresApproval, LoginNotFound,
+    loginStatusEq, LaunchAtLoginService, launchAtLoginNew,
+    launchAtLoginStatus, launchAtLoginError, launchAtLoginIsEnabled, launchAtLoginNeedsApproval,
+    launchAtLoginSetEnabled, launchAtLoginRefresh
+}
+use macos.executor.{
+    WindowGoal, TestApplyMsg, ApplyTestChannel,
+    windowExecutorNew, executorSubmit, executorCancelFocus,
+    executorPumpLocalEvents, executorSetOnSettled, executorFinishSynchronously,
+    executorHasPendingGeometry, executorHasPendingFocus,
+    executorSubmittedCount, executorAppliedCount
+}
+use macos.appkit.{nsImageSize}
+use status_render.{makeStatusIcon, renderConfiguredStatus}
+
+def assertTrue(label: String, ok: Bool): Result Void String =
+    if (ok) Ok(()) else Err("ASSERT FAILED: " + label)
+
+def testAxIO(): Result Void String = {
+    // 1. Animation guard restores AXEnhancedUserInterface when enabled
+    let writes: Cell (List Bool) = cellNew(Nil);
+    let io1 = AnimationAccess {
+        read: () -> Some(true),
+        write: (b) -> { cellSet(writes, Cons(b, cellGet(writes))); kAXErrorSuccess() },
+    };
+    let res1 = withAnimationGuard(io1, () -> 42);
+    assertTrue("anim guard return value", res1 == 42)?;
+    assertTrue("anim guard wrote false then true", match cellGet(writes) {
+        Cons(true, Cons(false, Nil)) -> true,
+        _ -> false,
+    })?;
+
+    // 2. Animation guard does nothing when initially false
+    let writes2: Cell (List Bool) = cellNew(Nil);
+    let io2 = AnimationAccess {
+        read: () -> Some(false),
+        write: (b) -> { cellSet(writes2, Cons(b, cellGet(writes2))); kAXErrorSuccess() },
+    };
+    let _ = withAnimationGuard(io2, () -> ());
+    assertTrue("anim guard skips write when already false", listLen(cellGet(writes2)) == 0)?;
+
+    // 3. axSetFrameWithAccess: same-size fast path skips size()
+    let posCalls = cellNew(0);
+    let sizeCalls = cellNew(0);
+    let settleCalls = cellNew(0);
+    let curRect = cellNew(rectNew(0.0, 0.0, 600.0, 400.0));
+    let targetSameSize = rectNew(100.0, 50.0, 600.0, 400.0);
+    let fa1 = FrameAccess {
+        read: () -> Some(cellGet(curRect)),
+        position: (x, y) -> {
+            cellSet(posCalls, cellGet(posCalls) + 1);
+            let r = cellGet(curRect);
+            cellSet(curRect, rectNew(x, y, r.w, r.h));
+            kAXErrorSuccess()
+        },
+        size: (w, h) -> {
+            cellSet(sizeCalls, cellGet(sizeCalls) + 1);
+            let r = cellGet(curRect);
+            cellSet(curRect, rectNew(r.x, r.y, w, h));
+            kAXErrorSuccess()
+        },
+        settle: () -> cellSet(settleCalls, cellGet(settleCalls) + 1),
+    };
+    let err1 = axSetFrameWithAccess(targetSameSize, Some(rectNew(0.0, 0.0, 600.0, 400.0)), false, fa1);
+    assertTrue("same-size move succeeds", err1 == kAXErrorSuccess())?;
+    assertTrue("same-size skips size calls", cellGet(sizeCalls) == 0 && cellGet(posCalls) == 1)?;
+    assertTrue("same-size no settle needed", cellGet(settleCalls) == 0)?;
+
+    // 4. Delayed read-back settles once and succeeds
+    let reads = cellNew(0);
+    let targetDelayed = rectNew(20.0, 30.0, 800.0, 500.0);
+    let fa2 = FrameAccess {
+        read: () -> {
+            cellSet(reads, cellGet(reads) + 1);
+            if (cellGet(reads) == 1) Some(rectNew(0.0, 0.0, 800.0, 500.0))
+            else Some(targetDelayed)
+        },
+        position: (_x, _y) -> kAXErrorSuccess(),
+        size: (_w, _h) -> kAXErrorSuccess(),
+        settle: () -> cellSet(settleCalls, cellGet(settleCalls) + 1),
+    };
+    let err2 = axSetFrameWithAccess(targetDelayed, None, false, fa2);
+    assertTrue("delayed readback succeeds after settle", err2 == kAXErrorSuccess() && cellGet(settleCalls) == 1)?;
+
+    // 5. Persistent mismatch returns cannotComplete
+    let fa3 = FrameAccess {
+        read: () -> Some(rectNew(0.0, 0.0, 200.0, 200.0)),
+        position: (_x, _y) -> kAXErrorSuccess(),
+        size: (_w, _h) -> kAXErrorSuccess(),
+        settle: () -> (),
+    };
+    let err3 = axSetFrameWithAccess(targetDelayed, None, false, fa3);
+    assertTrue("mismatch returns cannotComplete", err3 == kAXErrorCannotComplete())?;
+
+    // 6. Parking tolerance: X within 3px and Y ignored
+    assertTrue("parking tolerance allows X drift < 3 and ignores Y",
+        matchesFrame(rectNew(1440.5, 999.0, 600.0, 400.0), rectNew(1438.0, 40.0, 600.0, 400.0), true))?;
+    assertTrue("non-parking rejects Y drift",
+        !matchesFrame(rectNew(100.0, 105.0, 600.0, 400.0), rectNew(100.0, 100.0, 600.0, 400.0), false))?;
+
+    Ok(())
+}
+
+def testSpacesParser(): Result Void String = {
+    let raw = [
+        RawSpaceItem { id: intToI64(10), spaceType: 0 },
+        RawSpaceItem { id: intToI64(11), spaceType: 2 }, // ignored non-user space
+        RawSpaceItem { id: intToI64(12), spaceType: 4 }, // fullscreen space
+    ];
+    match parseSpaceEntries(intToI64(12), raw) {
+        None -> Err("expected parsed space entries"),
+        Some(entries) -> {
+            assertTrue("filtered to 2 spaces", listLen(entries) == 2)?;
+            match (listNthOpt(entries, 0), listNthOpt(entries, 1)) {
+                (Some(s0), Some(s1)) -> {
+                    assertTrue("first space desktop non-current", s0.id == intToI64(10) && !s0.isCurrent && !s0.isFullscreen)?;
+                    assertTrue("second space fullscreen current", s1.id == intToI64(12) && s1.isCurrent && s1.isFullscreen)?;
+                    Ok(())
+                },
+                _ -> Err("missing entries"),
+            }
+        },
+    }?;
+    // Missing current returns None
+    assertTrue("missing current returns None", match parseSpaceEntries(intToI64(99), raw) { None -> true, Some(_) -> false })?;
+    Ok(())
+}
+
+def testLaunchAtLogin(): Result Void String = {
+    let st = cellNew(LoginNotFound);
+    let regCalls = cellNew(0);
+    let unregCalls = cellNew(0);
+    let settingsCalls = cellNew(0);
+    let failNext = cellNew(false);
+    let svc = LaunchAtLoginService {
+        status: () -> cellGet(st),
+        register: () -> {
+            cellSet(regCalls, cellGet(regCalls) + 1);
+            if (cellGet(failNext)) Err("permission denied")
+            else { cellSet(st, LoginEnabled); Ok(()) }
+        },
+        unregister: () -> {
+            cellSet(unregCalls, cellGet(unregCalls) + 1);
+            cellSet(st, LoginNotRegistered);
+            Ok(())
+        },
+        openSystemSettings: () -> cellSet(settingsCalls, cellGet(settingsCalls) + 1),
+    };
+    let model = launchAtLoginNew(svc);
+    assertTrue("init does not auto-register", cellGet(regCalls) == 0 && !launchAtLoginIsEnabled(model))?;
+
+    // Enabling from .notFound registers cleanly
+    launchAtLoginSetEnabled(model, true);
+    assertTrue("enable from notFound registers", cellGet(regCalls) == 1 && launchAtLoginIsEnabled(model))?;
+
+    // RequiresApproval opens System Settings instead of re-registering
+    cellSet(st, LoginRequiresApproval);
+    launchAtLoginRefresh(model);
+    assertTrue("needsApproval reflected", launchAtLoginNeedsApproval(model))?;
+    launchAtLoginSetEnabled(model, true);
+    assertTrue("enable while requiresApproval opens settings without register",
+        cellGet(settingsCalls) == 1 && cellGet(regCalls) == 1)?;
+
+    // Disabling from requiresApproval calls unregister
+    launchAtLoginSetEnabled(model, false);
+    assertTrue("disable from requiresApproval unregisters",
+        cellGet(unregCalls) == 1 && loginStatusEq(launchAtLoginStatus(model), LoginNotRegistered))?;
+
+    // Error is recorded cleanly
+    cellSet(failNext, true);
+    launchAtLoginSetEnabled(model, true);
+    assertTrue("error captured", match launchAtLoginError(model) { Some(_) -> true, None -> false })?;
+    Ok(())
+}
+
+def testActorExecutor(): Result Void String = {
+    let ch: Chan TestApplyMsg = chanUnbounded();
+    let ex = windowExecutorNew(ApplyTestChannel(ch), false);
+    let settledCount = cellNew(0);
+    let focusCount = cellNew(0);
+    executorSetOnSettled(ex, () -> cellSet(settledCount, cellGet(settledCount) + 1));
+
+    let g1 = WindowGoal { key: intToI64(101), pid: 5001, target: rectNew(0.0, 0.0, 500.0, 500.0), resizable: true, parking: false };
+    let g2 = WindowGoal { key: intToI64(101), pid: 5001, target: rectNew(10.0, 0.0, 500.0, 500.0), resizable: true, parking: false };
+    let g3 = WindowGoal { key: intToI64(101), pid: 5001, target: rectNew(20.0, 0.0, 500.0, 500.0), resizable: true, parking: false };
+
+    // Submit g1 and hold it in flight on Actor 5001
+    executorSubmit(ex, [g1], Some(intToI64(101)), Some(5001), Some(() -> cellSet(focusCount, cellGet(focusCount) + 1)));
+    let m1Opt = chanRecv(ch);
+    match m1Opt {
+        None -> Err("expected first apply message"),
+        Some(m1) -> {
+            assertTrue("first apply is g1", floatNear(m1.goal.target.x, 0.0, 0.01))?;
+            // While g1 is in flight, submit g2 then g3 -> g2 must be coalesced away!
+            executorSubmit(ex, [g2], None, None, None);
+            executorSubmit(ex, [g3], None, None, None);
+            // Cancel focus before settlement -> focus must NOT run!
+            executorCancelFocus(ex);
+            assertTrue("focus cancelled", !executorHasPendingFocus(ex))?;
+
+            // Release g1
+            mvarPut(m1.reply, kAXErrorSuccess());
+            // Next apply must be g3 (x=20.0), NOT g2 (x=10.0)!
+            match chanRecv(ch) {
+                None -> Err("expected coalesced g3 apply message"),
+                Some(m2) -> {
+                    assertTrue("g2 was coalesced; actor applied g3 directly", floatNear(m2.goal.target.x, 20.0, 0.01))?;
+                    mvarPut(m2.reply, kAXErrorSuccess());
+                    // Drain synchronously and pump local events
+                    executorFinishSynchronously(ex);
+                    executorPumpLocalEvents(ex);
+                    assertTrue("cancelled focus did not run", cellGet(focusCount) == 0)?;
+                    assertTrue("executor applied exactly 2 writes for 3 submits",
+                        executorSubmittedCount(ex) == intToI64(3) && executorAppliedCount(ex) == intToI64(2))?;
+                    assertTrue("no pending geometry after drain", !executorHasPendingGeometry(ex))?;
+                    Ok(())
+                },
+            }
+        },
+    }?;
+
+    // Cross-app parallel test: PID 6001 and PID 6002 both reach channel concurrently before either replies!
+    let pA = WindowGoal { key: intToI64(201), pid: 6001, target: rectNew(0.0, 0.0, 400.0, 400.0), resizable: true, parking: false };
+    let pB = WindowGoal { key: intToI64(202), pid: 6002, target: rectNew(400.0, 0.0, 400.0, 400.0), resizable: true, parking: false };
+    let focusRan2 = cellNew(0);
+    executorSubmit(ex, [pA, pB], Some(intToI64(202)), Some(6002), Some(() -> cellSet(focusRan2, cellGet(focusRan2) + 1)));
+    match (chanRecv(ch), chanRecv(ch)) {
+        (Some(ma), Some(mb)) -> {
+            assertTrue("two distinct PIDs ran concurrently in parallel actors", ma.goal.pid != mb.goal.pid)?;
+            mvarPut(ma.reply, kAXErrorSuccess());
+            mvarPut(mb.reply, kAXErrorSuccess());
+            sleepMs(20);
+            executorPumpLocalEvents(ex);
+            assertTrue("focus ran after all parallel geometry settled", cellGet(focusRan2) == 1)?;
+            executorFinishSynchronously(ex);
+            Ok(())
+        },
+        _ -> Err("expected parallel actor apply messages"),
+    }
+}
+
+def testStatusRender(): Result Void String = withAutoreleasePool(() -> {
+    let icon = makeStatusIcon();
+    let iconSz = nsImageSize(icon);
+    assertTrue("status icon is 18x18", floatNear(iconSz.w, 18.0, 0.01) && floatNear(iconSz.h, 18.0, 0.01))?;
+
+    let spaces = [
+        SpaceEntry { id: intToI64(1), isCurrent: true, isFullscreen: false, windowCount: Some(2) },
+        SpaceEntry { id: intToI64(2), isCurrent: false, isFullscreen: false, windowCount: Some(1) },
+        SpaceEntry { id: intToI64(3), isCurrent: false, isFullscreen: false, windowCount: Some(0) },
+    ];
+    let baseCfg = defaultConfig();
+    let cfg = Configuration {
+        modifiers: baseCfg.modifiers,
+        workspaceMode: baseCfg.workspaceMode,
+        workspaceCount: 3,
+        masterRatio: baseCfg.masterRatio,
+        ratioStep: baseCfg.ratioStep,
+        masterCount: baseCfg.masterCount,
+        outerGap: baseCfg.outerGap,
+        innerGap: baseCfg.innerGap,
+        ignoreApps: baseCfg.ignoreApps,
+        appWorkspaces: baseCfg.appWorkspaces,
+        floatWindows: baseCfg.floatWindows,
+        statusFormat: baseCfg.statusFormat,
+        statusTemplate: Some("%spaces%"),
+        statusShowIcon: true,
+        workspaceCurrent: "<box type=full color=#0A84FF width=1 radius=8><bg=#0A84FF><fc=#FFFFFF>%icon%</fc></bg></box>",
+        workspaceOther: "<fc=#FFFFFF>%icon%</fc>",
+        statusFonts: baseCfg.statusFonts,
+        statusFontSize: baseCfg.statusFontSize,
+        statusCommands: Nil,
+        spaceLabels: ["1", "2", "3"],
+        workspaceIcons: ["terminal", "safari", "folder"],
+        statusTextFile: baseCfg.statusTextFile,
+        statusStateFile: baseCfg.statusStateFile,
+    };
+    let vals = StatusValues {
+        spaces: Some(spaces),
+        spaceLabels: cfg.spaceLabels,
+        spaceIcons: cfg.workspaceIcons,
+        layout: "Tall",
+        paused: false,
+        title: "Terminal",
+        count: 3,
+        custom: "",
+    };
+    let parts = templateStatusParts(cfg, vals, (_) -> "");
+    let out = renderConfiguredStatus(parts, true, true, Some(1));
+    let sz = nsImageSize(out.image);
+    assertTrue("rendered status image has positive width and height 18", sz.w > 40.0 && floatNear(sz.h, 18.0, 0.01))?;
+    assertTrue("rendered status has 3 workspace hit regions", listLen(out.workspaceRegions) == 3)?;
+    match listNthOpt(out.workspaceRegions, 1) {
+        Some(r1) -> {
+            let midX = r1.rect.x + r1.rect.w / 2.0;
+            let hit = statusWorkspaceIndex(midX, 9.0, rectNew(0.0, 0.0, sz.w, 18.0), rectNew(0.0, 0.0, sz.w, 18.0), out.workspaceRegions);
+            assertTrue("hit test hits workspace 1", match hit { Some(1) -> true, _ -> false })
+        },
+        None -> Err("missing hit region 1"),
+    }
+})
+
+def runAll(): Result Void String = {
+    testAxIO()?;
+    printLn("  [PASS] AX geometry I/O, animation guard & read-back settle");
+    testSpacesParser()?;
+    printLn("  [PASS] SkyLight native spaces parser");
+    testLaunchAtLogin()?;
+    printLn("  [PASS] LaunchAtLogin SMAppService model");
+    testActorExecutor()?;
+    printLn("  [PASS] Per-PID Actor WindowExecutor coalescing, parallelism & settlement");
+    testStatusRender()?;
+    printLn("  [PASS] Menu bar vector status icon, rich SF Symbol render & hit regions");
+    Ok(())
+}
+
+def main(): Void = {
+    printLn("Running Talus macOS native & Actor test suite...");
+    match runAll() {
+        Ok(_) -> printLn("All Talus macOS native tests passed!"),
+        Err(e) -> { eprintLn("FAIL: " + e); exit(1) },
+    }
+}

@@ -1,0 +1,117 @@
+/// Verification suite for Talus AppKit SettingsViewModel & UI previews (`tests/settings_tests.gsa`).
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listLen}
+use std.str.{intToStr}
+use sys.fs.{mkdirAll, fileExists, readFile, removeFile, writeFileAtomic}
+use sys.io.eprintLn
+use sys.proc.exit
+use sys.time.{nowMs}
+use objc.{withAutoreleasePool}
+
+use util.{eqStr, listContainsBy, floatNear}
+use config.{Configuration, ConfigResolution, defaultConfig, loadConfigFromPath}
+use macos.launch_at_login.{
+    LoginNotRegistered, LaunchAtLoginService, launchAtLoginNew
+}
+use macos.appkit.{nsImageSize}
+use settings_ui.{
+    parseArgumentLine, settingsViewModelNew,
+    vmBuildConfiguration, vmNotifyChanged, vmToggleModifier,
+    vmApplyTemplatePreset, vmPreviewImage, vmReloadFromExternal,
+    vmModifierSymbolPrefix
+}
+
+def assertTrue(label: String, ok: Bool): Result Void String =
+    if (ok) Ok(()) else Err("ASSERT FAILED: " + label)
+
+def dummyLoginService(): LaunchAtLoginService = LaunchAtLoginService {
+    status: () -> LoginNotRegistered,
+    register: () -> Ok(()),
+    unregister: () -> Ok(()),
+    openSystemSettings: () -> (),
+}
+
+def testArgumentParser(): Result Void String = {
+    let a1 = parseArgumentLine("+%H:%M --label \"hello world\" 'a b'");
+    assertTrue("parsed 4 tokens", listLen(a1) == 4)?;
+    assertTrue("quoted args preserved", match a1 {
+        Cons("+%H:%M", Cons("--label", Cons("hello world", Cons("a b", Nil)))) -> true,
+        _ -> false,
+    })?;
+    Ok(())
+}
+
+def testViewModelSaveAndPresets(): Result Void String = withAutoreleasePool(() -> {
+    let dir = "/tmp/talus-gsa-settings-test-" + intToStr(i64ToInt(nowMs() % intToI64(1_000_000)));
+    let _ = mkdirAll(dir);
+    let cfgPath = dir + "/config.toml";
+    let initToml = "# user header comment\n[layout]\nmaster_ratio = 0.50\n";
+    let _ = writeFileAtomic(cfgPath, initToml);
+
+    let cfg0 = defaultConfig();
+    let res0 = ConfigResolution { loadPath: cfgPath, savePath: cfgPath, migratedFromJson: false };
+    let vm = settingsViewModelNew(cfg0, res0, launchAtLoginNew(dummyLoginService()));
+
+    let appliedCount = cellNew(0);
+    cellSet(vm.onConfigurationApplied, Some((_c, _p) -> cellSet(appliedCount, cellGet(appliedCount) + 1)));
+
+    // Toggle modifiers (at least 1 must remain)
+    vmToggleModifier(vm, "option"); // removes option, leaving ["control"]
+    assertTrue("left with control only", listLen(cellGet(vm.modifiers)) == 1)?;
+    vmToggleModifier(vm, "control"); // cannot remove last modifier
+    assertTrue("cannot remove last modifier", listLen(cellGet(vm.modifiers)) == 1)?;
+    vmToggleModifier(vm, "option"); // re-adds option
+    assertTrue("re-added option modifier", listContainsBy(cellGet(vm.modifiers), "option", eqStr))?;
+    assertTrue("modifier prefix has control+option", vmModifierSymbolPrefix(vm) == "⌃⌥")?;
+
+    // Apply icons preset and verify comment-preserving TOML save
+    vmApplyTemplatePreset(vm, "icons");
+    assertTrue("applied callback ran", cellGet(appliedCount) >= 2)?;
+    assertTrue("config file saved", fileExists(cfgPath))?;
+    match readFile(cfgPath) {
+        Ok(raw) -> assertTrue("preserved user header comment on save", util.strContains(raw, "# user header comment")),
+        Err(e) -> Err("read saved config failed: " + e),
+    }?;
+    match loadConfigFromPath(cfgPath) {
+        Ok(reloaded) -> {
+            assertTrue("reloaded modifiers include control", listContainsBy(reloaded.modifiers, "control", eqStr))?;
+            assertTrue("reloaded workspaceIcons populated", listLen(reloaded.workspaceIcons) == 5)?;
+            Ok(())
+        },
+        Err(e) -> Err("reload saved config failed: " + e),
+    }?;
+
+    // Live menu bar preview renders in both dark & light modes
+    let darkImg = vmPreviewImage(vm, true);
+    let lightImg = vmPreviewImage(vm, false);
+    let dSz = nsImageSize(darkImg);
+    let lSz = nsImageSize(lightImg);
+    assertTrue("dark preview image valid", dSz.w > 40.0 && floatNear(dSz.h, 18.0, 0.01))?;
+    assertTrue("light preview image valid", lSz.w > 40.0 && floatNear(lSz.h, 18.0, 0.01))?;
+
+    // External reload does not fire onConfigurationApplied
+    let beforeReload = cellGet(appliedCount);
+    vmReloadFromExternal(vm, defaultConfig(), res0);
+    assertTrue("external reload suppressed auto-save", cellGet(appliedCount) == beforeReload)?;
+
+    let _ = removeFile(cfgPath);
+    Ok(())
+})
+
+def runAll(): Result Void String = {
+    testArgumentParser()?;
+    printLn("  [PASS] argument line parsing");
+    testViewModelSaveAndPresets()?;
+    printLn("  [PASS] SettingsViewModel modifiers, presets, TOML comment preservation & previews");
+    Ok(())
+}
+
+def main(): Void = {
+    printLn("Running Talus SettingsViewModel test suite...");
+    match runAll() {
+        Ok(_) -> printLn("All Talus SettingsViewModel tests passed!"),
+        Err(e) -> { eprintLn("FAIL: " + e); exit(1) },
+    }
+}

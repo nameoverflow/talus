@@ -1,0 +1,928 @@
+/// XMonad-inspired virtual workspace state machine and JSON session persistence.
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listLen, listRev, listAppend, listMap, listFilter, listAny}
+use std.str.{intToStr, parseInt}
+use std.math.{abs}
+use std.codec.{Value, VNull, VBool, VInt, VFloat, VStr, VArr, VObj}
+use std.json.{parse as jsonParse, stringify as jsonStringify}
+use std.path.{pathDirname}
+use sys.fs.{readFile, writeFileAtomicMode, mkdirAll}
+use sys.env.{getEnv}
+use util.{
+    clampInt, clampFloat, i64ToFloat, strTrimEndSlash, listContainsBy,
+    listIndexOfBy, listNthOpt, listReplaceAt, listRemoveAt, listInsertAt,
+    listUniqueBy, listSortBy, listTake, strLessEq, listEqualsBy, optEqBy
+}
+
+pub data WorkspaceLayoutState {
+    layoutMode: Int,
+    ratio: Float,
+    masters: Int,
+}
+
+pub instance Eq WorkspaceLayoutState {
+    def eq(a: WorkspaceLayoutState, b: WorkspaceLayoutState): Bool =
+        a.layoutMode == b.layoutMode && a.ratio == b.ratio && a.masters == b.masters
+}
+
+pub def defaultWorkspaceLayoutState(): WorkspaceLayoutState =
+    WorkspaceLayoutState { layoutMode: 0, ratio: 0.5, masters: 1 }
+
+pub data PersistedWindowRect {
+    x: Float,
+    y: Float,
+    width: Float,
+    height: Float,
+}
+
+pub instance Eq PersistedWindowRect {
+    def eq(a: PersistedWindowRect, b: PersistedWindowRect): Bool =
+        a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height
+}
+
+pub data PersistedWorkspaceSession {
+    activeWorkspace: Int,
+    layouts: List WorkspaceLayoutState,
+    workspaceWindowIds: List (List Int),
+    /// Sorted list of `(wsIndexStr, windowId)` pairs.
+    focusedWindowIdByWorkspace: List (String, Int),
+    /// Sorted unique list of floating window IDs.
+    floatingWindowIds: List Int,
+    /// Sorted list of `(widStr, PersistedWindowRect)` pairs.
+    savedFramesByWindowId: List (String, PersistedWindowRect),
+}
+
+pub instance Eq PersistedWorkspaceSession {
+    def eq(a: PersistedWorkspaceSession, b: PersistedWorkspaceSession): Bool =
+        a.activeWorkspace == b.activeWorkspace
+        && listEqualsBy(a.layouts, b.layouts, (x, y) -> x == y)
+        && listEqualsBy(a.workspaceWindowIds, b.workspaceWindowIds, (x, y) -> listEqualsBy(x, y, (i1, i2) -> i1 == i2))
+        && listEqualsBy(a.focusedWindowIdByWorkspace, b.focusedWindowIdByWorkspace, (p1, p2) -> {
+            let (k1, v1) = p1; let (k2, v2) = p2; k1 == k2 && v1 == v2
+        })
+        && listEqualsBy(a.floatingWindowIds, b.floatingWindowIds, (x, y) -> x == y)
+        && listEqualsBy(a.savedFramesByWindowId, b.savedFramesByWindowId, (p1, p2) -> {
+            let (k1, v1) = p1; let (k2, v2) = p2; k1 == k2 && v1 == v2
+        })
+}
+
+pub def emptyPersistedSession(): PersistedWorkspaceSession =
+    PersistedWorkspaceSession {
+        activeWorkspace: 0,
+        layouts: Nil,
+        workspaceWindowIds: Nil,
+        focusedWindowIdByWorkspace: Nil,
+        floatingWindowIds: Nil,
+        savedFramesByWindowId: Nil,
+    }
+
+pub def defaultSessionFilePath(): Option String =
+    match getEnv("HOME") {
+        Some(h) if (strLen(h) > 0) -> Some(strTrimEndSlash(h) + "/Library/Application Support/Talus/session-state.json"),
+        _ -> None,
+    }
+
+pub def buildPersistedSession(
+    activeWorkspace: Int,
+    layouts: List WorkspaceLayoutState,
+    workspaceWindowIds: List (List Int),
+    focusedByWs: List (Int, Int),
+    floatingIds: List Int,
+    savedFrames: List (Int, PersistedWindowRect)
+): PersistedWorkspaceSession = {
+    let focusSorted = listSortBy(
+        listMap(focusedByWs, (p) -> { let (ws, wid) = p; (intToStr(ws), wid) }),
+        (a, b) -> { let (ka, _) = a; let (kb, _) = b; strLessEq(ka, kb) }
+    );
+    let floatSorted = listSortBy(
+        listUniqueBy(floatingIds, (a, b) -> a == b),
+        (a, b) -> a <= b
+    );
+    let framesSorted = listSortBy(
+        listMap(savedFrames, (p) -> { let (wid, r) = p; (intToStr(wid), r) }),
+        (a, b) -> { let (ka, _) = a; let (kb, _) = b; strLessEq(ka, kb) }
+    );
+    PersistedWorkspaceSession {
+        activeWorkspace: activeWorkspace,
+        layouts: layouts,
+        workspaceWindowIds: workspaceWindowIds,
+        focusedWindowIdByWorkspace: focusSorted,
+        floatingWindowIds: floatSorted,
+        savedFramesByWindowId: framesSorted,
+    }
+}
+
+pub def sessionFocusedByWs(s: PersistedWorkspaceSession): List (Int, Int) = {
+    let outRev: Cell (List (Int, Int)) = cellNew(Nil);
+    let cur = cellNew(s.focusedWindowIdByWorkspace);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((k, wid), r) -> {
+                match parseInt(k) {
+                    Ok(ws) -> cellSet(outRev, Cons((ws, wid), cellGet(outRev))),
+                    Err(_) -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+pub def sessionSavedFrames(s: PersistedWorkspaceSession): List (Int, PersistedWindowRect) = {
+    let outRev: Cell (List (Int, PersistedWindowRect)) = cellNew(Nil);
+    let cur = cellNew(s.savedFramesByWindowId);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((k, rect), r) -> {
+                match parseInt(k) {
+                    Ok(wid) -> cellSet(outRev, Cons((wid, rect), cellGet(outRev))),
+                    Err(_) -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+def valAsFloat(v: Value): Option Float = match v {
+    VFloat(f) -> Some(f),
+    VInt(i) -> Some(i64ToFloat(i)),
+    _ -> None,
+}
+
+def valAsInt(v: Value): Option Int = match v {
+    VInt(i) -> Some(i64ToInt(i)),
+    _ -> None,
+}
+
+def findObjField(fs: List (String, Value), key: String): Option Value = {
+    let cur = cellNew(fs);
+    let res: Cell (Option Value) = cellNew(None);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match cellGet(cur) {
+            Nil -> cellSet(running, false),
+            Cons((k, v), r) ->
+                if (k == key) { cellSet(res, Some(v)); cellSet(running, false) }
+                else cellSet(cur, r),
+        }
+    };
+    cellGet(res)
+}
+
+pub def persistedSessionToJson(s: PersistedWorkspaceSession): String = {
+    let layoutsVal = VArr(listMap(s.layouts, (l: WorkspaceLayoutState) -> VObj([
+        ("layoutMode", VInt(intToI64(l.layoutMode))),
+        ("ratio", VFloat(l.ratio)),
+        ("masters", VInt(intToI64(l.masters))),
+    ])));
+    let wsIdsVal = VArr(listMap(s.workspaceWindowIds, (stack) ->
+        VArr(listMap(stack, (wid) -> VInt(intToI64(wid))))
+    ));
+    let focusVal = VObj(listMap(s.focusedWindowIdByWorkspace, (p) -> {
+        let (k, wid) = p;
+        (k, VInt(intToI64(wid)))
+    }));
+    let floatVal = VArr(listMap(s.floatingWindowIds, (wid) -> VInt(intToI64(wid))));
+    let framesVal = VObj(listMap(s.savedFramesByWindowId, (p: (String, PersistedWindowRect)) -> {
+        let (k, r) = p;
+        (k, VObj([
+            ("x", VFloat(r.x)),
+            ("y", VFloat(r.y)),
+            ("width", VFloat(r.width)),
+            ("height", VFloat(r.height)),
+        ]))
+    }));
+    jsonStringify(VObj([
+        ("activeWorkspace", VInt(intToI64(s.activeWorkspace))),
+        ("layouts", layoutsVal),
+        ("workspaceWindowIDs", wsIdsVal),
+        ("focusedWindowIDByWorkspace", focusVal),
+        ("floatingWindowIDs", floatVal),
+        ("savedFramesByWindowID", framesVal),
+    ]))
+}
+
+pub def persistedSessionFromJson(raw: String): Option PersistedWorkspaceSession =
+    match jsonParse(raw) {
+        Ok(VObj(fs)) -> {
+            let activeWs = match findObjField(fs, "activeWorkspace") {
+                Some(v) -> match valAsInt(v) { Some(n) -> n, None -> 0 },
+                None -> 0,
+            };
+            let layouts = match findObjField(fs, "layouts") {
+                Some(VArr(items)) -> {
+                    let rev: Cell (List WorkspaceLayoutState) = cellNew(Nil);
+                    let cur = cellNew(items);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(VObj(lfs), r) -> {
+                                let lm = match findObjField(lfs, "layoutMode") { Some(v) -> match valAsInt(v) { Some(x) -> x, None -> 0 }, None -> 0 };
+                                let rt = match findObjField(lfs, "ratio") { Some(v) -> match valAsFloat(v) { Some(x) -> x, None -> 0.5 }, None -> 0.5 };
+                                let ms = match findObjField(lfs, "masters") { Some(v) -> match valAsInt(v) { Some(x) -> x, None -> 1 }, None -> 1 };
+                                cellSet(rev, Cons(WorkspaceLayoutState { layoutMode: lm, ratio: rt, masters: ms }, cellGet(rev)));
+                                cellSet(cur, r)
+                            },
+                            Cons(_, r) -> cellSet(cur, r),
+                            Nil -> (),
+                        }
+                    };
+                    listRev(cellGet(rev))
+                },
+                _ -> Nil,
+            };
+            let wsIds = match findObjField(fs, "workspaceWindowIDs") {
+                Some(VArr(rows)) -> listMap(rows, (row) -> match row {
+                    VArr(ids) -> {
+                        let rev: Cell (List Int) = cellNew(Nil);
+                        let cur = cellNew(ids);
+                        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                            match cellGet(cur) {
+                                Cons(v, r) -> {
+                                    match valAsInt(v) { Some(n) -> cellSet(rev, Cons(n, cellGet(rev))), None -> () };
+                                    cellSet(cur, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        listRev(cellGet(rev))
+                    },
+                    _ -> Nil,
+                }),
+                _ -> Nil,
+            };
+            let focused = match findObjField(fs, "focusedWindowIDByWorkspace") {
+                Some(VObj(ffs)) -> {
+                    let rev: Cell (List (String, Int)) = cellNew(Nil);
+                    let cur = cellNew(ffs);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons((k, v), r) -> {
+                                match valAsInt(v) { Some(n) -> cellSet(rev, Cons((k, n), cellGet(rev))), None -> () };
+                                cellSet(cur, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    listSortBy(listRev(cellGet(rev)), (a, b) -> { let (ka, _) = a; let (kb, _) = b; strLessEq(ka, kb) })
+                },
+                _ -> Nil,
+            };
+            let floating = match findObjField(fs, "floatingWindowIDs") {
+                Some(VArr(items)) -> {
+                    let rev: Cell (List Int) = cellNew(Nil);
+                    let cur = cellNew(items);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(v, r) -> {
+                                match valAsInt(v) { Some(n) -> cellSet(rev, Cons(n, cellGet(rev))), None -> () };
+                                cellSet(cur, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    listSortBy(listUniqueBy(listRev(cellGet(rev)), (a, b) -> a == b), (a, b) -> a <= b)
+                },
+                _ -> Nil,
+            };
+            let frames = match findObjField(fs, "savedFramesByWindowID") {
+                Some(VObj(rfs)) -> {
+                    let rev: Cell (List (String, PersistedWindowRect)) = cellNew(Nil);
+                    let cur = cellNew(rfs);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons((k, VObj(obj)), r) -> {
+                                match (findObjField(obj, "x"), findObjField(obj, "y"), findObjField(obj, "width"), findObjField(obj, "height")) {
+                                    (Some(vx), Some(vy), Some(vw), Some(vh)) ->
+                                        match (valAsFloat(vx), valAsFloat(vy), valAsFloat(vw), valAsFloat(vh)) {
+                                            (Some(x), Some(y), Some(w), Some(h)) ->
+                                                cellSet(rev, Cons((k, PersistedWindowRect { x: x, y: y, width: w, height: h }), cellGet(rev))),
+                                            _ -> (),
+                                        },
+                                    _ -> (),
+                                };
+                                cellSet(cur, r)
+                            },
+                            Cons(_, r) -> cellSet(cur, r),
+                            Nil -> (),
+                        }
+                    };
+                    listSortBy(listRev(cellGet(rev)), (a, b) -> { let (ka, _) = a; let (kb, _) = b; strLessEq(ka, kb) })
+                },
+                _ -> Nil,
+            };
+            Some(PersistedWorkspaceSession {
+                activeWorkspace: activeWs,
+                layouts: layouts,
+                workspaceWindowIds: wsIds,
+                focusedWindowIdByWorkspace: focused,
+                floatingWindowIds: floating,
+                savedFramesByWindowId: frames,
+            })
+        },
+        _ -> None,
+    }
+
+pub def loadPersistedSessionFromPath(path: String): Option PersistedWorkspaceSession =
+    match readFile(path) {
+        Ok(raw) -> persistedSessionFromJson(raw),
+        Err(_) -> None,
+    }
+
+pub def savePersistedSessionToPath(s: PersistedWorkspaceSession, path: String): Result Void String = {
+    let dir = pathDirname(path);
+    if (strLen(dir) > 0 && dir != ".") {
+        let _ = mkdirAll(dir)?;
+        ()
+    } else ();
+    writeFileAtomicMode(path, persistedSessionToJson(s), 0o600)
+}
+
+// ---- VirtualWorkspaceEngine (generic over `id: Int64` or `id: a`) ----
+
+pub data VirtualWorkspaceEngine a {
+    count: Cell Int,
+    active: Cell Int,
+    stacks: Cell (List (List a)),
+    focusedByWs: Cell (List (Int, a)),
+    layouts: Cell (List WorkspaceLayoutState),
+    defaultRatio: Cell Float,
+    defaultMasters: Cell Int,
+}
+
+def repeatItem(n: Int, val: a): List a = {
+    let out: Cell (List a) = cellNew(Nil);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        cellSet(out, Cons(val, cellGet(out)));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(out)
+}
+
+pub def vwNew(count: Int, defaultRatio: Float, defaultMasters: Int): VirtualWorkspaceEngine a = {
+    let clamped = clampInt(count, 1, 9);
+    let initLayout = WorkspaceLayoutState { layoutMode: 0, ratio: defaultRatio, masters: defaultMasters };
+    VirtualWorkspaceEngine {
+        count: cellNew(clamped),
+        active: cellNew(0),
+        stacks: cellNew(repeatItem(clamped, Nil)),
+        focusedByWs: cellNew(Nil),
+        layouts: cellNew(repeatItem(clamped, initLayout)),
+        defaultRatio: cellNew(defaultRatio),
+        defaultMasters: cellNew(defaultMasters),
+    }
+}
+
+def wsFocusGet(xs: List (Int, a), ws: Int): Option a = {
+    let cur = cellNew(xs);
+    let res: Cell (Option a) = cellNew(None);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match cellGet(cur) {
+            Nil -> cellSet(running, false),
+            Cons((k, v), r) ->
+                if (k == ws) { cellSet(res, Some(v)); cellSet(running, false) }
+                else cellSet(cur, r),
+        }
+    };
+    cellGet(res)
+}
+
+def wsFocusSet(xs: List (Int, a), ws: Int, val: a): List (Int, a) =
+    Cons((ws, val), listFilter(xs, (p) -> { let (k, _) = p; k != ws }))
+
+def wsFocusRemove(xs: List (Int, a), ws: Int): List (Int, a) =
+    listFilter(xs, (p) -> { let (k, _) = p; k != ws })
+
+pub def vwCount(e: VirtualWorkspaceEngine a): Int = cellGet(e.count)
+pub def vwActive(e: VirtualWorkspaceEngine a): Int = cellGet(e.active)
+pub def vwStacks(e: VirtualWorkspaceEngine a): List (List a) = cellGet(e.stacks)
+pub def vwLayouts(e: VirtualWorkspaceEngine a): List WorkspaceLayoutState = cellGet(e.layouts)
+
+pub def vwStackAt(e: VirtualWorkspaceEngine a, ws: Int): List a =
+    match listNthOpt(cellGet(e.stacks), ws) {
+        Some(st) -> st,
+        None -> Nil,
+    }
+
+pub def vwActiveLayout(e: VirtualWorkspaceEngine a): WorkspaceLayoutState =
+    match listNthOpt(cellGet(e.layouts), cellGet(e.active)) {
+        Some(l) -> l,
+        None -> defaultWorkspaceLayoutState(),
+    }
+
+pub def vwSetActiveLayout(e: VirtualWorkspaceEngine a, l: WorkspaceLayoutState): Void =
+    cellSet(e.layouts, listReplaceAt(cellGet(e.layouts), cellGet(e.active), l))
+
+pub def vwActiveWindows(e: VirtualWorkspaceEngine a): List a =
+    vwStackAt(e, cellGet(e.active))
+
+pub def vwInactiveWindows(e: VirtualWorkspaceEngine a): List a = {
+    let act = cellGet(e.active);
+    let outRev: Cell (List a) = cellNew(Nil);
+    let cur = cellNew(cellGet(e.stacks));
+    let idx = cellNew(0);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(st, r) -> {
+                if (cellGet(idx) != act) {
+                    let cs = cellNew(st);
+                    while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                        match cellGet(cs) {
+                            Cons(id, sr) -> { cellSet(outRev, Cons(id, cellGet(outRev))); cellSet(cs, sr) },
+                            Nil -> (),
+                        }
+                    }
+                } else ();
+                cellSet(idx, cellGet(idx) + 1);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+pub def vwAllWindows(e: VirtualWorkspaceEngine a): List a = {
+    let outRev: Cell (List a) = cellNew(Nil);
+    let cur = cellNew(cellGet(e.stacks));
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(st, r) -> {
+                let cs = cellNew(st);
+                while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                    match cellGet(cs) {
+                        Cons(id, sr) -> { cellSet(outRev, Cons(id, cellGet(outRev))); cellSet(cs, sr) },
+                        Nil -> (),
+                    }
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+pub def vwFocusedFor(e: VirtualWorkspaceEngine a, ws: Int, eqFn: (a, a) -> Bool): Option a = {
+    let st = vwStackAt(e, ws);
+    match wsFocusGet(cellGet(e.focusedByWs), ws) {
+        Some(f) if (listContainsBy(st, f, eqFn)) -> Some(f),
+        _ -> match st { Cons(h, _) -> Some(h), Nil -> None },
+    }
+}
+
+pub def vwActiveFocused(e: VirtualWorkspaceEngine a, eqFn: (a, a) -> Bool): Option a =
+    vwFocusedFor(e, cellGet(e.active), eqFn)
+
+pub def vwWorkspaceContaining(e: VirtualWorkspaceEngine a, id: a, eqFn: (a, a) -> Bool): Option Int =
+    listIndexOfBy(cellGet(e.stacks), (st) -> listContainsBy(st, id, eqFn))
+
+pub def vwWindowCount(e: VirtualWorkspaceEngine a, ws: Int): Int =
+    listLen(vwStackAt(e, ws))
+
+pub def vwRestoreLayoutsAndActive(
+    e: VirtualWorkspaceEngine a,
+    restoredActive: Int,
+    restoredLayouts: List WorkspaceLayoutState
+): Void = {
+    let cnt = cellGet(e.count);
+    let maxIdx = if (cnt > 0) cnt - 1 else 0;
+    cellSet(e.active, if (restoredActive > maxIdx) maxIdx else if (restoredActive < 0) 0 else restoredActive);
+    let i = cellNew(0);
+    let cur = cellNew(restoredLayouts);
+    while (cellGet(i) < cnt && (match cellGet(cur) { Nil -> false, _ -> true })) {
+        match cellGet(cur) {
+            Cons(src, r) -> {
+                let mode = if (src.layoutMode >= 0 && src.layoutMode <= 2) src.layoutMode else 0;
+                let cleaned = WorkspaceLayoutState {
+                    layoutMode: mode,
+                    ratio: clampFloat(src.ratio, 0.2, 0.8),
+                    masters: clampInt(src.masters, 1, 20),
+                };
+                cellSet(e.layouts, listReplaceAt(cellGet(e.layouts), cellGet(i), cleaned));
+                cellSet(i, cellGet(i) + 1);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+pub def vwSeedFromCurrentDesktop(
+    e: VirtualWorkspaceEngine a,
+    orderedWindows: List a,
+    focused: Option a,
+    assignedWorkspace: a -> Option Int,
+    preferredOrderRank: a -> Option Int,
+    preferredFocusForWorkspace: (Int, List a) -> Option a,
+    eqFn: (a, a) -> Bool
+): Void = {
+    let cnt = cellGet(e.count);
+    let act = cellGet(e.active);
+    let unique = listUniqueBy(orderedWindows, eqFn);
+    let buckets = arrayNew(cnt, Nil);
+    let cu = cellNew(unique);
+    while (match cellGet(cu) { Nil -> false, _ -> true }) {
+        match cellGet(cu) {
+            Cons(id, r) -> {
+                let ws = match assignedWorkspace(id) {
+                    Some(w) if (w >= 0 && w < cnt) -> w,
+                    _ -> act,
+                };
+                arraySet(buckets, ws, Cons(id, arrayGet(buckets, ws)));
+                cellSet(cu, r)
+            },
+            Nil -> (),
+        }
+    };
+    let stacksRev: Cell (List (List a)) = cellNew(Nil);
+    let focusMap: Cell (List (Int, a)) = cellNew(Nil);
+    let ws = cellNew(0);
+    while (cellGet(ws) < cnt) {
+        let wIdx = cellGet(ws);
+        let rawSt = listRev(arrayGet(buckets, wIdx));
+        let sortedSt = if (listLen(rawSt) <= 1) rawSt
+            else {
+                // Stable sort by preferredOrderRank (None => 2147483647) then original index
+                let idxRev: Cell (List (Int, Int, a)) = cellNew(Nil);
+                let cs = cellNew(rawSt);
+                let pos = cellNew(0);
+                while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                    match cellGet(cs) {
+                        Cons(elem, sr) -> {
+                            let rank = match preferredOrderRank(elem) { Some(rk) -> rk, None -> 2147483647 };
+                            cellSet(idxRev, Cons((rank, cellGet(pos), elem), cellGet(idxRev)));
+                            cellSet(pos, cellGet(pos) + 1);
+                            cellSet(cs, sr)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let sorted = listSortBy(listRev(cellGet(idxRev)), (x, y) -> {
+                    let (r1, i1, _) = x;
+                    let (r2, i2, _) = y;
+                    if (r1 != r2) r1 < r2 else i1 <= i2
+                });
+                listMap(sorted, (t) -> { let (_, _, el) = t; el })
+            };
+        cellSet(stacksRev, Cons(sortedSt, cellGet(stacksRev)));
+        if (listLen(sortedSt) > 0) {
+            let pickActiveFocus =
+                if (wIdx == act) {
+                    match focused {
+                        Some(f) if (listContainsBy(sortedSt, f, eqFn)) -> Some(f),
+                        _ -> None,
+                    }
+                } else None;
+            let chosen = match pickActiveFocus {
+                Some(f) -> Some(f),
+                None -> match preferredFocusForWorkspace(wIdx, sortedSt) {
+                    Some(pf) if (listContainsBy(sortedSt, pf, eqFn)) -> Some(pf),
+                    _ -> match focused {
+                        Some(f) if (listContainsBy(sortedSt, f, eqFn)) -> Some(f),
+                        _ -> match sortedSt { Cons(h, _) -> Some(h), Nil -> None },
+                    },
+                },
+            };
+            match chosen {
+                Some(c) -> cellSet(focusMap, wsFocusSet(cellGet(focusMap), wIdx, c)),
+                None -> (),
+            }
+        } else ();
+        cellSet(ws, wIdx + 1)
+    };
+    cellSet(e.stacks, listRev(cellGet(stacksRev)));
+    cellSet(e.focusedByWs, cellGet(focusMap))
+}
+
+pub def vwUpdateDefaults(e: VirtualWorkspaceEngine a, ratio: Float, masters: Int): Void = {
+    let oldRatio = cellGet(e.defaultRatio);
+    let oldMasters = cellGet(e.defaultMasters);
+    let ratioChanged = abs(ratio - oldRatio) > 0.0001;
+    let mastersChanged = masters != oldMasters;
+    let updated = listMap(cellGet(e.layouts), (l: WorkspaceLayoutState) -> WorkspaceLayoutState {
+        layoutMode: l.layoutMode,
+        ratio: if (ratioChanged && abs(l.ratio - oldRatio) <= 0.0001) ratio else l.ratio,
+        masters: if (mastersChanged && l.masters == oldMasters) masters else l.masters,
+    });
+    cellSet(e.layouts, updated);
+    cellSet(e.defaultRatio, ratio);
+    cellSet(e.defaultMasters, masters)
+}
+
+pub def vwResizeCount(e: VirtualWorkspaceEngine a, requestedCount: Int, eqFn: (a, a) -> Bool): Void = {
+    let newCount = clampInt(requestedCount, 1, 9);
+    let oldCount = cellGet(e.count);
+    if (newCount == oldCount) ()
+    else if (newCount > oldCount) {
+        let extra = newCount - oldCount;
+        let defLayout = WorkspaceLayoutState {
+            layoutMode: 0,
+            ratio: cellGet(e.defaultRatio),
+            masters: cellGet(e.defaultMasters),
+        };
+        cellSet(e.stacks, listAppend(cellGet(e.stacks), repeatItem(extra, Nil)));
+        cellSet(e.layouts, listAppend(cellGet(e.layouts), repeatItem(extra, defLayout)));
+        cellSet(e.count, newCount)
+    } else {
+        let lastIdx = newCount - 1;
+        let lastStackCell = cellNew(vwStackAt(e, lastIdx));
+        let ov = cellNew(newCount);
+        while (cellGet(ov) < oldCount) {
+            let ovIdx = cellGet(ov);
+            let ovItems = vwStackAt(e, ovIdx);
+            let ci = cellNew(ovItems);
+            while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                match cellGet(ci) {
+                    Cons(id, r) -> {
+                        if (!listContainsBy(cellGet(lastStackCell), id, eqFn)) {
+                            cellSet(lastStackCell, listAppend(cellGet(lastStackCell), [id]))
+                        } else ();
+                        cellSet(ci, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellSet(e.focusedByWs, wsFocusRemove(cellGet(e.focusedByWs), ovIdx));
+            cellSet(ov, ovIdx + 1)
+        };
+        let truncatedStacks = listReplaceAt(listTake(cellGet(e.stacks), newCount), lastIdx, cellGet(lastStackCell));
+        cellSet(e.stacks, truncatedStacks);
+        cellSet(e.layouts, listTake(cellGet(e.layouts), newCount));
+        if (cellGet(e.active) >= newCount) cellSet(e.active, lastIdx) else ();
+        let finalLast = cellGet(lastStackCell);
+        let validFocus = match wsFocusGet(cellGet(e.focusedByWs), lastIdx) {
+            Some(f) -> listContainsBy(finalLast, f, eqFn),
+            None -> false,
+        };
+        if (!validFocus) {
+            match finalLast {
+                Cons(h, _) -> cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), lastIdx, h)),
+                Nil -> cellSet(e.focusedByWs, wsFocusRemove(cellGet(e.focusedByWs), lastIdx)),
+            }
+        } else ();
+        cellSet(e.count, newCount)
+    }
+}
+
+pub def vwReconcile(
+    e: VirtualWorkspaceEngine a,
+    discovered: List a,
+    currentlyFocused: Option a,
+    assignedWorkspace: a -> Option Int,
+    canInsertBeforeFocus: (a, a) -> Bool,
+    eqFn: (a, a) -> Bool
+): (Bool, List a) = {
+    let beforeStacks = cellGet(e.stacks);
+    let cnt = cellGet(e.count);
+    let act = cellGet(e.active);
+    let uniqueDisc = listUniqueBy(discovered, eqFn);
+    let autoShiftedRev: Cell (List a) = cellNew(Nil);
+
+    // 1. Prune closed windows while picking neighbor focus
+    let ws = cellNew(0);
+    while (cellGet(ws) < cnt) {
+        let wIdx = cellGet(ws);
+        let oldStack = vwStackAt(e, wIdx);
+        let newStack = listFilter(oldStack, (id) -> listContainsBy(uniqueDisc, id, eqFn));
+        if (!listEqualsBy(oldStack, newStack, eqFn)) {
+            match wsFocusGet(cellGet(e.focusedByWs), wIdx) {
+                Some(oldFocus) if (!listContainsBy(newStack, oldFocus, eqFn)) -> {
+                    if (listLen(newStack) == 0) {
+                        cellSet(e.focusedByWs, wsFocusRemove(cellGet(e.focusedByWs), wIdx))
+                    } else {
+                        match listIndexOfBy(oldStack, (x) -> eqFn(x, oldFocus)) {
+                            Some(oldIdx) -> {
+                                // Search forward then backward in oldStack
+                                let rep: Cell (Option a) = cellNew(None);
+                                let oldLen = listLen(oldStack);
+                                let probe = cellNew(oldIdx + 1);
+                                while (cellGet(probe) < oldLen && (match cellGet(rep) { None -> true, Some(_) -> false })) {
+                                    match listNthOpt(oldStack, cellGet(probe)) {
+                                        Some(cand) if (listContainsBy(uniqueDisc, cand, eqFn)) -> cellSet(rep, Some(cand)),
+                                        _ -> (),
+                                    };
+                                    cellSet(probe, cellGet(probe) + 1)
+                                };
+                                let probeBack = cellNew(oldIdx - 1);
+                                while (cellGet(probeBack) >= 0 && (match cellGet(rep) { None -> true, Some(_) -> false })) {
+                                    match listNthOpt(oldStack, cellGet(probeBack)) {
+                                        Some(cand) if (listContainsBy(uniqueDisc, cand, eqFn)) -> cellSet(rep, Some(cand)),
+                                        _ -> (),
+                                    };
+                                    cellSet(probeBack, cellGet(probeBack) - 1)
+                                };
+                                let chosen = match cellGet(rep) {
+                                    Some(c) -> Some(c),
+                                    None -> match newStack { Cons(h, _) -> Some(h), Nil -> None },
+                                };
+                                match chosen {
+                                    Some(c) -> cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), wIdx, c)),
+                                    None -> (),
+                                }
+                            },
+                            None -> match newStack {
+                                Cons(h, _) -> cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), wIdx, h)),
+                                Nil -> cellSet(e.focusedByWs, wsFocusRemove(cellGet(e.focusedByWs), wIdx)),
+                            },
+                        }
+                    }
+                },
+                _ -> (),
+            };
+            cellSet(e.stacks, listReplaceAt(cellGet(e.stacks), wIdx, newStack))
+        } else ();
+        cellSet(ws, wIdx + 1)
+    };
+
+    // 2. Track currently assigned windows & update active focus if currentlyFocused is on active
+    let assigned: Cell (List a) = cellNew(vwAllWindows(e));
+    match currentlyFocused {
+        Some(cf) if (listContainsBy(vwStackAt(e, act), cf, eqFn)) ->
+            cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), act, cf)),
+        _ -> (),
+    };
+
+    // 3. Route newly discovered windows
+    let anchorFocus = vwActiveFocused(e, eqFn);
+    let cd = cellNew(uniqueDisc);
+    while (match cellGet(cd) { Nil -> false, _ -> true }) {
+        match cellGet(cd) {
+            Cons(id, r) -> {
+                if (!listContainsBy(cellGet(assigned), id, eqFn)) {
+                    cellSet(assigned, Cons(id, cellGet(assigned)));
+                    let targetWs = match assignedWorkspace(id) {
+                        Some(w) if (w >= 0 && w < cnt) -> w,
+                        _ -> act,
+                    };
+                    if (targetWs != act) {
+                        let st = vwStackAt(e, targetWs);
+                        cellSet(e.stacks, listReplaceAt(cellGet(e.stacks), targetWs, Cons(id, st)));
+                        cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), targetWs, id));
+                        cellSet(autoShiftedRev, Cons(id, cellGet(autoShiftedRev)))
+                    } else {
+                        let actStack = vwStackAt(e, act);
+                        let nextStack = match anchorFocus {
+                            Some(anchor) -> match listIndexOfBy(actStack, (x) -> eqFn(x, anchor)) {
+                                Some(anchorIdx) if (canInsertBeforeFocus(id, anchor)) ->
+                                    listInsertAt(actStack, anchorIdx, id),
+                                _ -> listAppend(actStack, [id]),
+                            },
+                            None -> listAppend(actStack, [id]),
+                        };
+                        cellSet(e.stacks, listReplaceAt(cellGet(e.stacks), act, nextStack));
+                        let isCurFocused = match currentlyFocused { Some(cf) -> eqFn(cf, id), None -> false };
+                        let hasFocus = match wsFocusGet(cellGet(e.focusedByWs), act) { Some(_) -> true, None -> false };
+                        if (isCurFocused || !hasFocus) {
+                            cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), act, id))
+                        } else ()
+                    }
+                } else ();
+                cellSet(cd, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // 4. Normalize active workspace focus
+    let finalActiveStack = vwStackAt(e, act);
+    let validActiveFocus = match wsFocusGet(cellGet(e.focusedByWs), act) {
+        Some(f) -> listContainsBy(finalActiveStack, f, eqFn),
+        None -> false,
+    };
+    if (!validActiveFocus) {
+        match finalActiveStack {
+            Cons(h, _) -> cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), act, h)),
+            Nil -> cellSet(e.focusedByWs, wsFocusRemove(cellGet(e.focusedByWs), act)),
+        }
+    } else ();
+
+    let stacksChanged = !listEqualsBy(beforeStacks, cellGet(e.stacks), (s1, s2) -> listEqualsBy(s1, s2, eqFn));
+    (stacksChanged, listRev(cellGet(autoShiftedRev)))
+}
+
+pub def vwSwitchTo(e: VirtualWorkspaceEngine a, target: Int, eqFn: (a, a) -> Bool): Bool = {
+    let cnt = cellGet(e.count);
+    if (target < 0 || target >= cnt || target == cellGet(e.active)) false
+    else {
+        cellSet(e.active, target);
+        let st = vwStackAt(e, target);
+        let valid = match wsFocusGet(cellGet(e.focusedByWs), target) {
+            Some(f) -> listContainsBy(st, f, eqFn),
+            None -> false,
+        };
+        if (!valid) {
+            match st {
+                Cons(h, _) -> cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), target, h)),
+                Nil -> cellSet(e.focusedByWs, wsFocusRemove(cellGet(e.focusedByWs), target)),
+            }
+        } else ();
+        true
+    }
+}
+
+pub def vwMoveWindow(e: VirtualWorkspaceEngine a, id: a, target: Int, eqFn: (a, a) -> Bool): (Bool, Option a) = {
+    let cnt = cellGet(e.count);
+    if (target < 0 || target >= cnt) (false, vwActiveFocused(e, eqFn))
+    else match vwWorkspaceContaining(e, id, eqFn) {
+        None -> (false, vwActiveFocused(e, eqFn)),
+        Some(source) if (source == target) -> (false, vwActiveFocused(e, eqFn)),
+        Some(source) -> {
+            let srcStack = vwStackAt(e, source);
+            match listIndexOfBy(srcStack, (x) -> eqFn(x, id)) {
+                None -> (false, vwActiveFocused(e, eqFn)),
+                Some(oldIdx) -> {
+                    let nextSrc = listRemoveAt(srcStack, oldIdx);
+                    cellSet(e.stacks, listReplaceAt(cellGet(e.stacks), source, nextSrc));
+                    let wasFocused = match wsFocusGet(cellGet(e.focusedByWs), source) {
+                        Some(f) -> eqFn(f, id),
+                        None -> false,
+                    };
+                    if (wasFocused) {
+                        let slen = listLen(nextSrc);
+                        if (slen == 0) {
+                            cellSet(e.focusedByWs, wsFocusRemove(cellGet(e.focusedByWs), source))
+                        } else {
+                            let nextIdx = if (oldIdx < slen) oldIdx else slen - 1;
+                            match listNthOpt(nextSrc, nextIdx) {
+                                Some(nf) -> cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), source, nf)),
+                                None -> (),
+                            }
+                        }
+                    } else ();
+                    let dstStack = listFilter(vwStackAt(e, target), (x) -> !eqFn(x, id));
+                    cellSet(e.stacks, listReplaceAt(cellGet(e.stacks), target, Cons(id, dstStack)));
+                    cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), target, id));
+                    (true, vwActiveFocused(e, eqFn))
+                },
+            }
+        },
+    }
+}
+
+pub def vwHandleExternalFocus(e: VirtualWorkspaceEngine a, id: a, eqFn: (a, a) -> Bool): Option Int =
+    match vwWorkspaceContaining(e, id, eqFn) {
+        None -> None,
+        Some(ws) -> {
+            cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), ws, id));
+            if (ws != cellGet(e.active)) {
+                cellSet(e.active, ws);
+                Some(ws)
+            } else None
+        },
+    }
+
+pub def vwSetActiveFocus(e: VirtualWorkspaceEngine a, idOpt: Option a, eqFn: (a, a) -> Bool): Void = {
+    let act = cellGet(e.active);
+    let st = vwStackAt(e, act);
+    match idOpt {
+        Some(val) ->
+            if (listContainsBy(st, val, eqFn)) cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), act, val))
+            else (),
+        None ->
+            if (listLen(st) == 0) cellSet(e.focusedByWs, wsFocusRemove(cellGet(e.focusedByWs), act))
+            else (),
+    }
+}
+
+pub def vwReplaceActiveStack(e: VirtualWorkspaceEngine a, newOrder: List a, eqFn: (a, a) -> Bool): Void = {
+    let act = cellGet(e.active);
+    let curStack = vwStackAt(e, act);
+    let filtered = listUniqueBy(
+        listFilter(newOrder, (id) -> listContainsBy(curStack, id, eqFn)),
+        eqFn
+    );
+    let extraRev: Cell (List a) = cellNew(Nil);
+    let cc = cellNew(curStack);
+    while (match cellGet(cc) { Nil -> false, _ -> true }) {
+        match cellGet(cc) {
+            Cons(id, r) -> {
+                if (!listContainsBy(filtered, id, eqFn) && !listContainsBy(cellGet(extraRev), id, eqFn)) {
+                    cellSet(extraRev, Cons(id, cellGet(extraRev)))
+                } else ();
+                cellSet(cc, r)
+            },
+            Nil -> (),
+        }
+    };
+    let finalStack = listAppend(filtered, listRev(cellGet(extraRev)));
+    cellSet(e.stacks, listReplaceAt(cellGet(e.stacks), act, finalStack));
+    let valid = match wsFocusGet(cellGet(e.focusedByWs), act) {
+        Some(f) -> listContainsBy(finalStack, f, eqFn),
+        None -> false,
+    };
+    if (!valid) {
+        match finalStack {
+            Cons(h, _) -> cellSet(e.focusedByWs, wsFocusSet(cellGet(e.focusedByWs), act, h)),
+            Nil -> cellSet(e.focusedByWs, wsFocusRemove(cellGet(e.focusedByWs), act)),
+        }
+    } else ()
+}

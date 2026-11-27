@@ -1,0 +1,2020 @@
+/// Pure window manager core state machine (`ManagerCore`):
+/// tracks windows, screens, virtual/native layouts, focus echo guards,
+/// floating/auto-float rules, parking/unparking, and session persistence.
+
+use std.option.{Option, Some, None}
+use std.list.{listLen, listRev, listAppend, listMap, listFilter, listAny}
+use std.str.{intToStr, floatToStr}
+use std.math.{abs}
+use config.{
+    Configuration, FloatWindowRule, WorkspaceTarget,
+    floatRuleMatches, resolveWorkspaceTarget, lookupAppWorkspace
+}
+use layout.{
+    Rect, rectNew, rectIntersectionArea, rectIntersects,
+    insetArea, tallLayoutWithGaps, mirrorTallLayoutWithGaps,
+    centeredFrame, centeredOrigin
+}
+use screen_geometry.{isParkedWindowFrame, parkedWindowOrigin}
+use session_writer.{
+    SessionWriter, sessionWriterNew, sessionWriterFailed,
+    sessionWriterSubmit, sessionWriterFlush, sessionWriterStop
+}
+use status_markup.{SpaceEntry}
+use virtual_workspaces.{
+    WorkspaceLayoutState, PersistedWindowRect, PersistedWorkspaceSession,
+    VirtualWorkspaceEngine, buildPersistedSession, sessionFocusedByWs,
+    sessionSavedFrames, loadPersistedSessionFromPath,
+    vwNew, vwCount, vwActive, vwStacks, vwLayouts, vwStackAt, vwActiveLayout,
+    vwSetActiveLayout, vwActiveWindows, vwInactiveWindows, vwAllWindows,
+    vwActiveFocused, vwWorkspaceContaining, vwWindowCount,
+    vwRestoreLayoutsAndActive, vwSeedFromCurrentDesktop, vwUpdateDefaults,
+    vwResizeCount, vwReconcile, vwSwitchTo, vwMoveWindow,
+    vwHandleExternalFocus, vwSetActiveFocus, vwReplaceActiveStack
+}
+use window_history.{mergeHistory, orderUsingHistory}
+use util.{
+    optEqBy,
+    minInt, maxInt, minFloat, maxFloat,
+    listContainsBy, listIndexOfBy, listFindBy, listNthOpt, listSwapIndices,
+    listReplaceAt, listInsertAt, listRemoveAt, listSortBy, listUniqueBy
+}
+
+pub def kvkAnsiA(): Int = 0x00
+pub def kvkAnsiH(): Int = 0x04
+pub def kvkAnsiJ(): Int = 0x26
+pub def kvkAnsiK(): Int = 0x28
+pub def kvkAnsiL(): Int = 0x25
+pub def kvkAnsiP(): Int = 0x23
+pub def kvkAnsiT(): Int = 0x11
+pub def kvkAnsiComma(): Int = 0x2B
+pub def kvkAnsiPeriod(): Int = 0x2F
+pub def kvkReturn(): Int = 0x24
+pub def kvkSpace(): Int = 0x31
+
+pub def workspaceDigitKeyCodes(): List Int =
+    [0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19]
+
+pub data ScreenSpec {
+    id: Int,
+    visibleFrame: Rect,
+    fullFrame: Rect,
+}
+
+pub data CandidateWindow {
+    key: Int64,
+    pid: Int,
+    bundleId: Option String,
+    windowId: Option Int,
+    title: String,
+    frame: Rect,
+    isResizable: Bool,
+}
+
+pub data TrackedWindow {
+    key: Int64,
+    pid: Int,
+    bundleId: Option String,
+    windowId: Option Int,
+    title: String,
+    screenId: Int,
+    isResizable: Bool,
+    frame: Rect,
+}
+
+pub data WindowEffect {
+    EffSetFrame { key: Int64, rect: Rect },
+    EffSetPosition { key: Int64, x: Float, y: Float },
+    EffFocus { key: Int64, pid: Int },
+    EffRelinquishFocus,
+}
+
+pub data ManagerActionOutput {
+    geometryGeneration: Int64,
+    windowFrames: List (Int64, Rect),
+    effects: List WindowEffect,
+    activeWindowKeys: List Int64,
+    observeWindowKeys: List Int64,
+    paused: Bool,
+    pausedToggled: Option Bool,
+    layoutName: String,
+    activeWorkspace: Int,
+    workspaceCount: Int,
+    isVirtualMode: Bool,
+    statusChanged: Bool,
+    traceLog: Option String,
+}
+
+pub data ManagerStatusSnapshot {
+    isVirtualMode: Bool,
+    paused: Bool,
+    layoutName: String,
+    activeWorkspace: Int,
+    workspaceCount: Int,
+    windowCount: Int,
+    focusedWindowKey: Option Int64,
+    focusedScreenId: Option Int,
+    virtualSpaceEntries: List SpaceEntry,
+}
+
+// ---- Small association-list map/set helpers for Int64 / Int keys ----
+
+def eqI64(a: Int64, b: Int64): Bool = a == b
+def eqInt(a: Int, b: Int): Bool = a == b
+def eqStr(a: String, b: String): Bool = a == b
+
+def setHasI64(xs: List Int64, k: Int64): Bool = listContainsBy(xs, k, eqI64)
+def setAddI64(xs: List Int64, k: Int64): List Int64 =
+    if (setHasI64(xs, k)) xs else Cons(k, xs)
+def setRemI64(xs: List Int64, k: Int64): List Int64 =
+    listFilter(xs, (x) -> x != k)
+
+def setHasInt(xs: List Int, k: Int): Bool = listContainsBy(xs, k, eqInt)
+def setAddInt(xs: List Int, k: Int): List Int =
+    if (setHasInt(xs, k)) xs else Cons(k, xs)
+def setRemInt(xs: List Int, k: Int): List Int =
+    listFilter(xs, (x) -> x != k)
+
+def mapGetI64(xs: List (Int64, v), k: Int64): Option v = {
+    let cur = cellNew(xs);
+    let res: Cell (Option v) = cellNew(None);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match cellGet(cur) {
+            Nil -> cellSet(running, false),
+            Cons((ek, ev), r) ->
+                if (ek == k) { cellSet(res, Some(ev)); cellSet(running, false) }
+                else cellSet(cur, r),
+        }
+    };
+    cellGet(res)
+}
+
+def mapSetI64(xs: List (Int64, v), k: Int64, val: v): List (Int64, v) =
+    Cons((k, val), listFilter(xs, (p) -> { let (ek, _) = p; ek != k }))
+
+def mapRemI64(xs: List (Int64, v), k: Int64): List (Int64, v) =
+    listFilter(xs, (p) -> { let (ek, _) = p; ek != k })
+
+def mapGetInt(xs: List (Int, v), k: Int): Option v = {
+    let cur = cellNew(xs);
+    let res: Cell (Option v) = cellNew(None);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match cellGet(cur) {
+            Nil -> cellSet(running, false),
+            Cons((ek, ev), r) ->
+                if (ek == k) { cellSet(res, Some(ev)); cellSet(running, false) }
+                else cellSet(cur, r),
+        }
+    };
+    cellGet(res)
+}
+
+def mapSetInt(xs: List (Int, v), k: Int, val: v): List (Int, v) =
+    Cons((k, val), listFilter(xs, (p) -> { let (ek, _) = p; ek != k }))
+
+def mapRemInt(xs: List (Int, v), k: Int): List (Int, v) =
+    listFilter(xs, (p) -> { let (ek, _) = p; ek != k })
+
+pub data ManagerCore {
+    windows: Cell (List TrackedWindow),
+    history: Cell (List Int64),
+    floating: Cell (List Int64),
+    autoFloatedKeys: Cell (List Int64),
+    userToggledFloatKeys: Cell (List Int64),
+    savedFrames: Cell (List (Int64, Rect)),
+    homeScreens: Cell (List (Int64, Int)),
+    parkedKeys: Cell (List Int64),
+    windowByKey: Cell (List (Int64, TrackedWindow)),
+    lastScreens: Cell (List ScreenSpec),
+
+    workspaceMode: Cell String,
+    virtualEngine: VirtualWorkspaceEngine Int64,
+    virtualSeeded: Cell Bool,
+    suppressExternalFocusUntil: Cell Float,
+    programmaticFocusKey: Cell (Option Int64),
+    programmaticFocusUntil: Cell Float,
+
+    sessionFilePath: Option String,
+    lastWorkspaceByWid: Cell (List (Int, Int)),
+    persistedWindowRank: Cell (List (Int, Int)),
+    persistedFocusedByWs: Cell (List (Int, Int)),
+    persistedFloatingIds: Cell (List Int),
+    persistedSavedFrames: Cell (List (Int, Rect)),
+    lastSavedSession: Cell (Option PersistedWorkspaceSession),
+    sessionWriter: Option SessionWriter,
+
+    nativeRatio: Cell Float,
+    nativeMasters: Cell Int,
+    nativeLayoutMode: Cell Int,
+    geometryGeneration: Cell Int64,
+
+    paused: Cell Bool,
+    ignoredApps: Cell (List String),
+    appWorkspaces: Cell (List (String, WorkspaceTarget)),
+    floatWindows: Cell (List FloatWindowRule),
+    spaceLabels: Cell (List String),
+    ratioStep: Cell Float,
+    outerGap: Cell Float,
+    innerGap: Cell Float,
+    lastFocused: Cell (Option Int64),
+}
+
+pub def managerCoreNew(cfg: Configuration, sessionFilePath: Option String): ManagerCore = {
+    let writer = match sessionFilePath {
+        Some(p) if (strLen(p) > 0) -> Some(sessionWriterNew(p)),
+        _ -> None,
+    };
+    let core = ManagerCore {
+        windows: cellNew(Nil),
+        history: cellNew(Nil),
+        floating: cellNew(Nil),
+        autoFloatedKeys: cellNew(Nil),
+        userToggledFloatKeys: cellNew(Nil),
+        savedFrames: cellNew(Nil),
+        homeScreens: cellNew(Nil),
+        parkedKeys: cellNew(Nil),
+        windowByKey: cellNew(Nil),
+        lastScreens: cellNew(Nil),
+        workspaceMode: cellNew(cfg.workspaceMode),
+        virtualEngine: vwNew(cfg.workspaceCount, cfg.masterRatio, cfg.masterCount),
+        virtualSeeded: cellNew(false),
+        suppressExternalFocusUntil: cellNew(0.0),
+        programmaticFocusKey: cellNew(None),
+        programmaticFocusUntil: cellNew(0.0),
+        sessionFilePath: sessionFilePath,
+        lastWorkspaceByWid: cellNew(Nil),
+        persistedWindowRank: cellNew(Nil),
+        persistedFocusedByWs: cellNew(Nil),
+        persistedFloatingIds: cellNew(Nil),
+        persistedSavedFrames: cellNew(Nil),
+        lastSavedSession: cellNew(None),
+        sessionWriter: writer,
+        nativeRatio: cellNew(cfg.masterRatio),
+        nativeMasters: cellNew(cfg.masterCount),
+        nativeLayoutMode: cellNew(0),
+        geometryGeneration: cellNew(intToI64(0)),
+        paused: cellNew(false),
+        ignoredApps: cellNew(cfg.ignoreApps),
+        appWorkspaces: cellNew(cfg.appWorkspaces),
+        floatWindows: cellNew(cfg.floatWindows),
+        spaceLabels: cellNew(cfg.spaceLabels),
+        ratioStep: cellNew(cfg.ratioStep),
+        outerGap: cellNew(cfg.outerGap),
+        innerGap: cellNew(cfg.innerGap),
+        lastFocused: cellNew(None),
+    };
+    if (cfg.workspaceMode == "virtual") loadPersistedSessionIfAvailable(core) else ();
+    core
+}
+
+pub def managerCoreClose(core: ManagerCore): Void = match core.sessionWriter {
+    Some(w) -> sessionWriterStop(w),
+    None -> (),
+}
+
+pub def managerCoreIsVirtual(core: ManagerCore): Bool =
+    cellGet(core.workspaceMode) == "virtual"
+
+pub def managerCoreIsFloating(core: ManagerCore, w: TrackedWindow): Bool =
+    !w.isResizable || setHasI64(cellGet(core.floating), w.key)
+
+pub def managerCoreLayoutMode(core: ManagerCore): Int =
+    if (managerCoreIsVirtual(core)) (vwActiveLayout(core.virtualEngine)).layoutMode
+    else cellGet(core.nativeLayoutMode)
+
+pub def managerCoreSetLayoutMode(core: ManagerCore, mode: Int): Void =
+    if (managerCoreIsVirtual(core)) {
+        let cur = vwActiveLayout(core.virtualEngine);
+        vwSetActiveLayout(core.virtualEngine, WorkspaceLayoutState {
+            layoutMode: mode,
+            ratio: cur.ratio,
+            masters: cur.masters,
+        })
+    } else cellSet(core.nativeLayoutMode, mode)
+
+pub def managerCoreRatio(core: ManagerCore): Float =
+    if (managerCoreIsVirtual(core)) (vwActiveLayout(core.virtualEngine)).ratio
+    else cellGet(core.nativeRatio)
+
+pub def managerCoreSetRatio(core: ManagerCore, ratio: Float): Void =
+    if (managerCoreIsVirtual(core)) {
+        let cur = vwActiveLayout(core.virtualEngine);
+        vwSetActiveLayout(core.virtualEngine, WorkspaceLayoutState {
+            layoutMode: cur.layoutMode,
+            ratio: ratio,
+            masters: cur.masters,
+        })
+    } else cellSet(core.nativeRatio, ratio)
+
+pub def managerCoreMasters(core: ManagerCore): Int =
+    if (managerCoreIsVirtual(core)) (vwActiveLayout(core.virtualEngine)).masters
+    else cellGet(core.nativeMasters)
+
+pub def managerCoreSetMasters(core: ManagerCore, masters: Int): Void =
+    if (managerCoreIsVirtual(core)) {
+        let cur = vwActiveLayout(core.virtualEngine);
+        vwSetActiveLayout(core.virtualEngine, WorkspaceLayoutState {
+            layoutMode: cur.layoutMode,
+            ratio: cur.ratio,
+            masters: masters,
+        })
+    } else cellSet(core.nativeMasters, masters)
+
+pub def managerCoreLayoutName(core: ManagerCore): String =
+    match managerCoreLayoutMode(core) {
+        1 -> "Mirror",
+        2 -> "Full",
+        _ -> "Tall",
+    }
+
+pub def managerCoreSetPaused(core: ManagerCore, p: Bool): Void =
+    cellSet(core.paused, p)
+
+pub def managerCoreFlushSession(core: ManagerCore): Void = match core.sessionWriter {
+    Some(w) -> sessionWriterFlush(w),
+    None -> (),
+}
+
+def loadPersistedSessionIfAvailable(core: ManagerCore): Void = {
+    managerCoreFlushSession(core);
+    match core.sessionFilePath {
+        None -> (),
+        Some(path) -> match loadPersistedSessionFromPath(path) {
+            None -> (),
+            Some(restored) -> {
+                vwRestoreLayoutsAndActive(core.virtualEngine, restored.activeWorkspace, restored.layouts);
+                let cnt = vwCount(core.virtualEngine);
+                let maxWs = if (cnt > 0) cnt - 1 else 0;
+                let wsMap: Cell (List (Int, Int)) = cellNew(Nil);
+                let rankMap: Cell (List (Int, Int)) = cellNew(Nil);
+                let rank = cellNew(0);
+                let ws = cellNew(0);
+                let curRows = cellNew(restored.workspaceWindowIds);
+                while (match cellGet(curRows) { Nil -> false, _ -> true }) {
+                    match cellGet(curRows) {
+                        Cons(wids, rRows) -> {
+                            let clampedWs = minInt(cellGet(ws), maxWs);
+                            let cw = cellNew(wids);
+                            while (match cellGet(cw) { Nil -> false, _ -> true }) {
+                                match cellGet(cw) {
+                                    Cons(wid, rw) -> {
+                                        cellSet(wsMap, mapSetInt(cellGet(wsMap), wid, clampedWs));
+                                        cellSet(rankMap, mapSetInt(cellGet(rankMap), wid, cellGet(rank)));
+                                        cellSet(rank, cellGet(rank) + 1);
+                                        cellSet(cw, rw)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            cellSet(ws, cellGet(ws) + 1);
+                            cellSet(curRows, rRows)
+                        },
+                        Nil -> (),
+                    }
+                };
+                cellSet(core.lastWorkspaceByWid, cellGet(wsMap));
+                cellSet(core.persistedWindowRank, cellGet(rankMap));
+                cellSet(core.persistedFocusedByWs, sessionFocusedByWs(restored));
+                cellSet(core.persistedFloatingIds, restored.floatingWindowIds);
+                let frames = listMap(sessionSavedFrames(restored), (p: (Int, PersistedWindowRect)) -> {
+                    let (wid, pr) = p;
+                    (wid, Rect { x: pr.x, y: pr.y, w: pr.width, h: pr.height })
+                });
+                cellSet(core.persistedSavedFrames, frames);
+                cellSet(core.lastSavedSession, Some(restored))
+            },
+        },
+    }
+}
+
+def shouldAutoFloat(core: ManagerCore, bundleId: Option String, title: String): Bool =
+    listAny(cellGet(core.floatWindows), (r) -> floatRuleMatches(r, bundleId, title))
+
+def assignedWorkspace(core: ManagerCore, bundleId: Option String): Option Int =
+    match bundleId {
+        None -> None,
+        Some(b) -> match lookupAppWorkspace(cellGet(core.appWorkspaces), b) {
+            None -> None,
+            Some(target) -> resolveWorkspaceTarget(target, vwCount(core.virtualEngine), cellGet(core.spaceLabels)),
+        },
+    }
+
+pub def managerCoreRecordSessionState(core: ManagerCore): Void =
+    if (!managerCoreIsVirtual(core) || !cellGet(core.virtualSeeded)) ()
+    else {
+        let wMap = cellGet(core.windowByKey);
+        let wsIdx = cellNew(0);
+        let cs = cellNew(vwStacks(core.virtualEngine));
+        while (match cellGet(cs) { Nil -> false, _ -> true }) {
+            match cellGet(cs) {
+                Cons(keys, r) -> {
+                    let w = cellGet(wsIdx);
+                    let ck = cellNew(keys);
+                    while (match cellGet(ck) { Nil -> false, _ -> true }) {
+                        match cellGet(ck) {
+                            Cons(key, rk) -> {
+                                match mapGetI64(wMap, key) {
+                                    Some(tw) -> match tw.windowId {
+                                        Some(wid) -> cellSet(core.lastWorkspaceByWid, mapSetInt(cellGet(core.lastWorkspaceByWid), wid, w)),
+                                        None -> (),
+                                    },
+                                    None -> (),
+                                };
+                                cellSet(ck, rk)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    cellSet(wsIdx, w + 1);
+                    cellSet(cs, r)
+                },
+                Nil -> (),
+            }
+        };
+        match core.sessionWriter {
+            None -> (),
+            Some(writer) -> {
+                let wsWindowIds = listMap(vwStacks(core.virtualEngine), (stack) -> {
+                    let rev: Cell (List Int) = cellNew(Nil);
+                    let ck = cellNew(stack);
+                    while (match cellGet(ck) { Nil -> false, _ -> true }) {
+                        match cellGet(ck) {
+                            Cons(k, rk) -> {
+                                match mapGetI64(wMap, k) {
+                                    Some(tw) -> match tw.windowId {
+                                        Some(wid) -> cellSet(rev, Cons(wid, cellGet(rev))),
+                                        None -> (),
+                                    },
+                                    None -> (),
+                                };
+                                cellSet(ck, rk)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    listRev(cellGet(rev))
+                });
+                let cnt = vwCount(core.virtualEngine);
+                let focusRev: Cell (List (Int, Int)) = cellNew(Nil);
+                let wi = cellNew(0);
+                while (cellGet(wi) < cnt) {
+                    let w = cellGet(wi);
+                    let fKeyOpt = match vwActiveFocused(core.virtualEngine, eqI64) {
+                        _ -> match listNthOpt(vwStacks(core.virtualEngine), w) {
+                            _ -> {
+                                // Use vwFocusedFor
+                                let st = vwStackAt(core.virtualEngine, w);
+                                let raw = listFindBy(cellGet(core.virtualEngine.focusedByWs), (p) -> { let (k, _) = p; k == w });
+                                match raw {
+                                    Some((_, fk)) if (listContainsBy(st, fk, eqI64)) -> Some(fk),
+                                    _ -> match st { Cons(h, _) -> Some(h), Nil -> None },
+                                }
+                            },
+                        },
+                    };
+                    match fKeyOpt {
+                        Some(fk) -> match mapGetI64(wMap, fk) {
+                            Some(tw) -> match tw.windowId {
+                                Some(wid) -> cellSet(focusRev, Cons((w, wid), cellGet(focusRev))),
+                                None -> (),
+                            },
+                            None -> (),
+                        },
+                        None -> (),
+                    };
+                    cellSet(wi, w + 1)
+                };
+                let floatRev: Cell (List Int) = cellNew(Nil);
+                let cf = cellNew(cellGet(core.floating));
+                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                    match cellGet(cf) {
+                        Cons(k, rk) -> {
+                            match mapGetI64(wMap, k) {
+                                Some(tw) -> match tw.windowId {
+                                    Some(wid) -> cellSet(floatRev, Cons(wid, cellGet(floatRev))),
+                                    None -> (),
+                                },
+                                None -> (),
+                            };
+                            cellSet(cf, rk)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let framesRev: Cell (List (Int, PersistedWindowRect)) = cellNew(Nil);
+                let csf = cellNew(cellGet(core.savedFrames));
+                while (match cellGet(csf) { Nil -> false, _ -> true }) {
+                    match cellGet(csf) {
+                        Cons((k, rect), rsf) -> {
+                            match mapGetI64(wMap, k) {
+                                Some(tw) -> match tw.windowId {
+                                    Some(wid) -> cellSet(framesRev, Cons((wid, PersistedWindowRect {
+                                        x: rect.x, y: rect.y, width: rect.w, height: rect.h,
+                                    }), cellGet(framesRev))),
+                                    None -> (),
+                                },
+                                None -> (),
+                            };
+                            cellSet(csf, rsf)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let snap = buildPersistedSession(
+                    vwActive(core.virtualEngine),
+                    vwLayouts(core.virtualEngine),
+                    wsWindowIds,
+                    listRev(cellGet(focusRev)),
+                    listRev(cellGet(floatRev)),
+                    listRev(cellGet(framesRev))
+                );
+                let unchanged = match cellGet(core.lastSavedSession) {
+                    Some(prev) -> prev == snap,
+                    None -> false,
+                };
+                if (unchanged && !sessionWriterFailed(writer)) ()
+                else if (sessionWriterSubmit(writer, snap)) cellSet(core.lastSavedSession, Some(snap))
+                else ()
+            },
+        }
+    }
+
+def screenForId(core: ManagerCore, screenId: Int): Option ScreenSpec = {
+    let scrs = cellGet(core.lastScreens);
+    match listFindBy(scrs, (s: ScreenSpec) -> s.id == screenId) {
+        Some(s) -> Some(s),
+        None -> match scrs { Cons(h, _) -> Some(h), Nil -> None },
+    }
+}
+
+def updateWinFrame(w: TrackedWindow, rect: Rect): TrackedWindow = TrackedWindow {
+    key: w.key, pid: w.pid, bundleId: w.bundleId, windowId: w.windowId,
+    title: w.title, screenId: w.screenId, isResizable: w.isResizable, frame: rect,
+}
+
+def updateLiveFrames(core: ManagerCore, liveFrames: List (Int64, Rect)): Void = {
+    let cl = cellNew(liveFrames);
+    while (match cellGet(cl) { Nil -> false, _ -> true }) {
+        match cellGet(cl) {
+            Cons((k, rect), r) -> {
+                match mapGetI64(cellGet(core.windowByKey), k) {
+                    Some(w) -> cellSet(core.windowByKey, mapSetI64(cellGet(core.windowByKey), k, updateWinFrame(w, rect))),
+                    None -> (),
+                };
+                cellSet(core.windows, listMap(cellGet(core.windows), (w: TrackedWindow) -> if (w.key == k) updateWinFrame(w, rect) else w));
+                cellSet(cl, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+pub def managerCoreRestoreAllParked(
+    core: ManagerCore,
+    trusted: Bool,
+    liveFrames: List (Int64, Rect)
+): ManagerActionOutput = {
+    updateLiveFrames(core, liveFrames);
+    if (!trusted) {
+        cellSet(core.parkedKeys, Nil);
+        makeOutput(core, Nil, true, None, None)
+    } else {
+        let keysCell: Cell (List Int64) = cellNew(cellGet(core.parkedKeys));
+        let cw = cellNew(cellGet(core.windowByKey));
+        while (match cellGet(cw) { Nil -> false, _ -> true }) {
+            match cellGet(cw) {
+                Cons((key, win), r) -> {
+                    match screenForId(core, win.screenId) {
+                        Some(scr) if (isParkedWindowFrame(win.frame, scr.fullFrame) && !setHasI64(cellGet(keysCell), key)) ->
+                            cellSet(keysCell, Cons(key, cellGet(keysCell))),
+                        _ -> (),
+                    };
+                    cellSet(cw, r)
+                },
+                Nil -> (),
+            }
+        };
+        let sortedKeys = listSortBy(cellGet(keysCell), (a, b) -> a <= b);
+        let effRev: Cell (List WindowEffect) = cellNew(Nil);
+        let ck = cellNew(sortedKeys);
+        while (match cellGet(ck) { Nil -> false, _ -> true }) {
+            match cellGet(ck) {
+                Cons(key, r) -> {
+                    let winOpt = mapGetI64(cellGet(core.windowByKey), key);
+                    let screenId = match winOpt {
+                        Some(w) -> w.screenId,
+                        None -> match mapGetI64(cellGet(core.homeScreens), key) { Some(id) -> id, None -> 0 },
+                    };
+                    let resizable = match winOpt { Some(w) -> w.isResizable, None -> true };
+                    match mapGetI64(cellGet(core.savedFrames), key) {
+                        Some(saved) ->
+                            if (resizable) cellSet(effRev, Cons(EffSetFrame { key: key, rect: saved }, cellGet(effRev)))
+                            else cellSet(effRev, Cons(EffSetPosition { key: key, x: saved.x, y: saved.y }, cellGet(effRev))),
+                        None -> match (winOpt, screenForId(core, screenId)) {
+                            (Some(w), Some(scr)) ->
+                                if (resizable) {
+                                    let rect = centeredFrame(w.frame.w, w.frame.h, scr.visibleFrame);
+                                    cellSet(effRev, Cons(EffSetFrame { key: key, rect: rect }, cellGet(effRev)))
+                                } else {
+                                    let (ox, oy) = centeredOrigin(w.frame.w, w.frame.h, scr.visibleFrame);
+                                    cellSet(effRev, Cons(EffSetPosition { key: key, x: ox, y: oy }, cellGet(effRev)))
+                                },
+                            _ -> (),
+                        },
+                    };
+                    cellSet(ck, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellSet(core.parkedKeys, Nil);
+        makeOutput(core, listRev(cellGet(effRev)), true, None, None)
+    }
+}
+
+pub def managerCoreRememberFocus(core: ManagerCore, now: Float, frontmostKey: Option Int64): Void =
+    match frontmostKey {
+        None -> (),
+        Some(fk) ->
+            if (!listAny(cellGet(core.windows), (w: TrackedWindow) -> w.key == fk)) ()
+            else {
+                let blocked =
+                    if (now < cellGet(core.programmaticFocusUntil)) {
+                        match cellGet(core.programmaticFocusKey) {
+                            Some(target) ->
+                                if (fk == target) {
+                                    cellSet(core.programmaticFocusUntil, 0.0);
+                                    cellSet(core.suppressExternalFocusUntil, 0.0);
+                                    false
+                                } else true,
+                            None -> false,
+                        }
+                    } else false;
+                if (!blocked) {
+                    cellSet(core.lastFocused, Some(fk));
+                    if (managerCoreIsVirtual(core)) vwSetActiveFocus(core.virtualEngine, Some(fk), eqI64) else ()
+                } else ()
+            },
+    }
+
+pub def managerCoreBeginFocusDelivery(core: ManagerCore, now: Float, keyOpt: Option Int64): Void = {
+    cellSet(core.programmaticFocusKey, keyOpt);
+    cellSet(core.programmaticFocusUntil, match keyOpt { Some(_) -> now + 0.45, None -> 0.0 });
+    cellSet(core.suppressExternalFocusUntil, now + 0.45)
+}
+
+pub def managerCoreCancelFocusDelivery(core: ManagerCore): Void = {
+    cellSet(core.programmaticFocusKey, None);
+    cellSet(core.programmaticFocusUntil, 0.0);
+    cellSet(core.suppressExternalFocusUntil, 0.0)
+}
+
+pub def managerCoreFocusedIndex(core: ManagerCore, now: Float, frontmostKey: Option Int64): Option Int = {
+    let wins = cellGet(core.windows);
+    let fromProg =
+        if (now < cellGet(core.programmaticFocusUntil)) {
+            match cellGet(core.programmaticFocusKey) {
+                Some(target) -> listIndexOfBy(wins, (w: TrackedWindow) -> w.key == target),
+                None -> None,
+            }
+        } else None;
+    match fromProg {
+        Some(idx) -> Some(idx),
+        None -> {
+            let fromFront = match frontmostKey {
+                Some(fk) -> listIndexOfBy(wins, (w: TrackedWindow) -> w.key == fk),
+                None -> None,
+            };
+            match fromFront {
+                Some(idx) -> Some(idx),
+                None ->
+                    if (managerCoreIsVirtual(core)) {
+                        match vwActiveFocused(core.virtualEngine, eqI64) {
+                            Some(rem) -> listIndexOfBy(wins, (w: TrackedWindow) -> w.key == rem),
+                            None -> None,
+                        }
+                    } else None,
+            }
+        },
+    }
+}
+
+def emitFocus(core: ManagerCore, w: TrackedWindow, now: Float, effRev: Cell (List WindowEffect)): Void = {
+    cellSet(core.lastFocused, Some(w.key));
+    cellSet(core.programmaticFocusKey, Some(w.key));
+    let deadline = now + 0.45;
+    cellSet(core.programmaticFocusUntil, deadline);
+    if (deadline > cellGet(core.suppressExternalFocusUntil)) {
+        cellSet(core.suppressExternalFocusUntil, deadline)
+    } else ();
+    if (managerCoreIsVirtual(core)) vwSetActiveFocus(core.virtualEngine, Some(w.key), eqI64) else ();
+    cellSet(effRev, Cons(EffFocus { key: w.key, pid: w.pid }, cellGet(effRev)))
+}
+
+def emitRelinquishFocus(core: ManagerCore, effRev: Cell (List WindowEffect)): Void = {
+    cellSet(core.lastFocused, None);
+    cellSet(core.programmaticFocusKey, None);
+    cellSet(core.programmaticFocusUntil, 0.0);
+    cellSet(effRev, Cons(EffRelinquishFocus, cellGet(effRev)))
+}
+
+def setWindowFrameInMap(core: ManagerCore, key: Int64, rect: Rect): Void =
+    match mapGetI64(cellGet(core.windowByKey), key) {
+        Some(w) -> cellSet(core.windowByKey, mapSetI64(cellGet(core.windowByKey), key, updateWinFrame(w, rect))),
+        None -> (),
+    }
+
+def setWindowPosInMap(core: ManagerCore, key: Int64, x: Float, y: Float): Void =
+    match mapGetI64(cellGet(core.windowByKey), key) {
+        Some(w) -> {
+            let nr = Rect { x: x, y: y, w: w.frame.w, h: w.frame.h };
+            cellSet(core.windowByKey, mapSetI64(cellGet(core.windowByKey), key, updateWinFrame(w, nr)))
+        },
+        None -> (),
+    }
+
+pub def managerCoreTile(core: ManagerCore, now: Float, frontmostKey: Option Int64, effRev: Cell (List WindowEffect)): Void = {
+    cellSet(core.geometryGeneration, cellGet(core.geometryGeneration) + intToI64(1));
+    let screens = cellGet(core.lastScreens);
+    let mode = managerCoreLayoutMode(core);
+    let ratio = managerCoreRatio(core);
+    let masters = managerCoreMasters(core);
+
+    // 1. Unpark floating / fixed-size windows on the active workspace
+    if (managerCoreIsVirtual(core)) {
+        let ca = cellNew(cellGet(core.windows));
+        while (match cellGet(ca) { Nil -> false, _ -> true }) {
+            match cellGet(ca) {
+                Cons(w, r) -> {
+                    if (managerCoreIsFloating(core, w)) {
+                        match screenForId(core, w.screenId) {
+                            Some(scr) if (setHasI64(cellGet(core.parkedKeys), w.key) || isParkedWindowFrame(w.frame, scr.fullFrame)) -> {
+                                if (w.isResizable) {
+                                    let restored = match mapGetI64(cellGet(core.savedFrames), w.key) {
+                                        Some(sf) -> sf,
+                                        None -> centeredFrame(w.frame.w, w.frame.h, scr.visibleFrame),
+                                    };
+                                    cellSet(effRev, Cons(EffSetFrame { key: w.key, rect: restored }, cellGet(effRev)));
+                                    setWindowFrameInMap(core, w.key, restored)
+                                } else {
+                                    let (ox, oy) = match mapGetI64(cellGet(core.savedFrames), w.key) {
+                                        Some(sf) -> (sf.x, sf.y),
+                                        None -> centeredOrigin(w.frame.w, w.frame.h, scr.visibleFrame),
+                                    };
+                                    cellSet(effRev, Cons(EffSetPosition { key: w.key, x: ox, y: oy }, cellGet(effRev)));
+                                    setWindowPosInMap(core, w.key, ox, oy)
+                                };
+                                cellSet(core.parkedKeys, setRemI64(cellGet(core.parkedKeys), w.key))
+                            },
+                            _ -> (),
+                        }
+                    } else ();
+                    cellSet(ca, r)
+                },
+                Nil -> (),
+            }
+        }
+    } else ();
+
+    // 2. Tile resizable non-floating windows per display
+    let currentFocused = match managerCoreFocusedIndex(core, now, frontmostKey) {
+        Some(idx) -> listNthOpt(cellGet(core.windows), idx),
+        None -> None,
+    };
+    let cs = cellNew(screens);
+    while (match cellGet(cs) { Nil -> false, _ -> true }) {
+        match cellGet(cs) {
+            Cons(scr, sr) -> {
+                let group = listFilter(cellGet(core.windows), (w: TrackedWindow) -> w.screenId == scr.id && !managerCoreIsFloating(core, w));
+                let gLen = listLen(group);
+                if (gLen > 0) {
+                    let rect = scr.visibleFrame;
+                    let rects = match mode {
+                        1 -> mirrorTallLayoutWithGaps(rect, gLen, masters, ratio, cellGet(core.outerGap), cellGet(core.innerGap)),
+                        2 -> {
+                            let full = insetArea(rect, cellGet(core.outerGap));
+                            listMap(group, (_) -> full)
+                        },
+                        _ -> tallLayoutWithGaps(rect, gLen, masters, ratio, cellGet(core.outerGap), cellGet(core.innerGap)),
+                    };
+                    let cg = cellNew(group);
+                    let cr = cellNew(rects);
+                    while (match (cellGet(cg), cellGet(cr)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                        match (cellGet(cg), cellGet(cr)) {
+                            (Cons(w, gr), Cons(targetRect, rr)) -> {
+                                let cur = match mapGetI64(cellGet(core.windowByKey), w.key) {
+                                    Some(e) -> e.frame,
+                                    None -> w.frame,
+                                };
+                                let same = abs(cur.x - targetRect.x) < 1.0
+                                    && abs(cur.y - targetRect.y) < 1.0
+                                    && abs(cur.w - targetRect.w) < 1.0
+                                    && abs(cur.h - targetRect.h) < 1.0;
+                                if (!same) {
+                                    cellSet(effRev, Cons(EffSetFrame { key: w.key, rect: targetRect }, cellGet(effRev)));
+                                    setWindowFrameInMap(core, w.key, targetRect)
+                                } else ();
+                                cellSet(core.parkedKeys, setRemI64(cellGet(core.parkedKeys), w.key));
+                                cellSet(cg, gr);
+                                cellSet(cr, rr)
+                            },
+                            _ -> (),
+                        }
+                    };
+                    if (mode == 2) {
+                        match currentFocused {
+                            Some(curWin) if (curWin.screenId == scr.id) -> emitFocus(core, curWin, now, effRev),
+                            _ -> (),
+                        }
+                    } else ()
+                } else ();
+                cellSet(cs, sr)
+            },
+            Nil -> (),
+        }
+    };
+
+    // 3. Park inactive virtual workspace windows at 1px corner
+    if (managerCoreIsVirtual(core)) {
+        let allFullRects = listMap(screens, (s: ScreenSpec) -> s.fullFrame);
+        let ci = cellNew(vwInactiveWindows(core.virtualEngine));
+        while (match cellGet(ci) { Nil -> false, _ -> true }) {
+            match cellGet(ci) {
+                Cons(key, kr) -> {
+                    match mapGetI64(cellGet(core.windowByKey), key) {
+                        Some(w) -> match screenForId(core, w.screenId) {
+                            Some(scr) -> {
+                                if (!isParkedWindowFrame(w.frame, scr.fullFrame)) {
+                                    let shouldSave = !w.isResizable
+                                        || setHasI64(cellGet(core.floating), key)
+                                        || (match mapGetI64(cellGet(core.savedFrames), key) { None -> true, Some(_) -> false });
+                                    if (shouldSave) {
+                                        cellSet(core.savedFrames, mapSetI64(cellGet(core.savedFrames), key, w.frame))
+                                    } else ();
+                                    let (ox, oy) = parkedWindowOrigin(w.frame.w, w.frame.h, scr.fullFrame, allFullRects);
+                                    cellSet(effRev, Cons(EffSetPosition { key: key, x: ox, y: oy }, cellGet(effRev)));
+                                    setWindowPosInMap(core, key, ox, oy)
+                                } else ();
+                                cellSet(core.parkedKeys, setAddI64(cellGet(core.parkedKeys), key))
+                            },
+                            None -> (),
+                        },
+                        None -> (),
+                    };
+                    cellSet(ci, kr)
+                },
+                Nil -> (),
+            }
+        }
+    } else ();
+
+    // Sync updated frames back into `core.windows`
+    let updatedMap = cellGet(core.windowByKey);
+    cellSet(core.windows, listMap(cellGet(core.windows), (w: TrackedWindow) -> match mapGetI64(updatedMap, w.key) {
+        Some(u) -> updateWinFrame(w, u.frame),
+        None -> w,
+    }))
+}
+
+def updateHistory(core: ManagerCore, aliveKeysOpt: Option (List Int64), deadKeys: List Int64): Void = {
+    let cleaned = listFilter(cellGet(core.history), (k) -> !setHasI64(deadKeys, k));
+    let activeKeys = listMap(cellGet(core.windows), (w: TrackedWindow) -> w.key);
+    let merged = mergeHistory(cleaned, activeKeys, eqI64);
+    cellSet(core.history, merged);
+
+    let knownAlive = match aliveKeysOpt {
+        Some(al) -> listAppend(merged, al),
+        None -> merged,
+    };
+    let keep = (k: Int64) -> setHasI64(knownAlive, k);
+    cellSet(core.floating, listFilter(cellGet(core.floating), keep));
+    cellSet(core.autoFloatedKeys, listFilter(cellGet(core.autoFloatedKeys), keep));
+    cellSet(core.userToggledFloatKeys, listFilter(cellGet(core.userToggledFloatKeys), keep));
+    cellSet(core.savedFrames, listFilter(cellGet(core.savedFrames), (p) -> { let (k, _) = p; keep(k) }));
+    cellSet(core.homeScreens, listFilter(cellGet(core.homeScreens), (p) -> { let (k, _) = p; keep(k) }));
+    cellSet(core.parkedKeys, listFilter(cellGet(core.parkedKeys), keep))
+}
+
+def makeOutput(
+    core: ManagerCore,
+    effects: List WindowEffect,
+    statusChanged: Bool,
+    pausedToggled: Option Bool,
+    traceLog: Option String
+): ManagerActionOutput = {
+    let framesCell: Cell (List (Int64, Rect)) = cellNew(
+        listMap(cellGet(core.windowByKey), (p: (Int64, TrackedWindow)) -> { let (k, w) = p; (k, w.frame) })
+    );
+    let cw = cellNew(cellGet(core.windows));
+    while (match cellGet(cw) { Nil -> false, _ -> true }) {
+        match cellGet(cw) {
+            Cons(w, r) -> { cellSet(framesCell, mapSetI64(cellGet(framesCell), w.key, w.frame)); cellSet(cw, r) },
+            Nil -> (),
+        }
+    };
+    let ce = cellNew(effects);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) {
+            Cons(EffSetFrame { key, rect }, r) -> {
+                cellSet(framesCell, mapSetI64(cellGet(framesCell), key, rect));
+                cellSet(ce, r)
+            },
+            Cons(EffSetPosition { key, x, y }, r) -> {
+                match mapGetI64(cellGet(framesCell), key) {
+                    Some(cur) -> cellSet(framesCell, mapSetI64(cellGet(framesCell), key, Rect { x: x, y: y, w: cur.w, h: cur.h })),
+                    None -> (),
+                };
+                cellSet(ce, r)
+            },
+            Cons(_, r) -> cellSet(ce, r),
+            Nil -> (),
+        }
+    };
+    let sortedFrames = listSortBy(cellGet(framesCell), (a, b) -> { let (ka, _) = a; let (kb, _) = b; ka <= kb });
+    ManagerActionOutput {
+        geometryGeneration: cellGet(core.geometryGeneration),
+        windowFrames: sortedFrames,
+        effects: effects,
+        activeWindowKeys: listMap(cellGet(core.windows), (w: TrackedWindow) -> w.key),
+        observeWindowKeys: listMap(cellGet(core.windowByKey), (p) -> { let (k, _) = p; k }),
+        paused: cellGet(core.paused),
+        pausedToggled: pausedToggled,
+        layoutName: managerCoreLayoutName(core),
+        activeWorkspace: vwActive(core.virtualEngine),
+        workspaceCount: vwCount(core.virtualEngine),
+        isVirtualMode: managerCoreIsVirtual(core),
+        statusChanged: statusChanged,
+        traceLog: traceLog,
+    }
+}
+
+def bestScreenForFrame(screens: List ScreenSpec, frame: Rect): Option ScreenSpec = {
+    let best: Cell (Option (ScreenSpec, Float)) = cellNew(None);
+    let cs = cellNew(screens);
+    while (match cellGet(cs) { Nil -> false, _ -> true }) {
+        match cellGet(cs) {
+            Cons(s, r) -> {
+                let area = rectIntersectionArea(s.fullFrame, frame);
+                match cellGet(best) {
+                    None -> cellSet(best, Some((s, area))),
+                    Some((_, ba)) -> if (area > ba) cellSet(best, Some((s, area))) else (),
+                };
+                cellSet(cs, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(best) { Some((s, _)) -> Some(s), None -> None }
+}
+
+pub def managerCoreRefresh(
+    core: ManagerCore,
+    force: Bool,
+    now: Float,
+    screens: List ScreenSpec,
+    candidates: List CandidateWindow,
+    busyPids: List Int,
+    visibleWindowIds: List Int,
+    allExistingCgWindowIds: List Int,
+    deadHistoryKeys: List Int64,
+    eligibleVisibleWindowExists: Bool,
+    frontmostKey: Option Int64,
+    traceEvents: Bool
+): ManagerActionOutput =
+    if (cellGet(core.paused) || listLen(screens) == 0) {
+        makeOutput(core, Nil, true, None, None)
+    } else {
+        cellSet(core.lastScreens, screens);
+        if (listLen(allExistingCgWindowIds) > 0) {
+            let keepWid = (wid: Int) -> setHasInt(allExistingCgWindowIds, wid);
+            cellSet(core.lastWorkspaceByWid, listFilter(cellGet(core.lastWorkspaceByWid), (p) -> { let (k, _) = p; keepWid(k) }));
+            cellSet(core.persistedWindowRank, listFilter(cellGet(core.persistedWindowRank), (p) -> { let (k, _) = p; keepWid(k) }));
+            cellSet(core.persistedFloatingIds, listFilter(cellGet(core.persistedFloatingIds), keepWid));
+            cellSet(core.persistedSavedFrames, listFilter(cellGet(core.persistedSavedFrames), (p) -> { let (k, _) = p; keepWid(k) }))
+        } else ();
+
+        let effRev: Cell (List WindowEffect) = cellNew(Nil);
+        let foundRev: Cell (List TrackedWindow) = cellNew(Nil);
+        let nextMap: Cell (List (Int64, TrackedWindow)) = cellNew(Nil);
+        let newlyAutoFloated: Cell (List Int64) = cellNew(Nil);
+
+        // Carry forward windows from transient busy PIDs
+        let cp = cellNew(cellGet(core.windowByKey));
+        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+            match cellGet(cp) {
+                Cons((_, prevWin), r) -> {
+                    if (setHasInt(busyPids, prevWin.pid)) {
+                        match prevWin.windowId {
+                            Some(wid) if (setHasInt(visibleWindowIds, wid)) -> {
+                                cellSet(foundRev, Cons(prevWin, cellGet(foundRev)));
+                                cellSet(nextMap, mapSetI64(cellGet(nextMap), prevWin.key, prevWin))
+                            },
+                            _ -> (),
+                        }
+                    } else ();
+                    cellSet(cp, r)
+                },
+                Nil -> (),
+            }
+        };
+
+        let cc = cellNew(candidates);
+        while (match cellGet(cc) { Nil -> false, _ -> true }) {
+            match cellGet(cc) {
+                Cons(cand, rc) -> {
+                    let alreadyPresent = match mapGetI64(cellGet(nextMap), cand.key) { Some(_) -> true, None -> false };
+                    let ignored = match cand.bundleId {
+                        Some(b) -> listContainsBy(cellGet(core.ignoredApps), b, eqStr),
+                        None -> false,
+                    };
+                    let skipNonResizable = !managerCoreIsVirtual(core) && !cand.isResizable;
+                    if (!alreadyPresent && !ignored && !skipNonResizable) {
+                        let fCell = cellNew(cand.frame);
+                        let homeMatch = match mapGetI64(cellGet(core.homeScreens), cand.key) {
+                            Some(homeId) -> match listFindBy(screens, (s: ScreenSpec) -> s.id == homeId) {
+                                Some(homeScr) if (isParkedWindowFrame(cellGet(fCell), homeScr.fullFrame)) -> Some(homeScr),
+                                _ -> None,
+                            },
+                            None -> None,
+                        };
+                        let scrOpt = match homeMatch {
+                            Some(hs) -> Some(hs),
+                            None -> bestScreenForFrame(screens, cellGet(fCell)),
+                        };
+                        match scrOpt {
+                            Some(screen) if (rectIntersects(screen.fullFrame, cellGet(fCell))) -> {
+                                match cand.windowId {
+                                    Some(wid) -> {
+                                        match mapGetInt(cellGet(core.persistedSavedFrames), wid) {
+                                            Some(pr) -> {
+                                                cellSet(core.persistedSavedFrames, mapRemInt(cellGet(core.persistedSavedFrames), wid));
+                                                match mapGetI64(cellGet(core.savedFrames), cand.key) {
+                                                    None -> cellSet(core.savedFrames, mapSetI64(cellGet(core.savedFrames), cand.key, pr)),
+                                                    Some(_) -> (),
+                                                }
+                                            },
+                                            None -> (),
+                                        };
+                                        if (setHasInt(cellGet(core.persistedFloatingIds), wid)) {
+                                            cellSet(core.persistedFloatingIds, setRemInt(cellGet(core.persistedFloatingIds), wid));
+                                            cellSet(core.floating, setAddI64(cellGet(core.floating), cand.key));
+                                            if (!shouldAutoFloat(core, cand.bundleId, cand.title)) {
+                                                cellSet(core.userToggledFloatKeys, setAddI64(cellGet(core.userToggledFloatKeys), cand.key))
+                                            } else {
+                                                cellSet(core.autoFloatedKeys, setAddI64(cellGet(core.autoFloatedKeys), cand.key))
+                                            }
+                                        } else ()
+                                    },
+                                    None -> (),
+                                };
+
+                                if (cand.isResizable && !setHasI64(cellGet(core.userToggledFloatKeys), cand.key)) {
+                                    if (shouldAutoFloat(core, cand.bundleId, cand.title)) {
+                                        let wasFloating = setHasI64(cellGet(core.floating), cand.key);
+                                        cellSet(core.floating, setAddI64(cellGet(core.floating), cand.key));
+                                        cellSet(core.autoFloatedKeys, setAddI64(cellGet(core.autoFloatedKeys), cand.key));
+                                        let wasKnown = match mapGetI64(cellGet(core.windowByKey), cand.key) { Some(_) -> true, None -> false };
+                                        if (!wasFloating && wasKnown) {
+                                            cellSet(newlyAutoFloated, Cons(cand.key, cellGet(newlyAutoFloated)))
+                                        } else ()
+                                    } else if (setHasI64(cellGet(core.autoFloatedKeys), cand.key)) {
+                                        cellSet(core.floating, setRemI64(cellGet(core.floating), cand.key));
+                                        cellSet(core.autoFloatedKeys, setRemI64(cellGet(core.autoFloatedKeys), cand.key))
+                                    } else ()
+                                } else ();
+
+                                let fCur = cellGet(fCell);
+                                let parkedNow = isParkedWindowFrame(fCur, screen.fullFrame);
+                                let belongsInactiveOnSeed =
+                                    if (managerCoreIsVirtual(core) && !cellGet(core.virtualSeeded)) {
+                                        let tWs = match cand.windowId {
+                                            Some(wid) -> match mapGetInt(cellGet(core.lastWorkspaceByWid), wid) {
+                                                Some(pw) -> Some(pw),
+                                                None -> assignedWorkspace(core, cand.bundleId),
+                                            },
+                                            None -> assignedWorkspace(core, cand.bundleId),
+                                        };
+                                        match tWs {
+                                            Some(ws) -> ws != vwActive(core.virtualEngine),
+                                            None -> false,
+                                        }
+                                    } else false;
+
+                                if (parkedNow && !setHasI64(cellGet(core.parkedKeys), cand.key)) {
+                                    if (belongsInactiveOnSeed) {
+                                        cellSet(core.homeScreens, mapSetI64(cellGet(core.homeScreens), cand.key, screen.id));
+                                        cellSet(core.parkedKeys, setAddI64(cellGet(core.parkedKeys), cand.key))
+                                    } else if (cand.isResizable) {
+                                        let rescued = match mapGetI64(cellGet(core.savedFrames), cand.key) {
+                                            Some(sf) -> sf,
+                                            None -> centeredFrame(fCur.w, fCur.h, screen.visibleFrame),
+                                        };
+                                        cellSet(effRev, Cons(EffSetFrame { key: cand.key, rect: rescued }, cellGet(effRev)));
+                                        cellSet(fCell, rescued)
+                                    } else {
+                                        let (ox, oy) = match mapGetI64(cellGet(core.savedFrames), cand.key) {
+                                            Some(sf) -> (sf.x, sf.y),
+                                            None -> centeredOrigin(fCur.w, fCur.h, screen.visibleFrame),
+                                        };
+                                        cellSet(effRev, Cons(EffSetPosition { key: cand.key, x: ox, y: oy }, cellGet(effRev)));
+                                        cellSet(fCell, Rect { x: ox, y: oy, w: fCur.w, h: fCur.h })
+                                    }
+                                } else if (!parkedNow) {
+                                    cellSet(core.homeScreens, mapSetI64(cellGet(core.homeScreens), cand.key, screen.id));
+                                    let noSaved = match mapGetI64(cellGet(core.savedFrames), cand.key) { None -> true, Some(_) -> false };
+                                    if (noSaved || setHasI64(cellGet(core.floating), cand.key) || !cand.isResizable) {
+                                        let area = screen.visibleFrame;
+                                        let inset = insetArea(area, cellGet(core.outerGap));
+                                        let matchesFullTiled =
+                                            (abs(fCur.w - area.w) <= 4.0 && abs(fCur.h - area.h) <= 4.0)
+                                            || (abs(fCur.w - inset.w) <= 4.0 && abs(fCur.h - inset.h) <= 4.0);
+                                        if (setHasI64(cellGet(newlyAutoFloated), cand.key) && matchesFullTiled) {
+                                            let fb = centeredFrame(minFloat(area.w * 0.72, 960.0), minFloat(area.h * 0.76, 720.0), area);
+                                            cellSet(core.savedFrames, mapSetI64(cellGet(core.savedFrames), cand.key, fb));
+                                            cellSet(effRev, Cons(EffSetFrame { key: cand.key, rect: fb }, cellGet(effRev)));
+                                            cellSet(fCell, fb)
+                                        } else {
+                                            cellSet(core.savedFrames, mapSetI64(cellGet(core.savedFrames), cand.key, fCur))
+                                        }
+                                    } else ()
+                                } else ();
+
+                                let win = TrackedWindow {
+                                    key: cand.key,
+                                    pid: cand.pid,
+                                    bundleId: cand.bundleId,
+                                    windowId: cand.windowId,
+                                    title: cand.title,
+                                    screenId: screen.id,
+                                    isResizable: cand.isResizable,
+                                    frame: cellGet(fCell),
+                                };
+                                cellSet(foundRev, Cons(win, cellGet(foundRev)));
+                                cellSet(nextMap, mapSetI64(cellGet(nextMap), win.key, win))
+                            },
+                            _ -> (),
+                        }
+                    } else ();
+                    cellSet(cc, rc)
+                },
+                Nil -> (),
+            }
+        };
+
+        let found = listRev(cellGet(foundRev));
+        let finalMap = cellGet(nextMap);
+
+        if (managerCoreIsVirtual(core)
+            && listLen(found) == 0
+            && eligibleVisibleWindowExists
+            && cellGet(core.virtualSeeded)
+            && listLen(vwAllWindows(core.virtualEngine)) > 0) {
+            makeOutput(core, listRev(cellGet(effRev)), true, None, None)
+        } else {
+            cellSet(core.windowByKey, finalMap);
+            if (managerCoreIsVirtual(core)) {
+                let effFront = if (now >= cellGet(core.suppressExternalFocusUntil)) frontmostKey else None;
+                let foundKeys = listMap(found, (w: TrackedWindow) -> w.key);
+                if (!cellGet(core.virtualSeeded) && (listLen(found) > 0 || !eligibleVisibleWindowExists)) {
+                    let orderedSeed = orderUsingHistory(foundKeys, cellGet(core.history), eqI64);
+                    let lastWsMap = cellGet(core.lastWorkspaceByWid);
+                    let appWsMap = cellGet(core.appWorkspaces);
+                    let wsCount = vwCount(core.virtualEngine);
+                    let labels = cellGet(core.spaceLabels);
+                    let rankMap = cellGet(core.persistedWindowRank);
+                    let focusMap = cellGet(core.persistedFocusedByWs);
+                    vwSeedFromCurrentDesktop(
+                        core.virtualEngine,
+                        orderedSeed,
+                        effFront,
+                        (key) -> match mapGetI64(finalMap, key) {
+                            None -> None,
+                            Some(win) -> {
+                                let fromPrev = match win.windowId {
+                                    Some(wid) -> mapGetInt(lastWsMap, wid),
+                                    None -> None,
+                                };
+                                match fromPrev {
+                                    Some(pw) -> Some(pw),
+                                    None -> match win.bundleId {
+                                        Some(b) -> match lookupAppWorkspace(appWsMap, b) {
+                                            Some(tgt) -> resolveWorkspaceTarget(tgt, wsCount, labels),
+                                            None -> None,
+                                        },
+                                        None -> None,
+                                    },
+                                }
+                            },
+                        },
+                        (key) -> match mapGetI64(finalMap, key) {
+                            Some(win) -> match win.windowId { Some(wid) -> mapGetInt(rankMap, wid), None -> None },
+                            None -> None,
+                        },
+                        (ws, cands) -> match mapGetInt(focusMap, ws) {
+                            None -> None,
+                            Some(targetWid) -> listFindBy(cands, (k) -> match mapGetI64(finalMap, k) {
+                                Some(w) -> optEqBy(w.windowId, Some(targetWid), eqInt),
+                                None -> false,
+                            }),
+                        },
+                        eqI64
+                    );
+                    cellSet(core.persistedWindowRank, Nil);
+                    cellSet(core.persistedFocusedByWs, Nil);
+                    cellSet(core.virtualSeeded, true)
+                } else ();
+
+                let switchedExt = match effFront {
+                    Some(fk) -> match vwHandleExternalFocus(core.virtualEngine, fk, eqI64) { Some(_) -> true, None -> false },
+                    None -> false,
+                };
+
+                let lastWsMap = cellGet(core.lastWorkspaceByWid);
+                let appWsMap = cellGet(core.appWorkspaces);
+                let wsCount = vwCount(core.virtualEngine);
+                let labels = cellGet(core.spaceLabels);
+                let floatingSet = cellGet(core.floating);
+                let activeWs = vwActive(core.virtualEngine);
+                let activePidsRev: Cell (List Int) = cellNew(Nil);
+                let caw = cellNew(vwActiveWindows(core.virtualEngine));
+                while (match cellGet(caw) { Nil -> false, _ -> true }) {
+                    match cellGet(caw) {
+                        Cons(k, kr) -> {
+                            match mapGetI64(finalMap, k) {
+                                Some(w) -> cellSet(activePidsRev, setAddInt(cellGet(activePidsRev), w.pid)),
+                                None -> (),
+                            };
+                            cellSet(caw, kr)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let activePids = cellGet(activePidsRev);
+
+                let (stacksChanged, autoShifted) = vwReconcile(
+                    core.virtualEngine,
+                    foundKeys,
+                    effFront,
+                    (key) -> match mapGetI64(finalMap, key) {
+                        None -> None,
+                        Some(win) -> {
+                            let fromPrev = match win.windowId {
+                                Some(wid) -> mapGetInt(lastWsMap, wid),
+                                None -> None,
+                            };
+                            match fromPrev {
+                                Some(pw) -> Some(pw),
+                                None ->
+                                    if (setHasI64(floatingSet, key) && setHasInt(activePids, win.pid)) Some(activeWs)
+                                    else match win.bundleId {
+                                        Some(b) -> match lookupAppWorkspace(appWsMap, b) {
+                                            Some(tgt) -> resolveWorkspaceTarget(tgt, wsCount, labels),
+                                            None -> None,
+                                        },
+                                        None -> None,
+                                    },
+                            }
+                        },
+                    },
+                    (newKey, anchorKey) -> match (mapGetI64(finalMap, newKey), mapGetI64(finalMap, anchorKey)) {
+                        (Some(w1), Some(w2)) -> w1.screenId == w2.screenId,
+                        _ -> false,
+                    },
+                    eqI64
+                );
+
+                if (listLen(autoShifted) > 0) cellSet(core.suppressExternalFocusUntil, now + 0.65) else ();
+
+                let nextActiveRev: Cell (List TrackedWindow) = cellNew(Nil);
+                let cnaw = cellNew(vwActiveWindows(core.virtualEngine));
+                while (match cellGet(cnaw) { Nil -> false, _ -> true }) {
+                    match cellGet(cnaw) {
+                        Cons(k, kr) -> {
+                            match mapGetI64(finalMap, k) {
+                                Some(w) -> cellSet(nextActiveRev, Cons(w, cellGet(nextActiveRev))),
+                                None -> (),
+                            };
+                            cellSet(cnaw, kr)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let nextActiveWins = listRev(cellGet(nextActiveRev));
+                let prevWins = cellGet(core.windows);
+                let activeChanged =
+                    listLen(cellGet(newlyAutoFloated)) > 0
+                    || listLen(nextActiveWins) != listLen(prevWins)
+                    || {
+                        let ca = cellNew(nextActiveWins);
+                        let cb = cellNew(prevWins);
+                        let diff = cellNew(false);
+                        while (match (cellGet(ca), cellGet(cb)) { (Cons(_, _), Cons(_, _)) -> !cellGet(diff), _ -> false }) {
+                            match (cellGet(ca), cellGet(cb)) {
+                                (Cons(a, ta), Cons(b, tb)) -> {
+                                    if (a.key != b.key || a.screenId != b.screenId || a.isResizable != b.isResizable
+                                        || managerCoreIsFloating(core, a) != managerCoreIsFloating(core, b)) {
+                                        cellSet(diff, true)
+                                    } else ();
+                                    cellSet(ca, ta);
+                                    cellSet(cb, tb)
+                                },
+                                _ -> (),
+                            }
+                        };
+                        cellGet(diff)
+                    };
+
+                cellSet(core.windows, nextActiveWins);
+                match vwActiveFocused(core.virtualEngine, eqI64) {
+                    Some(f) -> cellSet(core.lastFocused, Some(f)),
+                    None -> (),
+                };
+                let aliveKeys = listMap(finalMap, (p) -> { let (k, _) = p; k });
+                updateHistory(core, Some(aliveKeys), deadHistoryKeys);
+
+                let traceLog = if (traceEvents) {
+                    Some("refresh(virtual) ws=" + intToStr(vwActive(core.virtualEngine) + 1)
+                        + " active=" + intToStr(listLen(nextActiveWins))
+                        + " total=" + intToStr(listLen(found))
+                        + " changed=" + (if (stacksChanged || activeChanged) "true" else "false"))
+                } else None;
+
+                if (stacksChanged || activeChanged || switchedExt || force) {
+                    managerCoreTile(core, now, frontmostKey, effRev)
+                } else ();
+
+                if (listLen(autoShifted) > 0) {
+                    let frontWasShifted = match frontmostKey {
+                        None -> true,
+                        Some(fk) -> setHasI64(autoShifted, fk),
+                    };
+                    if (frontWasShifted) {
+                        match vwActiveFocused(core.virtualEngine, eqI64) {
+                            Some(af) -> match mapGetI64(finalMap, af) {
+                                Some(win) -> emitFocus(core, win, now, effRev),
+                                None -> (),
+                            },
+                            None -> if (listLen(cellGet(core.windows)) == 0) emitRelinquishFocus(core, effRev) else (),
+                        }
+                    } else ()
+                } else ();
+
+                if (cellGet(core.virtualSeeded) && (stacksChanged || activeChanged || switchedExt || force)) {
+                    managerCoreRecordSessionState(core)
+                } else ();
+
+                makeOutput(core, listRev(cellGet(effRev)), true, None, traceLog)
+            } else {
+                // Native Spaces mode
+                let foundKeys = listMap(found, (w: TrackedWindow) -> w.key);
+                let orderedKeys = cellNew(orderUsingHistory(foundKeys, cellGet(core.history), eqI64));
+                let hist = cellGet(core.history);
+                let cf = cellNew(found);
+                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                    match cellGet(cf) {
+                        Cons(w, fr) -> {
+                            if (!setHasI64(hist, w.key)) {
+                                let without = listFilter(cellGet(orderedKeys), (k) -> k != w.key);
+                                let inserted = match cellGet(core.lastFocused) {
+                                    Some(fk) -> match listIndexOfBy(without, (k) -> k == fk && (match mapGetI64(finalMap, k) {
+                                        Some(ow) -> ow.screenId == w.screenId,
+                                        None -> false,
+                                    })) {
+                                        Some(idx) -> Some(listInsertAt(without, idx, w.key)),
+                                        None -> None,
+                                    },
+                                    None -> None,
+                                };
+                                match inserted {
+                                    Some(nl) -> cellSet(orderedKeys, nl),
+                                    None -> cellSet(orderedKeys, listAppend(without, [w.key])),
+                                }
+                            } else ();
+                            cellSet(cf, fr)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let orderedRev: Cell (List TrackedWindow) = cellNew(Nil);
+                let cok = cellNew(cellGet(orderedKeys));
+                while (match cellGet(cok) { Nil -> false, _ -> true }) {
+                    match cellGet(cok) {
+                        Cons(k, kr) -> {
+                            match mapGetI64(finalMap, k) {
+                                Some(w) -> cellSet(orderedRev, Cons(w, cellGet(orderedRev))),
+                                None -> (),
+                            };
+                            cellSet(cok, kr)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let ordered = listRev(cellGet(orderedRev));
+                let prevWins = cellGet(core.windows);
+                let changed = listLen(ordered) != listLen(prevWins) || {
+                    let ca = cellNew(ordered);
+                    let cb = cellNew(prevWins);
+                    let diff = cellNew(false);
+                    while (match (cellGet(ca), cellGet(cb)) { (Cons(_, _), Cons(_, _)) -> !cellGet(diff), _ -> false }) {
+                        match (cellGet(ca), cellGet(cb)) {
+                            (Cons(a, ta), Cons(b, tb)) -> {
+                                if (a.key != b.key || a.screenId != b.screenId) cellSet(diff, true) else ();
+                                cellSet(ca, ta);
+                                cellSet(cb, tb)
+                            },
+                            _ -> (),
+                        }
+                    };
+                    cellGet(diff)
+                };
+                let traceLog = if (traceEvents) {
+                    Some("refresh " + floatToStr(now) + " windows=" + intToStr(listLen(ordered)) + " changed=" + (if (changed) "true" else "false"))
+                } else None;
+                cellSet(core.windows, ordered);
+                managerCoreRememberFocus(core, now, frontmostKey);
+                updateHistory(core, None, deadHistoryKeys);
+                if (changed || force) managerCoreTile(core, now, frontmostKey, effRev) else ();
+                makeOutput(core, listRev(cellGet(effRev)), true, None, traceLog)
+            }
+        }
+    }
+
+def activeTrackedFromEngine(core: ManagerCore): List TrackedWindow = {
+    let wMap = cellGet(core.windowByKey);
+    let rev: Cell (List TrackedWindow) = cellNew(Nil);
+    let cur = cellNew(vwActiveWindows(core.virtualEngine));
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(k, r) -> {
+                match mapGetI64(wMap, k) {
+                    Some(w) -> cellSet(rev, Cons(w, cellGet(rev))),
+                    None -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+pub def managerCoreHandleAxFocus(
+    core: ManagerCore,
+    now: Float,
+    trusted: Bool,
+    locked: Bool,
+    frontmostKey: Option Int64,
+    liveFrames: List (Int64, Rect)
+): ManagerActionOutput = {
+    updateLiveFrames(core, liveFrames);
+    if (trusted && !locked) managerCoreRememberFocus(core, now, frontmostKey) else ();
+    if (!managerCoreIsVirtual(core) || cellGet(core.paused) || !trusted || locked
+        || now < cellGet(core.suppressExternalFocusUntil)) {
+        managerCoreRememberFocus(core, now, frontmostKey);
+        makeOutput(core, Nil, false, None, None)
+    } else match frontmostKey {
+        Some(fk) -> match vwHandleExternalFocus(core.virtualEngine, fk, eqI64) {
+            Some(_) -> {
+                cellSet(core.lastFocused, Some(fk));
+                cellSet(core.windows, activeTrackedFromEngine(core));
+                let effRev: Cell (List WindowEffect) = cellNew(Nil);
+                managerCoreTile(core, now, frontmostKey, effRev);
+                match mapGetI64(cellGet(core.windowByKey), fk) {
+                    Some(win) -> emitFocus(core, win, now, effRev),
+                    None -> (),
+                };
+                managerCoreRecordSessionState(core);
+                makeOutput(core, listRev(cellGet(effRev)), true, None, None)
+            },
+            None -> {
+                managerCoreRememberFocus(core, now, frontmostKey);
+                makeOutput(core, Nil, false, None, None)
+            },
+        },
+        None -> {
+            managerCoreRememberFocus(core, now, frontmostKey);
+            makeOutput(core, Nil, false, None, None)
+        },
+    }
+}
+
+pub def managerCoreHandleAppActivated(
+    core: ManagerCore,
+    pid: Int,
+    now: Float,
+    trusted: Bool,
+    locked: Bool,
+    appFocusedKey: Option Int64,
+    liveFrames: List (Int64, Rect)
+): ManagerActionOutput = {
+    updateLiveFrames(core, liveFrames);
+    if (trusted && !locked) {
+        managerCoreRememberFocus(core, now, appFocusedKey);
+        if (listLen(cellGet(core.windows)) == 0 && (match cellGet(core.programmaticFocusKey) { None -> true, Some(_) -> false })) {
+            cellSet(core.suppressExternalFocusUntil, 0.0)
+        } else ()
+    } else ();
+    if (!managerCoreIsVirtual(core) || cellGet(core.paused) || !trusted || locked
+        || now < cellGet(core.suppressExternalFocusUntil)) {
+        makeOutput(core, Nil, false, None, None)
+    } else {
+        let targetKey = match appFocusedKey {
+            Some(k) -> Some(k),
+            None -> {
+                let wMap = cellGet(core.windowByKey);
+                let appKeys = listFilter(vwAllWindows(core.virtualEngine), (k) ->
+                    match mapGetI64(wMap, k) { Some(w) -> w.pid == pid, None -> false }
+                );
+                let actSet = vwActiveWindows(core.virtualEngine);
+                if (!listAny(appKeys, (k) -> setHasI64(actSet, k))) {
+                    match appKeys { Cons(h, _) -> Some(h), Nil -> None }
+                } else None
+            },
+        };
+        match targetKey {
+            Some(tk) -> match vwHandleExternalFocus(core.virtualEngine, tk, eqI64) {
+                Some(_) -> {
+                    cellSet(core.lastFocused, Some(tk));
+                    cellSet(core.windows, activeTrackedFromEngine(core));
+                    let effRev: Cell (List WindowEffect) = cellNew(Nil);
+                    managerCoreTile(core, now, Some(tk), effRev);
+                    match mapGetI64(cellGet(core.windowByKey), tk) {
+                        Some(win) -> emitFocus(core, win, now, effRev),
+                        None -> (),
+                    };
+                    managerCoreRecordSessionState(core);
+                    makeOutput(core, listRev(cellGet(effRev)), true, None, None)
+                },
+                None -> makeOutput(core, Nil, false, None, None),
+            },
+            None -> makeOutput(core, Nil, false, None, None),
+        }
+    }
+}
+
+pub def managerCoreSwitchWorkspace(
+    core: ManagerCore,
+    index: Int,
+    now: Float,
+    trusted: Bool,
+    frontmostKey: Option Int64,
+    liveFrames: List (Int64, Rect)
+): ManagerActionOutput = {
+    updateLiveFrames(core, liveFrames);
+    if (!managerCoreIsVirtual(core) || cellGet(core.paused) || !trusted || index < 0 || index >= vwCount(core.virtualEngine)) {
+        makeOutput(core, Nil, true, None, None)
+    } else {
+        managerCoreRememberFocus(core, now, frontmostKey);
+        cellSet(core.suppressExternalFocusUntil, now + 0.45);
+        let effRev: Cell (List WindowEffect) = cellNew(Nil);
+        if (vwSwitchTo(core.virtualEngine, index, eqI64)) {
+            cellSet(core.windows, activeTrackedFromEngine(core));
+            managerCoreTile(core, now, frontmostKey, effRev)
+        } else ();
+        match vwActiveFocused(core.virtualEngine, eqI64) {
+            Some(tk) -> match mapGetI64(cellGet(core.windowByKey), tk) {
+                Some(tw) -> emitFocus(core, tw, now, effRev),
+                None -> (),
+            },
+            None -> if (listLen(cellGet(core.windows)) == 0) emitRelinquishFocus(core, effRev) else (),
+        };
+        managerCoreRecordSessionState(core);
+        makeOutput(core, listRev(cellGet(effRev)), true, None, None)
+    }
+}
+
+pub def managerCoreMoveWindowToWorkspace(
+    core: ManagerCore,
+    index: Int,
+    now: Float,
+    trusted: Bool,
+    frontmostKey: Option Int64,
+    liveFrames: List (Int64, Rect)
+): ManagerActionOutput = {
+    updateLiveFrames(core, liveFrames);
+    if (!managerCoreIsVirtual(core) || cellGet(core.paused) || !trusted || index < 0 || index >= vwCount(core.virtualEngine)) {
+        makeOutput(core, Nil, true, None, None)
+    } else match managerCoreFocusedIndex(core, now, frontmostKey) {
+        None -> makeOutput(core, Nil, true, None, None),
+        Some(i) -> match listNthOpt(cellGet(core.windows), i) {
+            None -> makeOutput(core, Nil, true, None, None),
+            Some(moving) -> {
+                cellSet(core.suppressExternalFocusUntil, now + 0.45);
+                let (moved, nextFocusOpt) = vwMoveWindow(core.virtualEngine, moving.key, index, eqI64);
+                if (!moved) makeOutput(core, Nil, true, None, None)
+                else {
+                    match moving.windowId {
+                        Some(wid) -> cellSet(core.lastWorkspaceByWid, mapSetInt(cellGet(core.lastWorkspaceByWid), wid, index)),
+                        None -> (),
+                    };
+                    cellSet(core.windows, activeTrackedFromEngine(core));
+                    let effRev: Cell (List WindowEffect) = cellNew(Nil);
+                    managerCoreTile(core, now, frontmostKey, effRev);
+                    match nextFocusOpt {
+                        Some(nk) -> match mapGetI64(cellGet(core.windowByKey), nk) {
+                            Some(nw) -> emitFocus(core, nw, now, effRev),
+                            None -> emitRelinquishFocus(core, effRev),
+                        },
+                        None -> emitRelinquishFocus(core, effRev),
+                    };
+                    managerCoreRecordSessionState(core);
+                    makeOutput(core, listRev(cellGet(effRev)), true, None, None)
+                }
+            },
+        },
+    }
+}
+
+def syncActiveVirtualStack(core: ManagerCore): Void =
+    if (managerCoreIsVirtual(core)) {
+        let keys = listMap(cellGet(core.windows), (w: TrackedWindow) -> w.key);
+        vwReplaceActiveStack(core.virtualEngine, keys, eqI64)
+    } else ()
+
+pub def managerCoreHandleKey(
+    core: ManagerCore,
+    code: Int,
+    shift: Bool,
+    now: Float,
+    trusted: Bool,
+    frontmostKey: Option Int64,
+    liveFrames: List (Int64, Rect)
+): ManagerActionOutput = {
+    updateLiveFrames(core, liveFrames);
+    if (code == kvkAnsiP()) {
+        let nextPaused = !cellGet(core.paused);
+        cellSet(core.paused, nextPaused);
+        makeOutput(core, Nil, true, Some(nextPaused), None)
+    } else if (cellGet(core.paused) || !trusted) {
+        makeOutput(core, Nil, true, None, None)
+    } else {
+        let digitHit =
+            if (managerCoreIsVirtual(core)) {
+                match listIndexOfBy(workspaceDigitKeyCodes(), (c) -> c == code) {
+                    Some(dIdx) if (dIdx < vwCount(core.virtualEngine)) -> Some(dIdx),
+                    _ -> None,
+                }
+            } else None;
+        match digitHit {
+            Some(dIdx) ->
+                if (shift) managerCoreMoveWindowToWorkspace(core, dIdx, now, trusted, frontmostKey, liveFrames)
+                else managerCoreSwitchWorkspace(core, dIdx, now, trusted, frontmostKey, liveFrames),
+            None -> {
+                let effRev: Cell (List WindowEffect) = cellNew(Nil);
+                if (code == kvkAnsiT()) {
+                    match managerCoreFocusedIndex(core, now, frontmostKey) {
+                        Some(i) -> match listNthOpt(cellGet(core.windows), i) {
+                            Some(win) if (win.isResizable) -> match screenForId(core, win.screenId) {
+                                Some(scr) -> {
+                                    cellSet(core.userToggledFloatKeys, setAddI64(cellGet(core.userToggledFloatKeys), win.key));
+                                    cellSet(core.autoFloatedKeys, setRemI64(cellGet(core.autoFloatedKeys), win.key));
+                                    if (setHasI64(cellGet(core.floating), win.key)) {
+                                        if (!isParkedWindowFrame(win.frame, scr.fullFrame)) {
+                                            cellSet(core.savedFrames, mapSetI64(cellGet(core.savedFrames), win.key, win.frame))
+                                        } else ();
+                                        cellSet(core.floating, setRemI64(cellGet(core.floating), win.key));
+                                        managerCoreTile(core, now, frontmostKey, effRev)
+                                    } else {
+                                        cellSet(core.floating, setAddI64(cellGet(core.floating), win.key));
+                                        managerCoreTile(core, now, frontmostKey, effRev);
+                                        let area = scr.visibleFrame;
+                                        let inset = insetArea(area, cellGet(core.outerGap));
+                                        let restored = match mapGetI64(cellGet(core.savedFrames), win.key) {
+                                            Some(s) -> {
+                                                let isFull = abs(s.w - area.w) <= 4.0 && abs(s.h - area.h) <= 4.0;
+                                                let isInset = abs(s.w - inset.w) <= 4.0 && abs(s.h - inset.h) <= 4.0;
+                                                if (!isFull && !isInset) s else centeredFrame(860.0, 600.0, area)
+                                            },
+                                            None -> centeredFrame(860.0, 600.0, area),
+                                        };
+                                        cellSet(core.savedFrames, mapSetI64(cellGet(core.savedFrames), win.key, restored));
+                                        cellSet(effRev, Cons(EffSetFrame { key: win.key, rect: restored }, cellGet(effRev)));
+                                        setWindowFrameInMap(core, win.key, restored);
+                                        emitFocus(core, win, now, effRev)
+                                    };
+                                    managerCoreRecordSessionState(core)
+                                },
+                                None -> (),
+                            },
+                            _ -> (),
+                        },
+                        None -> (),
+                    }
+                } else if (code == kvkAnsiH()) {
+                    let nextR = maxFloat(managerCoreRatio(core) - cellGet(core.ratioStep), 0.2);
+                    managerCoreSetRatio(core, nextR);
+                    managerCoreTile(core, now, frontmostKey, effRev);
+                    managerCoreRecordSessionState(core)
+                } else if (code == kvkAnsiL()) {
+                    let nextR = minFloat(managerCoreRatio(core) + cellGet(core.ratioStep), 0.8);
+                    managerCoreSetRatio(core, nextR);
+                    managerCoreTile(core, now, frontmostKey, effRev);
+                    managerCoreRecordSessionState(core)
+                } else if (code == kvkAnsiComma()) {
+                    managerCoreSetMasters(core, managerCoreMasters(core) + 1);
+                    managerCoreTile(core, now, frontmostKey, effRev);
+                    managerCoreRecordSessionState(core)
+                } else if (code == kvkAnsiPeriod()) {
+                    managerCoreSetMasters(core, maxInt(managerCoreMasters(core) - 1, 1));
+                    managerCoreTile(core, now, frontmostKey, effRev);
+                    managerCoreRecordSessionState(core)
+                } else if (code == kvkSpace()) {
+                    managerCoreSetLayoutMode(core, (managerCoreLayoutMode(core) + 1) % 3);
+                    managerCoreTile(core, now, frontmostKey, effRev);
+                    managerCoreRecordSessionState(core)
+                } else if (code == kvkAnsiJ() || code == kvkAnsiK()) {
+                    let wins = cellGet(core.windows);
+                    if (listLen(wins) > 1) {
+                        match managerCoreFocusedIndex(core, now, frontmostKey) {
+                            Some(i) -> match listNthOpt(wins, i) {
+                                Some(curWin) -> {
+                                    let focusScreen = curWin.screenId;
+                                    // Gather matching indices
+                                    let idxRev: Cell (List Int) = cellNew(Nil);
+                                    let k = cellNew(0);
+                                    let cw = cellNew(wins);
+                                    while (match cellGet(cw) { Nil -> false, _ -> true }) {
+                                        match cellGet(cw) {
+                                            Cons(w, wr) -> {
+                                                let matchWin = w.screenId == focusScreen && (!shift || !managerCoreIsFloating(core, w));
+                                                if (matchWin) cellSet(idxRev, Cons(cellGet(k), cellGet(idxRev))) else ();
+                                                cellSet(k, cellGet(k) + 1);
+                                                cellSet(cw, wr)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    };
+                                    let indices = listRev(cellGet(idxRev));
+                                    let ilen = listLen(indices);
+                                    if (ilen > 1) {
+                                        match listIndexOfBy(indices, (idx) -> idx == i) {
+                                            Some(p) -> {
+                                                let step = if (code == kvkAnsiJ()) 1 else ilen - 1;
+                                                let nextPos = (p + step) % ilen;
+                                                match listNthOpt(indices, nextPos) {
+                                                    Some(nextIdx) ->
+                                                        if (shift) {
+                                                            let dir = if (code == kvkAnsiJ()) 1 else -1;
+                                                            if ((dir > 0 && p == ilen - 1) || (dir < 0 && p == 0)) {
+                                                                // Rotate group
+                                                                let grp = listMap(indices, (idx) -> match listNthOpt(wins, idx) { Some(w) -> w, None -> curWin });
+                                                                let rotated = if (dir > 0) {
+                                                                    match listNthOpt(grp, ilen - 1) {
+                                                                        Some(lastW) -> Cons(lastW, listRemoveAt(grp, ilen - 1)),
+                                                                        None -> grp,
+                                                                    }
+                                                                } else match grp {
+                                                                    Cons(firstW, restG) -> listAppend(restG, [firstW]),
+                                                                    Nil -> grp,
+                                                                };
+                                                                let wCell = cellNew(wins);
+                                                                let ci = cellNew(indices);
+                                                                let cg = cellNew(rotated);
+                                                                while (match (cellGet(ci), cellGet(cg)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                                                    match (cellGet(ci), cellGet(cg)) {
+                                                                        (Cons(wi, ir), Cons(ww, gr)) -> {
+                                                                            cellSet(wCell, listReplaceAt(cellGet(wCell), wi, ww));
+                                                                            cellSet(ci, ir);
+                                                                            cellSet(cg, gr)
+                                                                        },
+                                                                        _ -> (),
+                                                                    }
+                                                                };
+                                                                cellSet(core.windows, cellGet(wCell))
+                                                            } else {
+                                                                cellSet(core.windows, listSwapIndices(wins, i, nextIdx))
+                                                            };
+                                                            syncActiveVirtualStack(core);
+                                                            let aliveOpt = if (managerCoreIsVirtual(core)) {
+                                                                Some(listMap(cellGet(core.windowByKey), (pr) -> { let (kk, _) = pr; kk }))
+                                                            } else None;
+                                                            updateHistory(core, aliveOpt, Nil);
+                                                            managerCoreTile(core, now, frontmostKey, effRev);
+                                                            managerCoreRecordSessionState(core)
+                                                        } else {
+                                                            match listNthOpt(wins, nextIdx) {
+                                                                Some(nextWin) -> {
+                                                                    emitFocus(core, nextWin, now, effRev);
+                                                                    managerCoreRecordSessionState(core)
+                                                                },
+                                                                None -> (),
+                                                            }
+                                                        },
+                                                    None -> (),
+                                                }
+                                            },
+                                            None -> (),
+                                        }
+                                    } else ()
+                                },
+                                None -> (),
+                            },
+                            None -> (),
+                        }
+                    } else ()
+                } else if (code == kvkReturn()) {
+                    let wins = cellGet(core.windows);
+                    match managerCoreFocusedIndex(core, now, frontmostKey) {
+                        Some(i) -> match listNthOpt(wins, i) {
+                            Some(curWin) if (!managerCoreIsFloating(core, curWin)) -> {
+                                let focusScreen = curWin.screenId;
+                                match listIndexOfBy(wins, (w: TrackedWindow) -> w.screenId == focusScreen && !managerCoreIsFloating(core, w)) {
+                                    Some(first) if (first != i) -> {
+                                        cellSet(core.windows, listSwapIndices(wins, i, first));
+                                        syncActiveVirtualStack(core);
+                                        let aliveOpt = if (managerCoreIsVirtual(core)) {
+                                            Some(listMap(cellGet(core.windowByKey), (pr) -> { let (kk, _) = pr; kk }))
+                                        } else None;
+                                        updateHistory(core, aliveOpt, Nil);
+                                        managerCoreTile(core, now, frontmostKey, effRev);
+                                        managerCoreRecordSessionState(core)
+                                    },
+                                    _ -> (),
+                                }
+                            },
+                            _ -> (),
+                        },
+                        None -> (),
+                    }
+                } else ();
+                makeOutput(core, listRev(cellGet(effRev)), true, None, None)
+            },
+        }
+    }
+}
+
+pub def managerCoreApplyConfig(
+    core: ManagerCore,
+    cfg: Configuration,
+    now: Float,
+    trusted: Bool,
+    frontmostKey: Option Int64,
+    liveFrames: List (Int64, Rect)
+): ManagerActionOutput = {
+    updateLiveFrames(core, liveFrames);
+    let wasVirtual = managerCoreIsVirtual(core);
+    let willBeVirtual = cfg.workspaceMode == "virtual";
+
+    let oldCount = vwCount(core.virtualEngine);
+    let oldLabels = cellGet(core.spaceLabels);
+    let prevResRev: Cell (List (String, Int)) = cellNew(Nil);
+    let cOld = cellNew(cellGet(core.appWorkspaces));
+    while (match cellGet(cOld) { Nil -> false, _ -> true }) {
+        match cellGet(cOld) {
+            Cons((bundle, target), r) -> {
+                match resolveWorkspaceTarget(target, oldCount, oldLabels) {
+                    Some(ws) -> cellSet(prevResRev, Cons((bundle, ws), cellGet(prevResRev))),
+                    None -> (),
+                };
+                cellSet(cOld, r)
+            },
+            Nil -> (),
+        }
+    };
+    let prevResolved = cellGet(prevResRev);
+
+    cellSet(core.nativeRatio, cfg.masterRatio);
+    cellSet(core.nativeMasters, cfg.masterCount);
+    cellSet(core.ratioStep, cfg.ratioStep);
+    cellSet(core.outerGap, cfg.outerGap);
+    cellSet(core.innerGap, cfg.innerGap);
+    cellSet(core.ignoredApps, cfg.ignoreApps);
+    cellSet(core.appWorkspaces, cfg.appWorkspaces);
+    cellSet(core.floatWindows, cfg.floatWindows);
+    cellSet(core.spaceLabels, cfg.spaceLabels);
+    vwUpdateDefaults(core.virtualEngine, cfg.masterRatio, cfg.masterCount);
+    vwResizeCount(core.virtualEngine, cfg.workspaceCount, eqI64);
+
+    let effRev: Cell (List WindowEffect) = cellNew(Nil);
+    if (wasVirtual && !willBeVirtual) {
+        managerCoreRecordSessionState(core);
+        let restoredOut = managerCoreRestoreAllParked(core, trusted, liveFrames);
+        let ce = cellNew(restoredOut.effects);
+        while (match cellGet(ce) { Nil -> false, _ -> true }) {
+            match cellGet(ce) { Cons(e, r) -> { cellSet(effRev, Cons(e, cellGet(effRev))); cellSet(ce, r) }, Nil -> () }
+        };
+        cellSet(core.workspaceMode, "native");
+        cellSet(core.virtualSeeded, false)
+    } else if (!wasVirtual && willBeVirtual) {
+        cellSet(core.workspaceMode, "virtual");
+        cellSet(core.virtualSeeded, false);
+        loadPersistedSessionIfAvailable(core)
+    } else {
+        cellSet(core.workspaceMode, cfg.workspaceMode);
+        if (willBeVirtual && cellGet(core.virtualSeeded)) {
+            let movedAny = cellNew(false);
+            let cnt = vwCount(core.virtualEngine);
+            let labels = cellGet(core.spaceLabels);
+            let wMap = cellGet(core.windowByKey);
+            let cr = cellNew(cfg.appWorkspaces);
+            while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                match cellGet(cr) {
+                    Cons((bundle, target), rr) -> {
+                        match resolveWorkspaceTarget(target, cnt, labels) {
+                            Some(newWs) -> {
+                                let sameAsPrev = match listFindBy(prevResolved, (p) -> { let (b, _) = p; b == bundle }) {
+                                    Some((_, prevWs)) -> prevWs == newWs,
+                                    None -> false,
+                                };
+                                if (!sameAsPrev) {
+                                    let matching = listFilter(vwAllWindows(core.virtualEngine), (k) ->
+                                        match mapGetI64(wMap, k) {
+                                            Some(w) -> optEqBy(w.bundleId, Some(bundle), eqStr),
+                                            None -> false,
+                                        }
+                                    );
+                                    let cm = cellNew(matching);
+                                    while (match cellGet(cm) { Nil -> false, _ -> true }) {
+                                        match cellGet(cm) {
+                                            Cons(key, kr) -> {
+                                                if (!optEqBy(vwWorkspaceContaining(core.virtualEngine, key, eqI64), Some(newWs), eqInt)) {
+                                                    let (moved, _) = vwMoveWindow(core.virtualEngine, key, newWs, eqI64);
+                                                    if (moved) {
+                                                        match mapGetI64(wMap, key) {
+                                                            Some(w) -> match w.windowId {
+                                                                Some(wid) -> cellSet(core.lastWorkspaceByWid, mapSetInt(cellGet(core.lastWorkspaceByWid), wid, newWs)),
+                                                                None -> (),
+                                                            },
+                                                            None -> (),
+                                                        };
+                                                        cellSet(movedAny, true)
+                                                    } else ()
+                                                } else ();
+                                                cellSet(cm, kr)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    }
+                                } else ()
+                            },
+                            None -> (),
+                        };
+                        cellSet(cr, rr)
+                    },
+                    Nil -> (),
+                }
+            };
+            if (cellGet(movedAny)) {
+                cellSet(core.suppressExternalFocusUntil, now + 0.5);
+                cellSet(core.windows, activeTrackedFromEngine(core));
+                if (trusted) {
+                    managerCoreTile(core, now, frontmostKey, effRev);
+                    match vwActiveFocused(core.virtualEngine, eqI64) {
+                        Some(nk) -> match mapGetI64(cellGet(core.windowByKey), nk) {
+                            Some(nw) -> emitFocus(core, nw, now, effRev),
+                            None -> (),
+                        },
+                        None -> if (listLen(cellGet(core.windows)) == 0) emitRelinquishFocus(core, effRev) else (),
+                    }
+                } else ();
+                managerCoreRecordSessionState(core)
+            } else ()
+        } else ()
+    };
+    makeOutput(core, listRev(cellGet(effRev)), true, None, None)
+}
+
+pub def managerCoreVirtualSpaceEntries(core: ManagerCore): List SpaceEntry = {
+    let cnt = vwCount(core.virtualEngine);
+    let act = vwActive(core.virtualEngine);
+    let layouts = vwLayouts(core.virtualEngine);
+    let rev: Cell (List SpaceEntry) = cellNew(Nil);
+    let i = cellNew(0);
+    while (cellGet(i) < cnt) {
+        let idx = cellGet(i);
+        let wcnt = vwWindowCount(core.virtualEngine, idx);
+        let isFull = match listNthOpt(layouts, idx) {
+            Some(l) -> l.layoutMode == 2 && wcnt > 0,
+            None -> false,
+        };
+        cellSet(rev, Cons(SpaceEntry {
+            id: intToI64(idx + 1),
+            isCurrent: idx == act,
+            isFullscreen: isFull,
+            windowCount: Some(wcnt),
+        }, cellGet(rev)));
+        cellSet(i, idx + 1)
+    };
+    listRev(cellGet(rev))
+}
+
+pub def managerCoreStatusSnapshot(core: ManagerCore, now: Float, frontmostKey: Option Int64): ManagerStatusSnapshot = {
+    let wins = cellGet(core.windows);
+    let focusedWin = match managerCoreFocusedIndex(core, now, frontmostKey) {
+        Some(idx) -> listNthOpt(wins, idx),
+        None -> match wins { Cons(h, _) -> Some(h), Nil -> None },
+    };
+    ManagerStatusSnapshot {
+        isVirtualMode: managerCoreIsVirtual(core),
+        paused: cellGet(core.paused),
+        layoutName: managerCoreLayoutName(core),
+        activeWorkspace: vwActive(core.virtualEngine),
+        workspaceCount: vwCount(core.virtualEngine),
+        windowCount: listLen(wins),
+        focusedWindowKey: match focusedWin { Some(w) -> Some(w.key), None -> None },
+        focusedScreenId: match focusedWin { Some(w) -> Some(w.screenId), None -> None },
+        virtualSpaceEntries: if (managerCoreIsVirtual(core)) managerCoreVirtualSpaceEntries(core) else Nil,
+    }
+}

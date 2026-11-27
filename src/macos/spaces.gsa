@@ -1,0 +1,188 @@
+/// Read-only SkyLight private framework queries:
+/// - `WindowServerFrames` (`SLSGetWindowBounds`) for non-blocking live window bounds
+/// - `NativeSpaces` (`SLSCopyManagedDisplaySpaces`) for Mission Control spaces per display
+
+use std.option.{Option, Some, None}
+use std.list.{listRev, listAny}
+use sys.ffi.{dlOpen, dlSym}
+use objc.{objcSel, fromNSStringPtr, msgSend0}
+use util.{isFiniteFloat, strToLowerAscii}
+use layout.{Rect, rectNew}
+use status_markup.{SpaceEntry}
+use macos.ffi.{
+    c_CGDisplayCreateUUIDFromDisplayID, c_CFUUIDCreateString,
+    cfAdoptOpt, cfValueAsString,
+    nsArrayCount, nsArrayObjectAt, nsDictGet, nsNumberIntOpt, nsNumberI64Opt, nsStringOpt
+}
+
+extern ptr def callSLSMainConnectionID(fp: Ptr): Int
+extern ptr def callSLSGetWindowBounds(fp: Ptr, cid: Int, wid: Int, outRect: ScopedPtr): Int
+extern ptr def callSLSCopyManagedDisplaySpaces(fp: Ptr, cid: Int): Ptr
+
+data SkyLightHandle {
+    SkyLightHandle {
+        loaded: Bool,
+        mainConn: Ptr,
+        getBounds: Ptr,
+        copySpaces: Ptr,
+    }
+}
+
+def loadSkyLight(): SkyLightHandle =
+    match dlOpen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight") {
+        Some(lib) -> {
+            let mc = match dlSym(lib, "SLSMainConnectionID") { Some(p) -> p, None -> ptrNull() };
+            let gb = match dlSym(lib, "SLSGetWindowBounds") { Some(p) -> p, None -> ptrNull() };
+            let cs = match dlSym(lib, "SLSCopyManagedDisplaySpaces") { Some(p) -> p, None -> ptrNull() };
+            SkyLightHandle { loaded: true, mainConn: mc, getBounds: gb, copySpaces: cs }
+        },
+        None -> SkyLightHandle { loaded: true, mainConn: ptrNull(), getBounds: ptrNull(), copySpaces: ptrNull() },
+    }
+
+/// Read-only WindowServer window bounds (never mutates server geometry, never stalls on hung apps).
+pub def windowServerFrame(windowId: Int): Option Rect = {
+    if (windowId == 0) None
+    else {
+        let sl = loadSkyLight();
+        if (ptrIsNull(sl.mainConn) || ptrIsNull(sl.getBounds)) None
+        else {
+            let cid = callSLSMainConnectionID(sl.mainConn);
+            withAlloca(32, (rectBuf) -> {
+                scopedPtrWriteF64Le(rectBuf, 0, 0.0);
+                scopedPtrWriteF64Le(rectBuf, 8, 0.0);
+                scopedPtrWriteF64Le(rectBuf, 16, 0.0);
+                scopedPtrWriteF64Le(rectBuf, 24, 0.0);
+                let err = callSLSGetWindowBounds(sl.getBounds, cid, windowId, rectBuf);
+                if (err != 0) None
+                else {
+                    let x = scopedPtrReadF64Le(rectBuf, 0);
+                    let y = scopedPtrReadF64Le(rectBuf, 8);
+                    let w = scopedPtrReadF64Le(rectBuf, 16);
+                    let h = scopedPtrReadF64Le(rectBuf, 24);
+                    if (isFiniteFloat(x) && isFiniteFloat(y) && isFiniteFloat(w) && isFiniteFloat(h) && w > 0.0 && h > 0.0) {
+                        Some(rectNew(x, y, w, h))
+                    } else None
+                }
+            })
+        }
+    }
+}
+
+/// Pure parser for a display space descriptor (shared between live SkyLight and unit tests).
+pub data RawSpaceItem {
+    RawSpaceItem {
+        id: Int64,
+        spaceType: Int,
+    }
+}
+
+pub def parseSpaceEntries(currentId: Int64, rawItems: List RawSpaceItem): Option (List SpaceEntry) = {
+    let accRev: Cell (List SpaceEntry) = cellNew(Nil);
+    let cur = cellNew(rawItems);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(item, r) -> {
+                if (item.spaceType == 0 || item.spaceType == 4) {
+                    cellSet(accRev, Cons(SpaceEntry {
+                        id: item.id,
+                        isCurrent: item.id == currentId,
+                        isFullscreen: item.spaceType == 4,
+                        windowCount: None,
+                    }, cellGet(accRev)))
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    let entries = listRev(cellGet(accRev));
+    match entries {
+        Nil -> None,
+        _ -> if (listAny(entries, (e: SpaceEntry) -> e.isCurrent)) Some(entries) else None,
+    }
+}
+
+def parseDisplayDictPtr(displayPtr: Ptr): Option (List SpaceEntry) = {
+    let curDict = nsDictGet(displayPtr, "Current Space");
+    let spacesArr = nsDictGet(displayPtr, "Spaces");
+    if (ptrIsNull(curDict) || ptrIsNull(spacesArr)) None
+    else match nsNumberI64Opt(nsDictGet(curDict, "ManagedSpaceID")) {
+        None -> None,
+        Some(currentId) -> {
+            let n = nsArrayCount(spacesArr);
+            let rev: Cell (List RawSpaceItem) = cellNew(Nil);
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let idx = cellGet(i);
+                let item = nsArrayObjectAt(spacesArr, idx);
+                match (nsNumberI64Opt(nsDictGet(item, "ManagedSpaceID")), nsNumberIntOpt(nsDictGet(item, "type"))) {
+                    (Some(sid), Some(st)) ->
+                        cellSet(rev, Cons(RawSpaceItem { id: sid, spaceType: st }, cellGet(rev))),
+                    _ -> (),
+                };
+                cellSet(i, idx + 1)
+            };
+            parseSpaceEntries(currentId, listRev(cellGet(rev)))
+        },
+    }
+}
+
+def screenUuidString(screenPtr: Ptr): Option String = {
+    if (ptrIsNull(screenPtr)) None
+    else {
+        let desc = msgSend0(screenPtr, objcSel("deviceDescription"));
+        match nsNumberIntOpt(nsDictGet(desc, "NSScreenNumber")) {
+            None -> None,
+            Some(displayId) -> match cfAdoptOpt(c_CGDisplayCreateUUIDFromDisplayID(displayId)) {
+                None -> None,
+                Some(uuidFp) -> match withForeignPtr(uuidFp, (up) -> cfAdoptOpt(c_CFUUIDCreateString(ptrNull(), up))) {
+                    None -> None,
+                    Some(strFp) -> cfValueAsString(strFp),
+                },
+            },
+        }
+    }
+}
+
+/// Query Mission Control native spaces for an `NSScreen *` (or `ptrNull()` for fallback single-display).
+pub def nativeSpacesForScreen(screenPtr: Ptr): Option (List SpaceEntry) = {
+    let sl = loadSkyLight();
+    if (ptrIsNull(sl.mainConn) || ptrIsNull(sl.copySpaces)) None
+    else {
+        let cid = callSLSMainConnectionID(sl.mainConn);
+        match cfAdoptOpt(callSLSCopyManagedDisplaySpaces(sl.copySpaces, cid)) {
+            None -> None,
+            Some(arrFp) -> {
+                let targetUuidLower = match screenUuidString(screenPtr) {
+                    Some(u) -> strToLowerAscii(u),
+                    None -> "",
+                };
+                // Borrow CFArray/NSArray pointer cleanly inside withForeignPtr
+                withForeignPtr(arrFp, (ap) -> {
+                    // Use CFArrayGetCount / CFArrayGetValueAtIndex directly on ScopedPtr
+                    let n = i64ToInt(macos.ffi.c_CFArrayGetCount(ap));
+                    if (n == 0) None
+                    else {
+                        let matched: Cell Ptr = cellNew(ptrNull());
+                        let i = cellNew(0);
+                        while (cellGet(i) < n && ptrIsNull(cellGet(matched))) {
+                            let idx = cellGet(i);
+                            let d = macos.ffi.c_CFArrayGetValueAtIndex(ap, intToI64(idx));
+                            match nsStringOpt(nsDictGet(d, "Display Identifier")) {
+                                Some(ident) if (strToLowerAscii(ident) == targetUuidLower && strLen(targetUuidLower) > 0) ->
+                                    cellSet(matched, d),
+                                _ -> (),
+                            };
+                            cellSet(i, idx + 1)
+                        };
+                        let chosen =
+                            if (!ptrIsNull(cellGet(matched))) cellGet(matched)
+                            else if (n == 1) macos.ffi.c_CFArrayGetValueAtIndex(ap, intToI64(0))
+                            else ptrNull();
+                        if (ptrIsNull(chosen)) None else parseDisplayDictPtr(chosen)
+                    }
+                })
+            },
+        }
+    }
+}

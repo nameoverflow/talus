@@ -1,0 +1,1573 @@
+/// Pure-Geisha AppKit 4-tab Settings Window (`通用` / `快捷键与布局` / `应用规则` / `菜单栏`),
+/// `SettingsViewModel` with auto-save debounce & validation, live tiling + menu-bar previews,
+/// and offline high-DPI preview renderer (`--render-previews`).
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listLen, listRev, listFilter, listMap, listAppend}
+use std.str.{intToStr, parseInt, strTrim, strJoin, strStartsWith}
+use sys.fs.{mkdirAll}
+use sys.time.{nowMs}
+use objc.{
+    Id, NSObject,
+    objcClass, objcSel, idAdopt, idRetain, withId, withAutoreleasePool,
+    nsString, fromNSStringPtr,
+    msgSend0, msgSend1Ptr, msgSend1I64, msgSend1Bool, msgSend1Float,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+    msgSendInt0, msgSendI64_0, msgSendFloat0, msgSendBool0
+}
+use util.{
+    minInt, maxInt, minFloat, maxFloat, roundFloat, roundToInt,
+    eqStr, listContainsBy, listNthOpt, listRemoveAt, utf8TakeChars
+}
+use layout.{Rect, rectNew, tallLayoutWithGaps}
+use config.{
+    Configuration, ConfigResolution, WorkspaceTarget, WsIndex, WsLabel,
+    FloatWindowRule, StatusCommand,
+    defaultConfig, validateConfig, saveConfigToPath, abbreviatedPath, resolveWorkspaceTarget
+}
+use status_markup.{SpaceEntry, StatusValues, templateStatusParts}
+use status_render.{renderConfiguredStatus}
+use macos.ffi.{
+    CGSize, CGRect, cgSize, cgRect,
+    msgSendRect0, msgSendVoid1Rect, msgSendVoid1Size,
+    msgSend1Rect1I641I641Bool, msgSend1Rect
+}
+use macos.launch_at_login.{
+    LaunchAtLoginModel, launchAtLoginNew, systemLaunchAtLoginService,
+    launchAtLoginIsEnabled, launchAtLoginNeedsApproval, launchAtLoginError,
+    launchAtLoginRefresh, launchAtLoginSetEnabled, launchAtLoginOpenSettings
+}
+use macos.executor.{scheduleDelayedSignal}
+use macos.appkit.{
+    kFontWeightRegular, kFontWeightMedium, kFontWeightSemibold, kFontWeightBold,
+    nsAppShared, nsAppearanceIsDark, nsViewWritePng,
+    nsColorBlack, nsColorWhite, nsColorClear, nsColorLabel, nsColorSecondaryLabel,
+    nsColorControlAccent, nsColorWindowBackground, nsColorControlBackground, nsColorSeparator,
+    nsColorSystemRed, nsColorSystemOrange, nsColorSystemGreen, nsColorSRGB, nsColorWithAlpha,
+    nsColorSetFill, nsColorSetStroke,
+    nsFontSystem, nsFontMonospaced, nsFontMonospacedDigit,
+    nsDrawRoundedRectFill, nsDrawRoundedRectStroke, nsTextDrawAt,
+    makeActionTarget, makeTextChangeDelegate, makeWindowCloseDelegate,
+    makeFlippedView, makeCustomDrawView,
+    nsViewAddSubview, nsViewSetWantsLayer, nsViewSetLayerStyle,
+    makeLabel, makeTextField, textFieldStringValue, textFieldSetStringValue,
+    makePushButton, makeCheckbox, makeSwitch, controlStateOn,
+    makePopUpButton, makeSegmentedControl, makeSlider, makeImageView, imageViewSetImage,
+    makeMenuItemWithSelector, nsMenuAddItem, nsMenuAddSeparator
+}
+
+// Hoisted ScopedPtr objc_msgSend helpers
+extern "objc_msgSend" def c_setTitleP(o: Ptr, s: Ptr, t: ScopedPtr): Void
+extern "objc_msgSend" def c_fileUrl(cls: Ptr, s: Ptr, p: ScopedPtr): Ptr
+extern "objc_msgSend" def c_setTitleP2(o: Ptr, s: Ptr, t: ScopedPtr): Void
+extern "objc_msgSend" def c_menuInit(o: Ptr, s: Ptr, t: ScopedPtr): Ptr
+extern "objc_msgSend" def c_winTitle(o: Ptr, s: Ptr, t: ScopedPtr): Void
+extern "objc_msgSend" def c_appNamed(cls: Ptr, s: Ptr, n: ScopedPtr): Ptr
+extern "objc_msgSend" def c_appNamed2(cls: Ptr, s: Ptr, n: ScopedPtr): Ptr
+
+// ---------------------------------------------------------------------------
+// Settings Tab & Status Mode enums
+// ---------------------------------------------------------------------------
+
+pub data SettingsTab {
+    TabGeneral,
+    TabLayout,
+    TabRules,
+    TabStatus,
+}
+
+pub def settingsTabFromStr(s: String): Option SettingsTab =
+    if (s == "general") Some(TabGeneral)
+    else if (s == "layout") Some(TabLayout)
+    else if (s == "rules") Some(TabRules)
+    else if (s == "status") Some(TabStatus)
+    else None
+
+pub def settingsTabIndex(t: SettingsTab): Int = match t {
+    TabGeneral -> 0,
+    TabLayout -> 1,
+    TabRules -> 2,
+    TabStatus -> 3,
+}
+
+pub def settingsTabFromIndex(i: Int): SettingsTab =
+    if (i == 0) TabGeneral
+    else if (i == 1) TabLayout
+    else if (i == 2) TabRules
+    else TabStatus
+
+pub data StatusModeChoice {
+    ModeSimple,
+    ModeTemplate,
+    ModeScript,
+}
+
+def statusModeIndex(m: StatusModeChoice): Int = match m {
+    ModeSimple -> 0,
+    ModeTemplate -> 1,
+    ModeScript -> 2,
+}
+
+def statusModeFromIndex(i: Int): StatusModeChoice =
+    if (i == 0) ModeSimple
+    else if (i == 1) ModeTemplate
+    else ModeScript
+
+// Signal tag reserved for SettingsViewModel 150ms debounced save
+pub def kSettingsDebounceSaveSignalTag(): Int = 9001
+
+// ---------------------------------------------------------------------------
+// Argument line splitter (matches SettingsWindow.swift `parseArgumentLine`)
+// ---------------------------------------------------------------------------
+
+pub def parseArgumentLine(line: String): List String = {
+    let n = strLen(line);
+    let outRev: Cell (List String) = cellNew(Nil);
+    let cur = cellNew("");
+    let inQuote = cellNew(0); // 0 = none, 34 = ", 39 = '
+    let hasToken = cellNew(false);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let b = strByteAt(line, idx);
+        let q = cellGet(inQuote);
+        if (q != 0) {
+            if (b == q) cellSet(inQuote, 0)
+            else cellSet(cur, cellGet(cur) + ptrSliceFromStr(line, idx, 1))
+        } else if (b == 34 || b == 39) {
+            cellSet(inQuote, b);
+            cellSet(hasToken, true)
+        } else if (b == 32 || b == 9) {
+            if (cellGet(hasToken)) {
+                cellSet(outRev, Cons(cellGet(cur), cellGet(outRev)));
+                cellSet(cur, "");
+                cellSet(hasToken, false)
+            } else ()
+        } else {
+            cellSet(cur, cellGet(cur) + ptrSliceFromStr(line, idx, 1));
+            cellSet(hasToken, true)
+        };
+        cellSet(i, idx + 1)
+    };
+    if (cellGet(hasToken)) cellSet(outRev, Cons(cellGet(cur), cellGet(outRev))) else ();
+    listRev(cellGet(outRev))
+}
+
+// ---------------------------------------------------------------------------
+// SettingsViewModel
+// ---------------------------------------------------------------------------
+
+pub data SettingsViewModel {
+    SettingsViewModel {
+        selectedTab: Cell SettingsTab,
+        launchAtLogin: LaunchAtLoginModel,
+        modifiers: Cell (List String),
+        workspaceMode: Cell String,
+        workspaceCount: Cell Int,
+        masterRatioPercent: Cell Float,
+        ratioStepPercent: Cell Float,
+        masterCount: Cell Int,
+        outerGap: Cell Float,
+        innerGap: Cell Float,
+        ignoreApps: Cell (List String),
+        appWorkspaces: Cell (List (String, WorkspaceTarget)),
+        floatWindows: Cell (List FloatWindowRule),
+        statusShowIcon: Cell Bool,
+        spaceLabels: Cell (List String),
+        workspaceIcons: Cell (List String),
+        statusMode: Cell StatusModeChoice,
+        customTemplate: Cell String,
+        workspaceCurrent: Cell String,
+        workspaceOther: Cell String,
+        primaryFont: Cell String,
+        extraFonts: Cell (List String),
+        statusFontSize: Cell Float,
+        commands: Cell (List StatusCommand),
+        scriptName: Cell String,
+        scriptExecutable: Cell String,
+        scriptArgumentsText: Cell String,
+        scriptInterval: Cell Float,
+        scriptTimeout: Cell Float,
+        scriptMarkup: Cell Bool,
+        scriptOnChange: Cell Bool,
+        statusTextFile: Cell String,
+        statusStateFile: Cell String,
+        savePath: Cell String,
+        migratedFromJson: Cell Bool,
+        statusBanner: Cell String,
+        validationMessage: Cell (Option String),
+        legacyFormat: Cell String,
+        suppressAutoSave: Cell Bool,
+        pendingSaveGen: Cell Int,
+        lastWrittenMs: Cell Int64,
+        onConfigurationApplied: Cell (Option ((Configuration, String) -> Void)),
+        onUIStateChanged: Cell (Option (() -> Void)),
+    }
+}
+
+def detectStatusMode(cfg: Configuration): (StatusModeChoice, String, String, String, String, Float, Float, Bool, Bool) = {
+    let defs = defaultConfig();
+    let defaultTmpl = "%spaces%  <fc=#89CFC2>%layout%</fc>";
+    match cfg.statusCommands {
+        Cons(only, Nil) -> {
+            let expected = "%" + only.name + "%";
+            let isScript = match cfg.statusTemplate {
+                Some(t) -> strTrim(t) == expected,
+                None -> false,
+            };
+            if (isScript) {
+                let argsText = match only.arguments { Some(a) -> strJoin(a, " "), None -> "" };
+                let iv = match only.interval { Some(v) -> v, None -> 10.0 };
+                let to = match only.timeout { Some(v) -> v, None -> 2.0 };
+                let mk = match only.markup { Some(b) -> b, None -> true };
+                let oc = match only.onChange { Some(b) -> b, None -> true };
+                (ModeScript, defaultTmpl, only.name, only.executable, argsText, iv, to, mk, oc)
+            } else {
+                let tmpl = match cfg.statusTemplate { Some(t) -> t, None -> defaultTmpl };
+                (ModeTemplate, tmpl, "mybar", "/usr/bin/python3", "", 10.0, 2.0, true, true)
+            }
+        },
+        _ -> {
+            let hasCustom = (match cfg.statusTemplate { Some(_) -> true, None -> false })
+                || listLen(cfg.statusCommands) > 0
+                || cfg.statusFormat != defs.statusFormat;
+            if (hasCustom) {
+                let tmpl = match cfg.statusTemplate { Some(t) -> t, None -> defaultTmpl };
+                (ModeTemplate, tmpl, "mybar", "/usr/bin/python3", "", 10.0, 2.0, true, true)
+            } else {
+                (ModeSimple, defaultTmpl, "mybar", "/usr/bin/python3", "", 10.0, 2.0, true, true)
+            }
+        },
+    }
+}
+
+pub def settingsViewModelNew(
+    cfg: Configuration,
+    res: ConfigResolution,
+    loginModel: LaunchAtLoginModel
+): SettingsViewModel = {
+    let (mode, tmpl, sName, sExec, sArgs, sIv, sTo, sMk, sOc) = detectStatusMode(cfg);
+    let (pf, ef) = match cfg.statusFonts {
+        Cons(h, t) -> (h, t),
+        Nil -> ("", Nil),
+    };
+    let banner = if (res.migratedFromJson) {
+        "已读取旧版 config.json；修改后将保存至 " + abbreviatedPath(res.savePath)
+    } else {
+        "修改会自动保存到配置文件并立即生效"
+    };
+    SettingsViewModel {
+        selectedTab: cellNew(TabGeneral),
+        launchAtLogin: loginModel,
+        modifiers: cellNew(cfg.modifiers),
+        workspaceMode: cellNew(cfg.workspaceMode),
+        workspaceCount: cellNew(cfg.workspaceCount),
+        masterRatioPercent: cellNew(roundFloat(cfg.masterRatio * 100.0)),
+        ratioStepPercent: cellNew(roundFloat(cfg.ratioStep * 1000.0) / 10.0),
+        masterCount: cellNew(cfg.masterCount),
+        outerGap: cellNew(roundFloat(cfg.outerGap)),
+        innerGap: cellNew(roundFloat(cfg.innerGap)),
+        ignoreApps: cellNew(cfg.ignoreApps),
+        appWorkspaces: cellNew(cfg.appWorkspaces),
+        floatWindows: cellNew(cfg.floatWindows),
+        statusShowIcon: cellNew(cfg.statusShowIcon),
+        spaceLabels: cellNew(cfg.spaceLabels),
+        workspaceIcons: cellNew(cfg.workspaceIcons),
+        statusMode: cellNew(mode),
+        customTemplate: cellNew(tmpl),
+        workspaceCurrent: cellNew(cfg.workspaceCurrent),
+        workspaceOther: cellNew(cfg.workspaceOther),
+        primaryFont: cellNew(pf),
+        extraFonts: cellNew(ef),
+        statusFontSize: cellNew(cfg.statusFontSize),
+        commands: cellNew(cfg.statusCommands),
+        scriptName: cellNew(sName),
+        scriptExecutable: cellNew(sExec),
+        scriptArgumentsText: cellNew(sArgs),
+        scriptInterval: cellNew(sIv),
+        scriptTimeout: cellNew(sTo),
+        scriptMarkup: cellNew(sMk),
+        scriptOnChange: cellNew(sOc),
+        statusTextFile: cellNew(match cfg.statusTextFile { Some(s) -> s, None -> "" }),
+        statusStateFile: cellNew(match cfg.statusStateFile { Some(s) -> s, None -> "" }),
+        savePath: cellNew(res.savePath),
+        migratedFromJson: cellNew(res.migratedFromJson),
+        statusBanner: cellNew(banner),
+        validationMessage: cellNew(None),
+        legacyFormat: cellNew(cfg.statusFormat),
+        suppressAutoSave: cellNew(false),
+        pendingSaveGen: cellNew(0),
+        lastWrittenMs: cellNew(intToI64(0)),
+        onConfigurationApplied: cellNew(None),
+        onUIStateChanged: cellNew(None),
+    }
+}
+
+pub def vmBuildConfiguration(vm: SettingsViewModel): Configuration = {
+    let rawMods = cellGet(vm.modifiers);
+    let orderedMods = listFilter(["control", "option", "command"], (m) -> listContainsBy(rawMods, m, eqStr));
+    let finalMods = match orderedMods { Nil -> ["option"], _ -> orderedMods };
+    let modeStr = if (cellGet(vm.workspaceMode) == "virtual") "virtual" else "native";
+    let wsCnt = minInt(9, maxInt(1, cellGet(vm.workspaceCount)));
+    let mRatio = minFloat(0.8, maxFloat(0.2, roundFloat(cellGet(vm.masterRatioPercent)) / 100.0));
+    let rStep = minFloat(0.2, maxFloat(0.01, roundFloat(cellGet(vm.ratioStepPercent) * 10.0) / 1000.0));
+    let mCnt = minInt(20, maxInt(1, cellGet(vm.masterCount)));
+    let oGap = minFloat(64.0, maxFloat(0.0, roundFloat(cellGet(vm.outerGap))));
+    let iGap = minFloat(64.0, maxFloat(0.0, roundFloat(cellGet(vm.innerGap))));
+
+    let cleanLabels = listFilter(
+        listMap(cellGet(vm.spaceLabels), (s) -> utf8TakeChars(strTrim(s), 16)),
+        (s) -> strLen(s) > 0
+    );
+    let cleanIcons = listFilter(
+        listMap(cellGet(vm.workspaceIcons), (s) -> utf8TakeChars(strTrim(s), 64)),
+        (s) -> strLen(s) > 0
+    );
+    let pf = strTrim(cellGet(vm.primaryFont));
+    let fonts = if (strLen(pf) == 0) Nil else Cons(pf, cellGet(vm.extraFonts));
+    let fontSize = roundFloat(cellGet(vm.statusFontSize) * 2.0) / 2.0;
+
+    let txtF = strTrim(cellGet(vm.statusTextFile));
+    let txtOpt = if (strLen(txtF) == 0) None else Some(txtF);
+    let stF = strTrim(cellGet(vm.statusStateFile));
+    let stOpt = if (strLen(stF) == 0) None else Some(stF);
+
+    let (statusFormat, statusTemplate, cmds) = match cellGet(vm.statusMode) {
+        ModeSimple -> ("{spaces}  {layout}", None, Nil),
+        ModeTemplate -> (cellGet(vm.legacyFormat), Some(cellGet(vm.customTemplate)), cellGet(vm.commands)),
+        ModeScript -> {
+            let trimmedName = strTrim(cellGet(vm.scriptName));
+            let safeName = if (strLen(trimmedName) == 0) "mybar" else trimmedName;
+            let parsedArgs = parseArgumentLine(cellGet(vm.scriptArgumentsText));
+            let argsOpt = match parsedArgs { Nil -> None, _ -> Some(parsedArgs) };
+            let cmd = StatusCommand {
+                name: safeName,
+                executable: strTrim(cellGet(vm.scriptExecutable)),
+                arguments: argsOpt,
+                interval: Some(cellGet(vm.scriptInterval)),
+                timeout: Some(cellGet(vm.scriptTimeout)),
+                markup: Some(cellGet(vm.scriptMarkup)),
+                onChange: Some(cellGet(vm.scriptOnChange)),
+            };
+            (cellGet(vm.legacyFormat), Some("%" + safeName + "%"), [cmd])
+        },
+    };
+
+    Configuration {
+        modifiers: finalMods,
+        workspaceMode: modeStr,
+        workspaceCount: wsCnt,
+        masterRatio: mRatio,
+        ratioStep: rStep,
+        masterCount: mCnt,
+        outerGap: oGap,
+        innerGap: iGap,
+        ignoreApps: cellGet(vm.ignoreApps),
+        appWorkspaces: cellGet(vm.appWorkspaces),
+        floatWindows: cellGet(vm.floatWindows),
+        statusFormat: statusFormat,
+        statusTemplate: statusTemplate,
+        statusShowIcon: cellGet(vm.statusShowIcon),
+        workspaceCurrent: cellGet(vm.workspaceCurrent),
+        workspaceOther: cellGet(vm.workspaceOther),
+        statusFonts: fonts,
+        statusFontSize: fontSize,
+        statusCommands: cmds,
+        spaceLabels: cleanLabels,
+        workspaceIcons: cleanIcons,
+        statusTextFile: txtOpt,
+        statusStateFile: stOpt,
+    }
+}
+
+def vmPerformSaveNow(vm: SettingsViewModel, candidate: Configuration): Void = {
+    let path = cellGet(vm.savePath);
+    match saveConfigToPath(candidate, path) {
+        Ok(_) -> {
+            cellSet(vm.lastWrittenMs, nowMs());
+            cellSet(vm.migratedFromJson, false);
+            cellSet(vm.statusBanner, "✓ 已自动保存至 " + abbreviatedPath(path) + " 并生效");
+            cellSet(vm.validationMessage, None)
+        },
+        Err(e) -> cellSet(vm.validationMessage, Some("保存失败：" + e)),
+    };
+    match cellGet(vm.onUIStateChanged) { Some(cb) -> cb(), None -> () }
+}
+
+pub def vmNotifyChanged(vm: SettingsViewModel, immediate: Bool): Void =
+    if (!cellGet(vm.suppressAutoSave)) {
+        let candidate = vmBuildConfiguration(vm);
+        match validateConfig(candidate) {
+            Err(errMsg) -> {
+                cellSet(vm.validationMessage, Some(errMsg));
+                match cellGet(vm.onUIStateChanged) { Some(cb) -> cb(), None -> () }
+            },
+            Ok(_) -> {
+                cellSet(vm.validationMessage, None);
+                match cellGet(vm.onConfigurationApplied) {
+                    Some(cb) -> cb(candidate, cellGet(vm.savePath)),
+                    None -> (),
+                };
+                let nextGen = cellGet(vm.pendingSaveGen) + 1;
+                cellSet(vm.pendingSaveGen, nextGen);
+                if (immediate) {
+                    cellSet(vm.pendingSaveGen, 0);
+                    vmPerformSaveNow(vm, candidate)
+                } else {
+                    scheduleDelayedSignal(150, kSettingsDebounceSaveSignalTag())
+                }
+            },
+        }
+    } else ()
+
+pub def vmHandleDebounceSignal(vm: SettingsViewModel): Void =
+    if (cellGet(vm.pendingSaveGen) > 0) {
+        cellSet(vm.pendingSaveGen, 0);
+        let candidate = vmBuildConfiguration(vm);
+        match validateConfig(candidate) {
+            Ok(_) -> vmPerformSaveNow(vm, candidate),
+            Err(e) -> cellSet(vm.validationMessage, Some(e)),
+        }
+    } else ()
+
+pub def vmFlushPendingSave(vm: SettingsViewModel): Void =
+    if (cellGet(vm.pendingSaveGen) > 0) {
+        cellSet(vm.pendingSaveGen, 0);
+        vmNotifyChanged(vm, true)
+    } else ()
+
+pub def vmReloadFromExternal(vm: SettingsViewModel, cfg: Configuration, res: ConfigResolution): Void = {
+    cellSet(vm.suppressAutoSave, true);
+    cellSet(vm.savePath, res.savePath);
+    cellSet(vm.migratedFromJson, res.migratedFromJson);
+    cellSet(vm.modifiers, cfg.modifiers);
+    cellSet(vm.workspaceMode, cfg.workspaceMode);
+    cellSet(vm.workspaceCount, cfg.workspaceCount);
+    cellSet(vm.masterRatioPercent, roundFloat(cfg.masterRatio * 100.0));
+    cellSet(vm.ratioStepPercent, roundFloat(cfg.ratioStep * 1000.0) / 10.0);
+    cellSet(vm.masterCount, cfg.masterCount);
+    cellSet(vm.outerGap, roundFloat(cfg.outerGap));
+    cellSet(vm.innerGap, roundFloat(cfg.innerGap));
+    cellSet(vm.ignoreApps, cfg.ignoreApps);
+    cellSet(vm.appWorkspaces, cfg.appWorkspaces);
+    cellSet(vm.floatWindows, cfg.floatWindows);
+    cellSet(vm.statusShowIcon, cfg.statusShowIcon);
+    cellSet(vm.spaceLabels, cfg.spaceLabels);
+    cellSet(vm.workspaceIcons, cfg.workspaceIcons);
+    cellSet(vm.legacyFormat, cfg.statusFormat);
+    cellSet(vm.workspaceCurrent, cfg.workspaceCurrent);
+    cellSet(vm.workspaceOther, cfg.workspaceOther);
+    match cfg.statusFonts {
+        Cons(h, t) -> { cellSet(vm.primaryFont, h); cellSet(vm.extraFonts, t) },
+        Nil -> { cellSet(vm.primaryFont, ""); cellSet(vm.extraFonts, Nil) },
+    };
+    cellSet(vm.statusFontSize, cfg.statusFontSize);
+    cellSet(vm.commands, cfg.statusCommands);
+    cellSet(vm.statusTextFile, match cfg.statusTextFile { Some(s) -> s, None -> "" });
+    cellSet(vm.statusStateFile, match cfg.statusStateFile { Some(s) -> s, None -> "" });
+    let (mode, tmpl, sName, sExec, sArgs, sIv, sTo, sMk, sOc) = detectStatusMode(cfg);
+    cellSet(vm.statusMode, mode);
+    cellSet(vm.customTemplate, tmpl);
+    cellSet(vm.scriptName, sName);
+    cellSet(vm.scriptExecutable, sExec);
+    cellSet(vm.scriptArgumentsText, sArgs);
+    cellSet(vm.scriptInterval, sIv);
+    cellSet(vm.scriptTimeout, sTo);
+    cellSet(vm.scriptMarkup, sMk);
+    cellSet(vm.scriptOnChange, sOc);
+    cellSet(vm.validationMessage, None);
+    cellSet(vm.statusBanner, "已从磁盘同步最新配置 (" + abbreviatedPath(res.savePath) + ")");
+    cellSet(vm.suppressAutoSave, false);
+    match cellGet(vm.onUIStateChanged) { Some(cb) -> cb(), None -> () }
+}
+
+pub def vmModifierSymbolPrefix(vm: SettingsViewModel): String = {
+    let mods = cellGet(vm.modifiers);
+    let s1 = if (listContainsBy(mods, "control", eqStr)) "⌃" else "";
+    let s2 = if (listContainsBy(mods, "option", eqStr)) s1 + "⌥" else s1;
+    if (listContainsBy(mods, "command", eqStr)) s2 + "⌘" else s2
+}
+
+pub def vmToggleModifier(vm: SettingsViewModel, modName: String): Void = {
+    let cur = cellGet(vm.modifiers);
+    if (listContainsBy(cur, modName, eqStr)) {
+        if (listLen(cur) > 1) {
+            cellSet(vm.modifiers, listFilter(cur, (m) -> m != modName));
+            vmNotifyChanged(vm, true)
+        } else ()
+    } else {
+        cellSet(vm.modifiers, listAppend(cur, [modName]));
+        vmNotifyChanged(vm, true)
+    }
+}
+
+pub def vmApplyTemplatePreset(vm: SettingsViewModel, preset: String): Void = {
+    cellSet(vm.statusMode, ModeTemplate);
+    if (preset == "icons") {
+        cellSet(vm.customTemplate, "%spaces% <fc=#80808066>│</fc>  <fc=#14B8A6>%layout%</fc> · %count%");
+        cellSet(vm.workspaceCurrent, "<fc=#FFFFFF,#0F766E> %icon%%fullscreen% </fc>");
+        cellSet(vm.workspaceOther, " %icon%%fullscreen% ");
+        if (listLen(cellGet(vm.workspaceIcons)) == 0) {
+            cellSet(vm.workspaceIcons, ["terminal", "globe", "chevron.left.forwardslash.chevron.right", "bubble.left.and.bubble.right", "square.grid.2x2"])
+        } else ()
+    } else if (preset == "compact") {
+        cellSet(vm.customTemplate, "%spaces%  <fc=#80808066>│</fc>  <fc=#0D9488>%layout%</fc> · %count%");
+        cellSet(vm.workspaceCurrent, "<fc=#FFFFFF,#0F766E> %index%:%label%%fullscreen% </fc>");
+        cellSet(vm.workspaceOther, " %index%:%label%%occupied%%fullscreen% ")
+    } else if (preset == "underline") {
+        cellSet(vm.customTemplate, "%spaces%  <fc=#80808066>│</fc>  <fc=#14B8A6>%layout%</fc> · %count%");
+        cellSet(vm.workspaceCurrent, "<box type=Bottom width=2 color=#14B8A6> %index%:%label%%fullscreen% </box>");
+        cellSet(vm.workspaceOther, " %index%:%label%%occupied%%fullscreen% ")
+    } else if (preset == "pills") {
+        cellSet(vm.customTemplate, "%spaces%  <fc=,#80808024> %layout% · %count% </fc>");
+        cellSet(vm.workspaceCurrent, "<fc=#FFFFFF,#0F766E><box type=Full width=1 color=#2DD4BF80> %index%:%label%%fullscreen% </box></fc>");
+        cellSet(vm.workspaceOther, "<fc=,#80808022> %index%:%label%%occupied%%fullscreen% </fc>")
+    } else if (preset == "powerline") {
+        cellSet(vm.customTemplate, "%spaces%  <fc=#D97706>▶ %layout%</fc>");
+        cellSet(vm.workspaceCurrent, "<fc=#191C24,#F0C674> %index%:%label%%fullscreen% </fc>");
+        cellSet(vm.workspaceOther, "<fc=,#80808028> %index%:%label%%occupied%%fullscreen% </fc>")
+    } else if (preset == "clock") {
+        cellSet(vm.customTemplate, "%spaces%  <fc=#80808066>│</fc>  <fc=#0D9488>%layout%</fc>  %clock%");
+        cellSet(vm.workspaceCurrent, "<fc=#FFFFFF,#0F766E> %index%:%label%%fullscreen% </fc>");
+        cellSet(vm.workspaceOther, " %index%:%label%%occupied%%fullscreen% ");
+        let hasClock = listLen(listFilter(cellGet(vm.commands), (c: StatusCommand) -> c.name == "clock")) > 0;
+        if (!hasClock) {
+            let clk = StatusCommand {
+                name: "clock",
+                executable: "/bin/date",
+                arguments: Some(["+%H:%M"]),
+                interval: Some(30.0),
+                timeout: Some(2.0),
+                markup: None,
+                onChange: None,
+            };
+            cellSet(vm.commands, listAppend(cellGet(vm.commands), [clk]))
+        } else ()
+    } else ();
+    vmNotifyChanged(vm, true)
+}
+
+pub def vmPreviewImage(vm: SettingsViewModel, dark: Bool): Id NSObject = {
+    let cand = vmBuildConfiguration(vm);
+    let sampleSpaces = if (cand.workspaceMode == "virtual") {
+        let rev: Cell (List SpaceEntry) = cellNew(Nil);
+        let i = cellNew(0);
+        while (cellGet(i) < cand.workspaceCount) {
+            let idx = cellGet(i);
+            let wc = if (idx == 0) 2 else if (idx == 1) 1 else 0;
+            cellSet(rev, Cons(SpaceEntry {
+                id: intToI64(idx + 1),
+                isCurrent: idx == 0,
+                isFullscreen: false,
+                windowCount: Some(wc),
+            }, cellGet(rev)));
+            cellSet(i, idx + 1)
+        };
+        listRev(cellGet(rev))
+    } else {
+        [
+            SpaceEntry { id: intToI64(1), isCurrent: true, isFullscreen: false, windowCount: None },
+            SpaceEntry { id: intToI64(2), isCurrent: false, isFullscreen: false, windowCount: None },
+            SpaceEntry { id: intToI64(3), isCurrent: false, isFullscreen: true, windowCount: None },
+        ]
+    };
+    let vals = StatusValues {
+        spaces: Some(sampleSpaces),
+        layout: "Tall",
+        title: "Safari",
+        count: 3,
+        custom: "示例状态",
+        paused: false,
+        spaceLabels: cand.spaceLabels,
+        spaceIcons: cand.workspaceIcons,
+    };
+    let parts = templateStatusParts(cand, vals, (idx) ->
+        match listNthOpt(cand.statusCommands, idx) {
+            Some(c) -> if (c.name == "clock") "14:25" else "[" + c.name + "]",
+            None -> "",
+        }
+    );
+    let out = renderConfiguredStatus(parts, dark, cand.statusShowIcon, None);
+    out.image
+}
+
+// ---------------------------------------------------------------------------
+// AppKit UI Builder Helpers (SectionCard, TilingPreviewView, MenuBarPreviewPill)
+// ---------------------------------------------------------------------------
+
+def pickAppBundleId(): Option String = {
+    let panel = msgSend0(objcClass("NSOpenPanel"), objcSel("openPanel"));
+    let tNs = nsString("选择应用程序");
+    withId(tNs, (tp) -> {
+        c_setTitleP(panel, objcSel("setTitle:"), tp)
+    });
+    msgSendVoid1Bool(panel, objcSel("setAllowsMultipleSelection:"), false);
+    msgSendVoid1Bool(panel, objcSel("setCanChooseDirectories:"), false);
+    msgSendVoid1Bool(panel, objcSel("setCanChooseFiles:"), true);
+    let appsDir = nsString("/Applications");
+    let dirUrl = withId(appsDir, (ap) -> {
+        c_fileUrl(objcClass("NSURL"), objcSel("fileURLWithPath:"), ap)
+    });
+    if (!ptrIsNull(dirUrl)) msgSendVoid1Ptr(panel, objcSel("setDirectoryURL:"), dirUrl) else ();
+    let res = i64ToInt(msgSendI64_0(panel, objcSel("runModal")));
+    if (res != 1) None
+    else {
+        let url = msgSend0(panel, objcSel("URL"));
+        if (ptrIsNull(url)) None
+        else {
+            let bundle = msgSend1Ptr(objcClass("NSBundle"), objcSel("bundleWithURL:"), url);
+            if (ptrIsNull(bundle)) None
+            else {
+                let bid = fromNSStringPtr(msgSend0(bundle, objcSel("bundleIdentifier")));
+                if (strLen(bid) > 0) Some(bid) else None
+            }
+        }
+    }
+}
+
+def pickExecutableFile(): Option String = {
+    let panel = msgSend0(objcClass("NSOpenPanel"), objcSel("openPanel"));
+    let tNs = nsString("选择可执行文件或脚本");
+    withId(tNs, (tp) -> {
+        c_setTitleP2(panel, objcSel("setTitle:"), tp)
+    });
+    msgSendVoid1Bool(panel, objcSel("setAllowsMultipleSelection:"), false);
+    msgSendVoid1Bool(panel, objcSel("setCanChooseDirectories:"), false);
+    msgSendVoid1Bool(panel, objcSel("setCanChooseFiles:"), true);
+    msgSendVoid1Bool(panel, objcSel("setShowsHiddenFiles:"), true);
+    let res = i64ToInt(msgSendI64_0(panel, objcSel("runModal")));
+    if (res != 1) None
+    else {
+        let url = msgSend0(panel, objcSel("URL"));
+        if (ptrIsNull(url)) None
+        else {
+            let p = fromNSStringPtr(msgSend0(url, objcSel("path")));
+            if (strLen(p) > 0) Some(p) else None
+        }
+    }
+}
+
+// Keep strong references to targets/delegates/views owned by the current rendered tab
+data UIRetainBag {
+    UIRetainBag {
+        items: Cell (List (Id NSObject)),
+    }
+}
+
+def retainBagNew(): UIRetainBag = UIRetainBag { items: cellNew(Nil) }
+
+extern "objc_msgSend" def c_objcSelf(p: ScopedPtr, sel: Ptr): Ptr
+
+def idPtrKept(bag: UIRetainBag, obj: Id NSObject): Ptr = {
+    cellSet(bag.items, Cons(obj, cellGet(bag.items)));
+    withId(obj, (p) -> c_objcSelf(p, objcSel("self")))
+}
+
+/// Create a rounded section card (`SectionCard`) inside `parent` at `y` with given `height`, returning `(cardPtr, innerYStart)`.
+def addSectionCard(
+    bag: UIRetainBag,
+    parent: Ptr,
+    title: String,
+    subtitle: String,
+    x: Float,
+    y: Float,
+    w: Float,
+    h: Float,
+    dark: Bool
+): (Ptr, Float) = {
+    let cardId = makeFlippedView(cgRect(x, y, w, h));
+    let card = idPtrKept(bag, cardId);
+    let bg = if (dark) nsColorSRGB(1.0, 1.0, 1.0, 0.055) else nsColorSRGB(0.0, 0.0, 0.0, 0.032);
+    let border = if (dark) nsColorSRGB(1.0, 1.0, 1.0, 0.11) else nsColorSRGB(0.0, 0.0, 0.0, 0.09);
+    nsViewSetLayerStyle(card, Some(bg), Some(border), 1.0, 11.0);
+    nsViewAddSubview(parent, card);
+
+    let titleLbl = idPtrKept(bag, makeLabel(title, cgRect(14.0, 12.0, w - 28.0, 18.0), nsFontSystem(13.0, kFontWeightSemibold()), nsColorLabel()));
+    nsViewAddSubview(card, titleLbl);
+
+    let bodyY = if (strLen(subtitle) > 0) {
+        let subLbl = idPtrKept(bag, makeLabel(subtitle, cgRect(14.0, 31.0, w - 28.0, 16.0), nsFontSystem(11.5, kFontWeightRegular()), nsColorSecondaryLabel()));
+        nsViewAddSubview(card, subLbl);
+        54.0
+    } else 38.0;
+    (card, bodyY)
+}
+
+def makeTilingPreviewView(bag: UIRetainBag, vm: SettingsViewModel, frame: CGRect, dark: Bool): Ptr = {
+    let ratio = minFloat(0.8, maxFloat(0.2, cellGet(vm.masterRatioPercent) / 100.0));
+    let masters = minInt(20, maxInt(1, cellGet(vm.masterCount)));
+    let oGap = minFloat(64.0, maxFloat(0.0, cellGet(vm.outerGap))) * 0.45;
+    let iGap = minFloat(64.0, maxFloat(0.0, cellGet(vm.innerGap))) * 0.45;
+    let viewId = makeCustomDrawView(frame, (selfPtr: Ptr, _dirty: CGRect) -> {
+        let bounds = msgSendRect0(selfPtr, objcSel("bounds"));
+        let w = bounds.size.w;
+        let h = bounds.size.h;
+        // Desktop backdrop
+        let bg = if (dark) nsColorSRGB(0.11, 0.13, 0.16, 1.0) else nsColorSRGB(0.88, 0.91, 0.94, 1.0);
+        nsColorSetFill(bg);
+        nsDrawRoundedRectFill(0.0, 0.0, w, h, 10.0);
+        // Subtle simulated menu bar strip at top (AppKit non-flipped y = h - 16)
+        let mbH = 16.0;
+        let mb = if (dark) nsColorSRGB(0.17, 0.19, 0.23, 0.95) else nsColorSRGB(0.96, 0.97, 0.98, 0.95);
+        nsColorSetFill(mb);
+        nsDrawRoundedRectFill(1.0, h - mbH - 1.0, w - 2.0, mbH, 4.0);
+
+        let usableH = h - mbH - 12.0;
+        let area = rectNew(6.0, 6.0, w - 12.0, usableH);
+        let rects = tallLayoutWithGaps(area, 4, masters, ratio, oGap, iGap);
+        let idx = cellNew(0);
+        let cr = cellNew(rects);
+        while (match cellGet(cr) { Nil -> false, _ -> true }) {
+            match cellGet(cr) {
+                Cons(r, rest) -> {
+                    let i = cellGet(idx);
+                    let isMaster = i < masters;
+                    let fill = if (isMaster) {
+                        if (dark) nsColorSRGB(0.06, 0.46, 0.43, 0.88) else nsColorSRGB(0.08, 0.56, 0.52, 0.84)
+                    } else {
+                        if (dark) nsColorSRGB(0.24, 0.28, 0.34, 0.90) else nsColorSRGB(0.99, 0.99, 1.0, 0.94)
+                    };
+                    let stroke = if (isMaster) {
+                        nsColorSRGB(0.18, 0.83, 0.75, 0.72)
+                    } else {
+                        if (dark) nsColorSRGB(1.0, 1.0, 1.0, 0.16) else nsColorSRGB(0.0, 0.0, 0.0, 0.14)
+                    };
+                    // Convert top-down rect `r` inside `area` to bottom-up AppKit coordinates below menu bar
+                    let topOfWork = h - mbH - 6.0;
+                    let drawY = topOfWork - (r.y - 6.0) - r.h;
+                    let drawW = maxFloat(8.0, r.w);
+                    let drawH = maxFloat(8.0, r.h);
+                    nsColorSetFill(fill);
+                    nsDrawRoundedRectFill(r.x, drawY, drawW, drawH, 6.0);
+                    nsColorSetStroke(stroke);
+                    nsDrawRoundedRectStroke(r.x + 0.5, drawY + 0.5, maxFloat(7.0, drawW - 1.0), maxFloat(7.0, drawH - 1.0), 6.0, 1.0);
+                    let lbl = if (isMaster) "主区 " + intToStr(i + 1) else "副区 " + intToStr(i + 1);
+                    let txtCol = if (isMaster || dark) nsColorWithAlpha(nsColorWhite(), 0.92) else nsColorSRGB(0.15, 0.18, 0.22, 0.92);
+                    nsTextDrawAt(lbl, r.x + 8.0, drawY + maxFloat(4.0, drawH - 18.0), nsFontSystem(10.5, kFontWeightSemibold()), txtCol);
+                    cellSet(idx, i + 1);
+                    cellSet(cr, rest)
+                },
+                Nil -> (),
+            }
+        }
+    });
+    idPtrKept(bag, viewId)
+}
+
+// ---------------------------------------------------------------------------
+// SettingsWindowController
+// ---------------------------------------------------------------------------
+
+pub data SettingsWindowController {
+    SettingsWindowController {
+        viewModel: SettingsViewModel,
+        window: Cell (Option (Id NSObject)),
+        tabSegment: Cell Ptr,
+        scrollView: Cell Ptr,
+        bannerLabel: Cell Ptr,
+        validationLabel: Cell Ptr,
+        bag: UIRetainBag,
+        chromeBag: UIRetainBag,
+        onClose: Cell (Option (() -> Void)),
+        isPreviewMode: Cell Bool,
+    }
+}
+
+def installEditMenuIfNeeded(): Void = {
+    let app = nsAppShared();
+    let existing = msgSend0(app, objcSel("mainMenu"));
+    if (ptrIsNull(existing)) {
+        let mainMenu = msgSend0(msgSend0(objcClass("NSMenu"), objcSel("alloc")), objcSel("init"));
+        let appItem = msgSend0(msgSend0(objcClass("NSMenuItem"), objcSel("alloc")), objcSel("init"));
+        let appSub = msgSend0(msgSend0(objcClass("NSMenu"), objcSel("alloc")), objcSel("init"));
+        nsMenuAddItem(appSub, makeMenuItemWithSelector("关闭窗口", "w", "performClose:"));
+        nsMenuAddSeparator(appSub);
+        nsMenuAddItem(appSub, makeMenuItemWithSelector("退出 Talus", "q", "terminate:"));
+        msgSendVoid1Ptr(appItem, objcSel("setSubmenu:"), appSub);
+        msgSendVoid1Ptr(mainMenu, objcSel("addItem:"), appItem);
+
+        let editItem = msgSend0(msgSend0(objcClass("NSMenuItem"), objcSel("alloc")), objcSel("init"));
+        let editTitle = nsString("编辑");
+        let editSub = withId(editTitle, (ep) -> {
+            c_menuInit(msgSend0(objcClass("NSMenu"), objcSel("alloc")), objcSel("initWithTitle:"), ep)
+        });
+        nsMenuAddItem(editSub, makeMenuItemWithSelector("撤销", "z", "undo:"));
+        nsMenuAddItem(editSub, makeMenuItemWithSelector("重做", "Z", "redo:"));
+        nsMenuAddSeparator(editSub);
+        nsMenuAddItem(editSub, makeMenuItemWithSelector("剪切", "x", "cut:"));
+        nsMenuAddItem(editSub, makeMenuItemWithSelector("拷贝", "c", "copy:"));
+        nsMenuAddItem(editSub, makeMenuItemWithSelector("粘贴", "v", "paste:"));
+        nsMenuAddItem(editSub, makeMenuItemWithSelector("全选", "a", "selectAll:"));
+        msgSendVoid1Ptr(editItem, objcSel("setSubmenu:"), editSub);
+        msgSendVoid1Ptr(mainMenu, objcSel("addItem:"), editItem);
+
+        msgSendVoid1Ptr(app, objcSel("setMainMenu:"), mainMenu)
+    } else ()
+}
+
+def updateBannerLabels(ctrl: SettingsWindowController): Void = {
+    let bPtr = cellGet(ctrl.bannerLabel);
+    let vPtr = cellGet(ctrl.validationLabel);
+    if (!ptrIsNull(bPtr)) {
+        textFieldSetStringValue(bPtr, cellGet(ctrl.viewModel.statusBanner))
+    } else ();
+    if (!ptrIsNull(vPtr)) {
+        match cellGet(ctrl.viewModel.validationMessage) {
+            Some(err) -> {
+                textFieldSetStringValue(vPtr, "⚠ " + err);
+                msgSendVoid1Bool(vPtr, objcSel("setHidden:"), false)
+            },
+            None -> {
+                textFieldSetStringValue(vPtr, "");
+                msgSendVoid1Bool(vPtr, objcSel("setHidden:"), true)
+            },
+        }
+    } else ()
+}
+
+// Forward-ish tab builders (in dependency order before rebuildActiveTab)
+
+def buildGeneralTab(ctrl: SettingsWindowController, bag: UIRetainBag, width: Float, dark: Bool, rebuild: () -> Void): Id NSObject = {
+    let vm = ctrl.viewModel;
+    let contentW = width - 36.0;
+    let docId = makeFlippedView(cgRect(0.0, 0.0, width, 540.0));
+    let doc = idPtrKept(bag, docId);
+    let y = cellNew(14.0);
+
+    // Card 1: 工作区模式与数量
+    let isVirt = cellGet(vm.workspaceMode) == "virtual";
+    let card1H = if (isVirt) 152.0 else 112.0;
+    let (c1, cy1) = addSectionCard(bag, doc, "工作区模式", "选择虚拟工作区（瞬时切换、按应用自动归位）或跟随 macOS 原生 Spaces", 18.0, cellGet(y), contentW, card1H, dark);
+    let modeTgt = makeActionTarget((sender) -> {
+        let seg = i64ToInt(msgSendI64_0(sender, objcSel("selectedSegment")));
+        cellSet(vm.workspaceMode, if (seg == 0) "virtual" else "native");
+        vmNotifyChanged(vm, true);
+        rebuild()
+    });
+    let _ = idPtrKept(bag, modeTgt);
+    let modeSeg = idPtrKept(bag, makeSegmentedControl(["虚拟工作区（推荐）", "macOS 原生桌面"], if (isVirt) 0 else 1, cgRect(14.0, cy1, 320.0, 26.0), modeTgt));
+    nsViewAddSubview(c1, modeSeg);
+
+    if (isVirt) {
+        let cntLbl = idPtrKept(bag, makeLabel("工作区数量：" + intToStr(cellGet(vm.workspaceCount)) + " 个（" + vmModifierSymbolPrefix(vm) + "1–" + intToStr(cellGet(vm.workspaceCount)) + " 切换）", cgRect(14.0, cy1 + 40.0, 310.0, 18.0), nsFontSystem(12.5, kFontWeightRegular()), nsColorLabel()));
+        nsViewAddSubview(c1, cntLbl);
+        let cntItems = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+        let cntTgt = makeActionTarget((sender) -> {
+            let idx = i64ToInt(msgSendI64_0(sender, objcSel("indexOfSelectedItem")));
+            cellSet(vm.workspaceCount, idx + 1);
+            vmNotifyChanged(vm, true);
+            rebuild()
+        });
+        let _ = idPtrKept(bag, cntTgt);
+        let cntPop = idPtrKept(bag, makePopUpButton(cntItems, cellGet(vm.workspaceCount) - 1, cgRect(contentW - 96.0, cy1 + 35.0, 82.0, 26.0), cntTgt));
+        nsViewAddSubview(c1, cntPop)
+    } else ();
+    cellSet(y, cellGet(y) + card1H + 14.0);
+
+    // Card 2: 开机自动启动 (SMAppService.mainApp)
+    let needsApp = launchAtLoginNeedsApproval(vm.launchAtLogin);
+    let loginErr = launchAtLoginError(vm.launchAtLogin);
+    let card2H = if (needsApp || (match loginErr { Some(_) -> true, None -> false })) 130.0 else 96.0;
+    let (c2, cy2) = addSectionCard(bag, doc, "启动与系统集成", "由 macOS 登录项管理（不写入 TOML 配置文件）", 18.0, cellGet(y), contentW, card2H, dark);
+    let lLbl = idPtrKept(bag, makeLabel("登录 macOS 时自动启动 Talus", cgRect(14.0, cy2 + 4.0, 260.0, 18.0), nsFontSystem(12.5, kFontWeightMedium()), nsColorLabel()));
+    nsViewAddSubview(c2, lLbl);
+    let loginTgt = makeActionTarget((sender) -> {
+        launchAtLoginSetEnabled(vm.launchAtLogin, controlStateOn(sender));
+        rebuild()
+    });
+    let _ = idPtrKept(bag, loginTgt);
+    let sw = idPtrKept(bag, makeSwitch(launchAtLoginIsEnabled(vm.launchAtLogin), cgRect(contentW - 58.0, cy2, 42.0, 24.0), loginTgt));
+    nsViewAddSubview(c2, sw);
+
+    if (needsApp) {
+        let appNote = idPtrKept(bag, makeLabel("需要在系统设置 → 登录项中批准 Talus", cgRect(14.0, cy2 + 34.0, 320.0, 18.0), nsFontSystem(11.5, kFontWeightRegular()), nsColorSystemOrange()));
+        nsViewAddSubview(c2, appNote);
+        let openTgt = makeActionTarget((_) -> launchAtLoginOpenSettings(vm.launchAtLogin));
+        let _ = idPtrKept(bag, openTgt);
+        let openBtn = idPtrKept(bag, makePushButton("打开登录项设置…", cgRect(contentW - 144.0, cy2 + 29.0, 130.0, 26.0), openTgt));
+        nsViewAddSubview(c2, openBtn)
+    } else match loginErr {
+        Some(em) -> {
+            let errLbl = idPtrKept(bag, makeLabel(em, cgRect(14.0, cy2 + 34.0, contentW - 28.0, 18.0), nsFontSystem(11.5, kFontWeightRegular()), nsColorSystemRed()));
+            nsViewAddSubview(c2, errLbl)
+        },
+        None -> (),
+    };
+    cellSet(y, cellGet(y) + card2H + 14.0);
+
+    // Card 3: 配置文件与快捷操作
+    let card3H = 112.0;
+    let (c3, cy3) = addSectionCard(bag, doc, "配置文件", "所有设置均通过保注释 TOML 写回磁盘，手写注释不会丢失", 18.0, cellGet(y), contentW, card3H, dark);
+    let pathLbl = idPtrKept(bag, makeLabel("当前路径：" + abbreviatedPath(cellGet(vm.savePath)), cgRect(14.0, cy3 + 4.0, contentW - 140.0, 18.0), nsFontMonospaced(11.5, kFontWeightRegular()), nsColorSecondaryLabel()));
+    nsViewAddSubview(c3, pathLbl);
+    let resetTgt = makeActionTarget((_) -> {
+        let p = cellGet(vm.savePath);
+        vmReloadFromExternal(vm, defaultConfig(), ConfigResolution { loadPath: p, savePath: p, migratedFromJson: false });
+        vmNotifyChanged(vm, true);
+        rebuild()
+    });
+    let _ = idPtrKept(bag, resetTgt);
+    let resetBtn = idPtrKept(bag, makePushButton("恢复默认设置", cgRect(contentW - 122.0, cy3 - 1.0, 108.0, 26.0), resetTgt));
+    nsViewAddSubview(c3, resetBtn);
+
+    cellSet(y, cellGet(y) + card3H + 18.0);
+    msgSendVoid1Rect(doc, objcSel("setFrame:"), cgRect(0.0, 0.0, width, maxFloat(460.0, cellGet(y))));
+    docId
+}
+
+def buildLayoutTab(ctrl: SettingsWindowController, bag: UIRetainBag, width: Float, dark: Bool, rebuild: () -> Void): Id NSObject = {
+    let vm = ctrl.viewModel;
+    let contentW = width - 36.0;
+    let docId = makeFlippedView(cgRect(0.0, 0.0, width, 680.0));
+    let doc = idPtrKept(bag, docId);
+    let y = cellNew(14.0);
+
+    // Card 1: 快捷键修饰键 + 常用键位速查
+    let card1H = 166.0;
+    let (c1, cy1) = addSectionCard(bag, doc, "全局快捷键修饰键", "至少保留一个修饰键；组合键与 Shift 变体自动注册", 18.0, cellGet(y), contentW, card1H, dark);
+    let mods = cellGet(vm.modifiers);
+    let cTgt = makeActionTarget((_) -> { vmToggleModifier(vm, "control"); rebuild() });
+    let oTgt = makeActionTarget((_) -> { vmToggleModifier(vm, "option"); rebuild() });
+    let mTgt = makeActionTarget((_) -> { vmToggleModifier(vm, "command"); rebuild() });
+    let _ = idPtrKept(bag, cTgt);
+    let _ = idPtrKept(bag, oTgt);
+    let _ = idPtrKept(bag, mTgt);
+    nsViewAddSubview(c1, idPtrKept(bag, makeCheckbox("⌃ Control", listContainsBy(mods, "control", eqStr), cgRect(14.0, cy1, 100.0, 22.0), cTgt)));
+    nsViewAddSubview(c1, idPtrKept(bag, makeCheckbox("⌥ Option", listContainsBy(mods, "option", eqStr), cgRect(122.0, cy1, 100.0, 22.0), oTgt)));
+    nsViewAddSubview(c1, idPtrKept(bag, makeCheckbox("⌘ Command", listContainsBy(mods, "command", eqStr), cgRect(230.0, cy1, 110.0, 22.0), mTgt)));
+
+    let pfx = vmModifierSymbolPrefix(vm);
+    let cheat1 = pfx + "J / K 切换焦点    " + pfx + "⇧J / ⇧K 交换顺序    " + pfx + "Return 置为主窗    " + pfx + "Space 切换布局";
+    let cheat2 = pfx + "H / L 调整主区比例    " + pfx + ", / . 增减主区窗口    " + pfx + "T 浮动/平铺    " + pfx + "P 暂停";
+    nsViewAddSubview(c1, idPtrKept(bag, makeLabel(cheat1, cgRect(14.0, cy1 + 36.0, contentW - 28.0, 18.0), nsFontMonospaced(11.0, kFontWeightRegular()), nsColorSecondaryLabel())));
+    nsViewAddSubview(c1, idPtrKept(bag, makeLabel(cheat2, cgRect(14.0, cy1 + 58.0, contentW - 28.0, 18.0), nsFontMonospaced(11.0, kFontWeightRegular()), nsColorSecondaryLabel())));
+    cellSet(y, cellGet(y) + card1H + 14.0);
+
+    // Card 2: 平铺参数 + 实时平铺预览
+    let card2H = 356.0;
+    let (c2, cy2) = addSectionCard(bag, doc, "平铺几何与实时预览", "调整主区比例、主区窗口数与内外边距，立即生效", 18.0, cellGet(y), contentW, card2H, dark);
+
+    // Live TilingPreviewView
+    let preview = makeTilingPreviewView(bag, vm, cgRect(14.0, cy2, contentW - 28.0, 140.0), dark);
+    nsViewAddSubview(c2, preview);
+
+    let ry = cy2 + 154.0;
+    // Row 1: 主区比例
+    let rPct = roundToInt(cellGet(vm.masterRatioPercent));
+    nsViewAddSubview(c2, idPtrKept(bag, makeLabel("主区比例：" + intToStr(rPct) + "%", cgRect(14.0, ry, 140.0, 18.0), nsFontSystem(12.5, kFontWeightRegular()), nsColorLabel())));
+    let rTgt = makeActionTarget((sender) -> {
+        let v = roundFloat(msgSendFloat0(sender, objcSel("doubleValue")));
+        cellSet(vm.masterRatioPercent, v);
+        vmNotifyChanged(vm, false);
+        rebuild()
+    });
+    let _ = idPtrKept(bag, rTgt);
+    nsViewAddSubview(c2, idPtrKept(bag, makeSlider(20.0, 80.0, cellGet(vm.masterRatioPercent), cgRect(160.0, ry - 2.0, contentW - 178.0, 22.0), rTgt)));
+
+    // Row 2: 调整步长 & 主区窗口数
+    let ry2 = ry + 36.0;
+    nsViewAddSubview(c2, idPtrKept(bag, makeLabel("单次步长：" + intToStr(roundToInt(cellGet(vm.ratioStepPercent))) + "%", cgRect(14.0, ry2, 130.0, 18.0), nsFontSystem(12.5, kFontWeightRegular()), nsColorLabel())));
+    let stepTgt = makeActionTarget((sender) -> {
+        let v = roundFloat(msgSendFloat0(sender, objcSel("doubleValue")));
+        cellSet(vm.ratioStepPercent, v);
+        vmNotifyChanged(vm, false);
+        rebuild()
+    });
+    let _ = idPtrKept(bag, stepTgt);
+    nsViewAddSubview(c2, idPtrKept(bag, makeSlider(1.0, 20.0, cellGet(vm.ratioStepPercent), cgRect(160.0, ry2 - 2.0, 150.0, 22.0), stepTgt)));
+
+    nsViewAddSubview(c2, idPtrKept(bag, makeLabel("主区窗口数：" + intToStr(cellGet(vm.masterCount)), cgRect(334.0, ry2, 110.0, 18.0), nsFontSystem(12.5, kFontWeightRegular()), nsColorLabel())));
+    let mcTgt = makeActionTarget((sender) -> {
+        let idx = i64ToInt(msgSendI64_0(sender, objcSel("indexOfSelectedItem")));
+        cellSet(vm.masterCount, idx + 1);
+        vmNotifyChanged(vm, true);
+        rebuild()
+    });
+    let _ = idPtrKept(bag, mcTgt);
+    nsViewAddSubview(c2, idPtrKept(bag, makePopUpButton(["1", "2", "3", "4", "5"], minInt(4, maxInt(0, cellGet(vm.masterCount) - 1)), cgRect(contentW - 88.0, ry2 - 5.0, 74.0, 26.0), mcTgt)));
+
+    // Row 3: 外边距
+    let ry3 = ry2 + 36.0;
+    nsViewAddSubview(c2, idPtrKept(bag, makeLabel("屏幕外边距：" + intToStr(roundToInt(cellGet(vm.outerGap))) + " px", cgRect(14.0, ry3, 140.0, 18.0), nsFontSystem(12.5, kFontWeightRegular()), nsColorLabel())));
+    let ogTgt = makeActionTarget((sender) -> {
+        cellSet(vm.outerGap, roundFloat(msgSendFloat0(sender, objcSel("doubleValue"))));
+        vmNotifyChanged(vm, false);
+        rebuild()
+    });
+    let _ = idPtrKept(bag, ogTgt);
+    nsViewAddSubview(c2, idPtrKept(bag, makeSlider(0.0, 48.0, cellGet(vm.outerGap), cgRect(160.0, ry3 - 2.0, contentW - 178.0, 22.0), ogTgt)));
+
+    // Row 4: 内边距
+    let ry4 = ry3 + 36.0;
+    nsViewAddSubview(c2, idPtrKept(bag, makeLabel("窗口内间距：" + intToStr(roundToInt(cellGet(vm.innerGap))) + " px", cgRect(14.0, ry4, 140.0, 18.0), nsFontSystem(12.5, kFontWeightRegular()), nsColorLabel())));
+    let igTgt = makeActionTarget((sender) -> {
+        cellSet(vm.innerGap, roundFloat(msgSendFloat0(sender, objcSel("doubleValue"))));
+        vmNotifyChanged(vm, false);
+        rebuild()
+    });
+    let _ = idPtrKept(bag, igTgt);
+    nsViewAddSubview(c2, idPtrKept(bag, makeSlider(0.0, 48.0, cellGet(vm.innerGap), cgRect(160.0, ry4 - 2.0, contentW - 178.0, 22.0), igTgt)));
+
+    cellSet(y, cellGet(y) + card2H + 18.0);
+    msgSendVoid1Rect(doc, objcSel("setFrame:"), cgRect(0.0, 0.0, width, maxFloat(540.0, cellGet(y))));
+    docId
+}
+
+def buildRulesTab(ctrl: SettingsWindowController, bag: UIRetainBag, width: Float, dark: Bool, rebuild: () -> Void): Id NSObject = {
+    let vm = ctrl.viewModel;
+    let contentW = width - 36.0;
+    let docId = makeFlippedView(cgRect(0.0, 0.0, width, 640.0));
+    let doc = idPtrKept(bag, docId);
+    let y = cellNew(14.0);
+
+    // Card 1: 忽略平铺的应用
+    let ignored = cellGet(vm.ignoreApps);
+    let nIgn = listLen(ignored);
+    let card1H = 98.0 + intToFloat(maxInt(1, nIgn)) * 30.0;
+    let (c1, cy1) = addSectionCard(bag, doc, "忽略的应用（始终浮动）", "这些应用的窗口不会被 Talus 自动平铺或停放", 18.0, cellGet(y), contentW, card1H, dark);
+    let pickIgnTgt = makeActionTarget((_) -> match pickAppBundleId() {
+        Some(bid) -> {
+            if (!listContainsBy(cellGet(vm.ignoreApps), bid, eqStr)) {
+                cellSet(vm.ignoreApps, listAppend(cellGet(vm.ignoreApps), [bid]));
+                vmNotifyChanged(vm, true);
+                rebuild()
+            } else ()
+        },
+        None -> (),
+    });
+    let _ = idPtrKept(bag, pickIgnTgt);
+    nsViewAddSubview(c1, idPtrKept(bag, makePushButton("+ 选择应用…", cgRect(contentW - 118.0, 12.0, 104.0, 24.0), pickIgnTgt)));
+
+    if (nIgn == 0) {
+        nsViewAddSubview(c1, idPtrKept(bag, makeLabel("暂无忽略应用", cgRect(14.0, cy1 + 4.0, 240.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorSecondaryLabel())))
+    } else {
+        let ri = cellNew(0);
+        let cur = cellNew(ignored);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(bid, rest) -> {
+                    let rowY = cy1 + intToFloat(cellGet(ri)) * 30.0;
+                    nsViewAddSubview(c1, idPtrKept(bag, makeLabel(bid, cgRect(14.0, rowY + 4.0, contentW - 104.0, 18.0), nsFontMonospaced(12.0, kFontWeightRegular()), nsColorLabel())));
+                    let delBid = bid;
+                    let delTgt = makeActionTarget((_) -> {
+                        cellSet(vm.ignoreApps, listFilter(cellGet(vm.ignoreApps), (x) -> x != delBid));
+                        vmNotifyChanged(vm, true);
+                        rebuild()
+                    });
+                    let _ = idPtrKept(bag, delTgt);
+                    nsViewAddSubview(c1, idPtrKept(bag, makePushButton("移除", cgRect(contentW - 76.0, rowY, 62.0, 24.0), delTgt)));
+                    cellSet(ri, cellGet(ri) + 1);
+                    cellSet(cur, rest)
+                },
+                Nil -> (),
+            }
+        }
+    };
+    cellSet(y, cellGet(y) + card1H + 14.0);
+
+    // Card 2: 应用归属工作区 (app_workspaces)
+    let assigns = cellGet(vm.appWorkspaces);
+    let nAss = listLen(assigns);
+    let card2H = 98.0 + intToFloat(maxInt(1, nAss)) * 30.0;
+    let (c2, cy2) = addSectionCard(bag, doc, "应用归属工作区", "打开指定应用时自动归位到对应虚拟工作区", 18.0, cellGet(y), contentW, card2H, dark);
+    let pickAssTgt = makeActionTarget((_) -> match pickAppBundleId() {
+        Some(bid) -> {
+            let filtered = listFilter(cellGet(vm.appWorkspaces), (p) -> { let (k, _) = p; k != bid });
+            cellSet(vm.appWorkspaces, listAppend(filtered, [(bid, WsIndex(2))]));
+            vmNotifyChanged(vm, true);
+            rebuild()
+        },
+        None -> (),
+    });
+    let _ = idPtrKept(bag, pickAssTgt);
+    nsViewAddSubview(c2, idPtrKept(bag, makePushButton("+ 添加归属…", cgRect(contentW - 118.0, 12.0, 104.0, 24.0), pickAssTgt)));
+
+    if (nAss == 0) {
+        nsViewAddSubview(c2, idPtrKept(bag, makeLabel("暂无应用归属规则", cgRect(14.0, cy2 + 4.0, 240.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorSecondaryLabel())))
+    } else {
+        let wsLabels = cellGet(vm.spaceLabels);
+        let wsCount = cellGet(vm.workspaceCount);
+        let ri = cellNew(0);
+        let cur = cellNew(assigns);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((bid, target), rest) -> {
+                    let rowY = cy2 + intToFloat(cellGet(ri)) * 30.0;
+                    let wsText = match target {
+                        WsIndex(n) -> "工作区 " + intToStr(n),
+                        WsLabel(l) -> "工作区 · " + l,
+                    };
+                    let _ = resolveWorkspaceTarget(target, wsCount, wsLabels);
+                    nsViewAddSubview(c2, idPtrKept(bag, makeLabel(bid, cgRect(14.0, rowY + 4.0, contentW - 210.0, 18.0), nsFontMonospaced(12.0, kFontWeightRegular()), nsColorLabel())));
+                    nsViewAddSubview(c2, idPtrKept(bag, makeLabel(wsText, cgRect(contentW - 186.0, rowY + 4.0, 104.0, 18.0), nsFontSystem(12.0, kFontWeightMedium()), nsColorControlAccent())));
+                    let delBid = bid;
+                    let delTgt = makeActionTarget((_) -> {
+                        cellSet(vm.appWorkspaces, listFilter(cellGet(vm.appWorkspaces), (p) -> { let (k, _) = p; k != delBid }));
+                        vmNotifyChanged(vm, true);
+                        rebuild()
+                    });
+                    let _ = idPtrKept(bag, delTgt);
+                    nsViewAddSubview(c2, idPtrKept(bag, makePushButton("移除", cgRect(contentW - 76.0, rowY, 62.0, 24.0), delTgt)));
+                    cellSet(ri, cellGet(ri) + 1);
+                    cellSet(cur, rest)
+                },
+                Nil -> (),
+            }
+        }
+    };
+    cellSet(y, cellGet(y) + card2H + 14.0);
+
+    // Card 3: 按标题自动浮动规则 (float_windows)
+    let rules = cellGet(vm.floatWindows);
+    let nRules = listLen(rules);
+    let card3H = 98.0 + intToFloat(maxInt(1, nRules)) * 30.0;
+    let (c3, cy3) = addSectionCard(bag, doc, "按窗口标题自动浮动（[[rules.float_windows]]）", "匹配 Bundle ID 与标题通配符的弹窗/画中画窗口自动保持浮动", 18.0, cellGet(y), contentW, card3H, dark);
+    if (nRules == 0) {
+        nsViewAddSubview(c3, idPtrKept(bag, makeLabel("暂无标题浮动规则（可在 config.toml 中配置 [[rules.float_windows]]）", cgRect(14.0, cy3 + 4.0, contentW - 28.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorSecondaryLabel())))
+    } else {
+        let ri = cellNew(0);
+        let cur = cellNew(rules);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(rule, rest) -> {
+                    let rowY = cy3 + intToFloat(cellGet(ri)) * 30.0;
+                    let idxDel = cellGet(ri);
+                    let appStr = rule.app;
+                    let titleStr = match rule.titles {
+                        Some(ts) -> "titles=[" + strJoin(ts, ", ") + "]",
+                        None -> match rule.exceptTitles {
+                            Some(ets) -> "except=[" + strJoin(ets, ", ") + "]",
+                            None -> "*",
+                        },
+                    };
+                    nsViewAddSubview(c3, idPtrKept(bag, makeLabel(appStr + "  ·  " + titleStr, cgRect(14.0, rowY + 4.0, contentW - 104.0, 18.0), nsFontMonospaced(11.5, kFontWeightRegular()), nsColorLabel())));
+                    let delTgt = makeActionTarget((_) -> {
+                        cellSet(vm.floatWindows, listRemoveAt(cellGet(vm.floatWindows), idxDel));
+                        vmNotifyChanged(vm, true);
+                        rebuild()
+                    });
+                    let _ = idPtrKept(bag, delTgt);
+                    nsViewAddSubview(c3, idPtrKept(bag, makePushButton("移除", cgRect(contentW - 76.0, rowY, 62.0, 24.0), delTgt)));
+                    cellSet(ri, idxDel + 1);
+                    cellSet(cur, rest)
+                },
+                Nil -> (),
+            }
+        }
+    };
+
+    cellSet(y, cellGet(y) + card3H + 18.0);
+    msgSendVoid1Rect(doc, objcSel("setFrame:"), cgRect(0.0, 0.0, width, maxFloat(460.0, cellGet(y))));
+    docId
+}
+
+def addMenuBarPreviewRow(bag: UIRetainBag, parent: Ptr, label: String, darkPill: Bool, img: Id NSObject, x: Float, y: Float, w: Float): Void = {
+    nsViewAddSubview(parent, idPtrKept(bag, makeLabel(label, cgRect(x, y + 6.0, 38.0, 18.0), nsFontSystem(11.5, kFontWeightMedium()), nsColorSecondaryLabel())));
+    let pillId = makeFlippedView(cgRect(x + 44.0, y, w - 44.0, 30.0));
+    let pill = idPtrKept(bag, pillId);
+    let bg = if (darkPill) nsColorSRGB(0.13, 0.14, 0.17, 1.0) else nsColorSRGB(0.92, 0.93, 0.95, 1.0);
+    let border = if (darkPill) nsColorSRGB(1.0, 1.0, 1.0, 0.14) else nsColorSRGB(0.0, 0.0, 0.0, 0.12);
+    nsViewSetLayerStyle(pill, Some(bg), Some(border), 1.0, 12.0);
+    nsViewAddSubview(parent, pill);
+    let iv = idPtrKept(bag, makeImageView(cgRect(12.0, 6.0, w - 68.0, 18.0), Some(img)));
+    msgSendVoid1I64(iv, objcSel("setImageAlignment:"), intToI64(4)); // NSImageAlignLeft
+    nsViewAddSubview(pill, iv)
+}
+
+def buildStatusTab(ctrl: SettingsWindowController, bag: UIRetainBag, width: Float, dark: Bool, rebuild: () -> Void): Id NSObject = {
+    let vm = ctrl.viewModel;
+    let contentW = width - 36.0;
+    let docId = makeFlippedView(cgRect(0.0, 0.0, width, 760.0));
+    let doc = idPtrKept(bag, docId);
+    let y = cellNew(14.0);
+
+    // Card 1: 菜单栏实时预览（深色 + 浅色双栏）
+    let card1H = 154.0;
+    let (c1, cy1) = addSectionCard(bag, doc, "菜单栏实时预览", "所见即所得：深色与浅色外观下的矢量渲染效果", 18.0, cellGet(y), contentW, card1H, dark);
+    let darkImg = vmPreviewImage(vm, true);
+    let lightImg = vmPreviewImage(vm, false);
+    addMenuBarPreviewRow(bag, c1, "深色", true, darkImg, 14.0, cy1, contentW - 28.0);
+    addMenuBarPreviewRow(bag, c1, "浅色", false, lightImg, 14.0, cy1 + 38.0, contentW - 28.0);
+
+    let iconTgt = makeActionTarget((sender) -> {
+        cellSet(vm.statusShowIcon, controlStateOn(sender));
+        vmNotifyChanged(vm, true);
+        rebuild()
+    });
+    let _ = idPtrKept(bag, iconTgt);
+    nsViewAddSubview(c1, idPtrKept(bag, makeCheckbox("在状态栏左侧显示 Talus 图标", cellGet(vm.statusShowIcon), cgRect(14.0, cy1 + 76.0, 260.0, 20.0), iconTgt)));
+    cellSet(y, cellGet(y) + card1H + 14.0);
+
+    // Card 2: 显示模式与预设
+    let mode = cellGet(vm.statusMode);
+    let card2H = match mode {
+        ModeSimple -> 108.0,
+        ModeTemplate -> 276.0,
+        ModeScript -> 252.0,
+    };
+    let (c2, cy2) = addSectionCard(bag, doc, "状态栏样式与模板", "在简洁默认、富文本模板或外部脚本接管之间切换", 18.0, cellGet(y), contentW, card2H, dark);
+    let modeTgt = makeActionTarget((sender) -> {
+        let seg = i64ToInt(msgSendI64_0(sender, objcSel("selectedSegment")));
+        cellSet(vm.statusMode, statusModeFromIndex(seg));
+        vmNotifyChanged(vm, true);
+        rebuild()
+    });
+    let _ = idPtrKept(bag, modeTgt);
+    nsViewAddSubview(c2, idPtrKept(bag, makeSegmentedControl(["简洁默认", "自定义模板", "脚本完全接管"], statusModeIndex(mode), cgRect(14.0, cy2, 340.0, 26.0), modeTgt)));
+
+    match mode {
+        ModeSimple -> (),
+        ModeTemplate -> {
+            // Preset buttons row
+            let py = cy2 + 38.0;
+            let presets = [("图标", "icons"), ("紧凑", "compact"), ("下划线", "underline"), ("胶囊", "pills"), ("Powerline", "powerline"), ("时钟", "clock")];
+            let px = cellNew(14.0);
+            let cp = cellNew(presets);
+            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                match cellGet(cp) {
+                    Cons((lbl, key), rp) -> {
+                        let pKey = key;
+                        let pt = makeActionTarget((_) -> { vmApplyTemplatePreset(vm, pKey); rebuild() });
+                        let _ = idPtrKept(bag, pt);
+                        let bw = if (key == "powerline") 82.0 else 64.0;
+                        nsViewAddSubview(c2, idPtrKept(bag, makePushButton(lbl, cgRect(cellGet(px), py, bw, 24.0), pt)));
+                        cellSet(px, cellGet(px) + bw + 6.0);
+                        cellSet(cp, rp)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            let fy1 = py + 34.0;
+            nsViewAddSubview(c2, idPtrKept(bag, makeLabel("模板", cgRect(14.0, fy1 + 3.0, 88.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorLabel())));
+            let tfTmpl = idPtrKept(bag, makeTextField(cellGet(vm.customTemplate), "%spaces%  %layout%", cgRect(104.0, fy1, contentW - 118.0, 24.0), nsFontMonospaced(11.5, kFontWeightRegular())));
+            let dTmpl = makeTextChangeDelegate((tf) -> { cellSet(vm.customTemplate, textFieldStringValue(tf)); vmNotifyChanged(vm, false) });
+            msgSendVoid1Ptr(tfTmpl, objcSel("setDelegate:"), idPtrKept(bag, dTmpl));
+            nsViewAddSubview(c2, tfTmpl);
+
+            let fy2 = fy1 + 32.0;
+            nsViewAddSubview(c2, idPtrKept(bag, makeLabel("当前工作区", cgRect(14.0, fy2 + 3.0, 88.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorLabel())));
+            let tfCur = idPtrKept(bag, makeTextField(cellGet(vm.workspaceCurrent), "<fc=#FFFFFF,#0F766E> %index%:%label% </fc>", cgRect(104.0, fy2, contentW - 118.0, 24.0), nsFontMonospaced(11.5, kFontWeightRegular())));
+            let dCur = makeTextChangeDelegate((tf) -> { cellSet(vm.workspaceCurrent, textFieldStringValue(tf)); vmNotifyChanged(vm, false) });
+            msgSendVoid1Ptr(tfCur, objcSel("setDelegate:"), idPtrKept(bag, dCur));
+            nsViewAddSubview(c2, tfCur);
+
+            let fy3 = fy2 + 32.0;
+            nsViewAddSubview(c2, idPtrKept(bag, makeLabel("其他工作区", cgRect(14.0, fy3 + 3.0, 88.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorLabel())));
+            let tfOth = idPtrKept(bag, makeTextField(cellGet(vm.workspaceOther), " %index%:%label%%occupied% ", cgRect(104.0, fy3, contentW - 118.0, 24.0), nsFontMonospaced(11.5, kFontWeightRegular())));
+            let dOth = makeTextChangeDelegate((tf) -> { cellSet(vm.workspaceOther, textFieldStringValue(tf)); vmNotifyChanged(vm, false) });
+            msgSendVoid1Ptr(tfOth, objcSel("setDelegate:"), idPtrKept(bag, dOth));
+            nsViewAddSubview(c2, tfOth);
+
+            let fy4 = fy3 + 34.0;
+            nsViewAddSubview(c2, idPtrKept(bag, makeLabel("字体 / 字号", cgRect(14.0, fy4 + 3.0, 88.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorLabel())));
+            let tfFont = idPtrKept(bag, makeTextField(cellGet(vm.primaryFont), "默认系统等宽数字字体", cgRect(104.0, fy4, 240.0, 24.0), nsFontMonospaced(11.5, kFontWeightRegular())));
+            let dFont = makeTextChangeDelegate((tf) -> { cellSet(vm.primaryFont, textFieldStringValue(tf)); vmNotifyChanged(vm, false) });
+            msgSendVoid1Ptr(tfFont, objcSel("setDelegate:"), idPtrKept(bag, dFont));
+            nsViewAddSubview(c2, tfFont);
+
+            nsViewAddSubview(c2, idPtrKept(bag, makeLabel(intToStr(roundToInt(cellGet(vm.statusFontSize))) + " pt", cgRect(356.0, fy4 + 3.0, 46.0, 18.0), nsFontMonospacedDigit(12.0, kFontWeightMedium()), nsColorSecondaryLabel())));
+            let fsTgt = makeActionTarget((sender) -> {
+                cellSet(vm.statusFontSize, roundFloat(msgSendFloat0(sender, objcSel("doubleValue"))));
+                vmNotifyChanged(vm, false);
+                rebuild()
+            });
+            let _ = idPtrKept(bag, fsTgt);
+            nsViewAddSubview(c2, idPtrKept(bag, makeSlider(9.0, 16.0, cellGet(vm.statusFontSize), cgRect(404.0, fy4 + 1.0, contentW - 418.0, 22.0), fsTgt)))
+        },
+        ModeScript -> {
+            let fy1 = cy2 + 38.0;
+            nsViewAddSubview(c2, idPtrKept(bag, makeLabel("脚本路径", cgRect(14.0, fy1 + 3.0, 80.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorLabel())));
+            let tfExec = idPtrKept(bag, makeTextField(cellGet(vm.scriptExecutable), "/usr/bin/python3", cgRect(96.0, fy1, contentW - 188.0, 24.0), nsFontMonospaced(11.5, kFontWeightRegular())));
+            let dExec = makeTextChangeDelegate((tf) -> { cellSet(vm.scriptExecutable, textFieldStringValue(tf)); vmNotifyChanged(vm, false) });
+            msgSendVoid1Ptr(tfExec, objcSel("setDelegate:"), idPtrKept(bag, dExec));
+            nsViewAddSubview(c2, tfExec);
+            let brTgt = makeActionTarget((_) -> match pickExecutableFile() {
+                Some(p) -> { cellSet(vm.scriptExecutable, p); vmNotifyChanged(vm, true); rebuild() },
+                None -> (),
+            });
+            let _ = idPtrKept(bag, brTgt);
+            nsViewAddSubview(c2, idPtrKept(bag, makePushButton("浏览…", cgRect(contentW - 84.0, fy1, 70.0, 24.0), brTgt)));
+
+            let fy2 = fy1 + 34.0;
+            nsViewAddSubview(c2, idPtrKept(bag, makeLabel("参数", cgRect(14.0, fy2 + 3.0, 80.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorLabel())));
+            let tfArgs = idPtrKept(bag, makeTextField(cellGet(vm.scriptArgumentsText), "以空格分隔，支持引号", cgRect(96.0, fy2, contentW - 110.0, 24.0), nsFontMonospaced(11.5, kFontWeightRegular())));
+            let dArgs = makeTextChangeDelegate((tf) -> { cellSet(vm.scriptArgumentsText, textFieldStringValue(tf)); vmNotifyChanged(vm, false) });
+            msgSendVoid1Ptr(tfArgs, objcSel("setDelegate:"), idPtrKept(bag, dArgs));
+            nsViewAddSubview(c2, tfArgs);
+
+            let fy3 = fy2 + 36.0;
+            let mkTgt = makeActionTarget((sender) -> { cellSet(vm.scriptMarkup, controlStateOn(sender)); vmNotifyChanged(vm, true) });
+            let ocTgt = makeActionTarget((sender) -> { cellSet(vm.scriptOnChange, controlStateOn(sender)); vmNotifyChanged(vm, true) });
+            let _ = idPtrKept(bag, mkTgt);
+            let _ = idPtrKept(bag, ocTgt);
+            nsViewAddSubview(c2, idPtrKept(bag, makeCheckbox("解析颜色标记 (<fc>/<bg>/<box>)", cellGet(vm.scriptMarkup), cgRect(14.0, fy3, 240.0, 20.0), mkTgt)));
+            nsViewAddSubview(c2, idPtrKept(bag, makeCheckbox("状态变化时立即重新执行", cellGet(vm.scriptOnChange), cgRect(270.0, fy3, 220.0, 20.0), ocTgt)))
+        },
+    };
+    cellSet(y, cellGet(y) + card2H + 14.0);
+
+    // Card 3: 工作区标签、图标与状态导出文件
+    let card3H = 196.0;
+    let (c3, cy3) = addSectionCard(bag, doc, "工作区标签与状态文件 I/O", "以逗号分隔填写工作区名称或 SF Symbol 图标名（如 terminal, globe）", 18.0, cellGet(y), contentW, card3H, dark);
+
+    nsViewAddSubview(c3, idPtrKept(bag, makeLabel("工作区名称", cgRect(14.0, cy3 + 3.0, 92.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorLabel())));
+    let tfLbls = idPtrKept(bag, makeTextField(strJoin(cellGet(vm.spaceLabels), ", "), "Code, Web, Chat", cgRect(108.0, cy3, contentW - 122.0, 24.0), nsFontMonospaced(11.5, kFontWeightRegular())));
+    let dLbls = makeTextChangeDelegate((tf) -> {
+        let raw = textFieldStringValue(tf);
+        let parts = std.str.strSplitChar(raw, ',');
+        let cleaned = listFilter(listMap(parts, (s) -> strTrim(s)), (s) -> strLen(s) > 0);
+        cellSet(vm.spaceLabels, cleaned);
+        vmNotifyChanged(vm, false)
+    });
+    msgSendVoid1Ptr(tfLbls, objcSel("setDelegate:"), idPtrKept(bag, dLbls));
+    nsViewAddSubview(c3, tfLbls);
+
+    let fy2 = cy3 + 32.0;
+    nsViewAddSubview(c3, idPtrKept(bag, makeLabel("SF Symbol 图标", cgRect(14.0, fy2 + 3.0, 92.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorLabel())));
+    let tfIcons = idPtrKept(bag, makeTextField(strJoin(cellGet(vm.workspaceIcons), ", "), "terminal, globe, bubble.left.and.bubble.right", cgRect(108.0, fy2, contentW - 122.0, 24.0), nsFontMonospaced(11.5, kFontWeightRegular())));
+    let dIcons = makeTextChangeDelegate((tf) -> {
+        let raw = textFieldStringValue(tf);
+        let parts = std.str.strSplitChar(raw, ',');
+        let cleaned = listFilter(listMap(parts, (s) -> strTrim(s)), (s) -> strLen(s) > 0);
+        cellSet(vm.workspaceIcons, cleaned);
+        vmNotifyChanged(vm, false)
+    });
+    msgSendVoid1Ptr(tfIcons, objcSel("setDelegate:"), idPtrKept(bag, dIcons));
+    nsViewAddSubview(c3, tfIcons);
+
+    let fy3 = fy2 + 32.0;
+    nsViewAddSubview(c3, idPtrKept(bag, makeLabel("自定义文本文件", cgRect(14.0, fy3 + 3.0, 92.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorLabel())));
+    let tfTxtF = idPtrKept(bag, makeTextField(cellGet(vm.statusTextFile), "可选，用于 %custom% 占位符", cgRect(108.0, fy3, contentW - 122.0, 24.0), nsFontMonospaced(11.5, kFontWeightRegular())));
+    let dTxtF = makeTextChangeDelegate((tf) -> { cellSet(vm.statusTextFile, textFieldStringValue(tf)); vmNotifyChanged(vm, false) });
+    msgSendVoid1Ptr(tfTxtF, objcSel("setDelegate:"), idPtrKept(bag, dTxtF));
+    nsViewAddSubview(c3, tfTxtF);
+
+    let fy4 = fy3 + 32.0;
+    nsViewAddSubview(c3, idPtrKept(bag, makeLabel("导出状态 JSON", cgRect(14.0, fy4 + 3.0, 92.0, 18.0), nsFontSystem(12.0, kFontWeightRegular()), nsColorLabel())));
+    let tfStF = idPtrKept(bag, makeTextField(cellGet(vm.statusStateFile), "可选，自动写入当前工作区与标题 JSON", cgRect(108.0, fy4, contentW - 122.0, 24.0), nsFontMonospaced(11.5, kFontWeightRegular())));
+    let dStF = makeTextChangeDelegate((tf) -> { cellSet(vm.statusStateFile, textFieldStringValue(tf)); vmNotifyChanged(vm, false) });
+    msgSendVoid1Ptr(tfStF, objcSel("setDelegate:"), idPtrKept(bag, dStF));
+    nsViewAddSubview(c3, tfStF);
+
+    cellSet(y, cellGet(y) + card3H + 18.0);
+    msgSendVoid1Rect(doc, objcSel("setFrame:"), cgRect(0.0, 0.0, width, maxFloat(540.0, cellGet(y))));
+    docId
+}
+
+pub def settingsRebuildActiveTab(ctrl: SettingsWindowController): Void = {
+    let sv = cellGet(ctrl.scrollView);
+    if (!ptrIsNull(sv)) {
+        cellSet(ctrl.bag.items, Nil);
+        let bounds = msgSendRect0(sv, objcSel("bounds"));
+        let w = maxFloat(600.0, bounds.size.w);
+        let dark = nsAppearanceIsDark(sv);
+        match cellGet(ctrl.window) {
+            Some(winId) -> {
+                let root = msgSend0(idPtrKept(ctrl.chromeBag, winId), objcSel("contentView"));
+                if (!ptrIsNull(root)) {
+                    let winBg = if (dark) nsColorSRGB(0.118, 0.118, 0.125, 1.0) else nsColorSRGB(0.955, 0.955, 0.962, 1.0);
+                    nsViewSetLayerStyle(root, Some(winBg), None, 0.0, 0.0)
+                } else ()
+            },
+            None -> (),
+        };
+        let rebuild = () -> settingsRebuildActiveTab(ctrl);
+        let docId = match cellGet(ctrl.viewModel.selectedTab) {
+            TabGeneral -> buildGeneralTab(ctrl, ctrl.bag, w, dark, rebuild),
+            TabLayout -> buildLayoutTab(ctrl, ctrl.bag, w, dark, rebuild),
+            TabRules -> buildRulesTab(ctrl, ctrl.bag, w, dark, rebuild),
+            TabStatus -> buildStatusTab(ctrl, ctrl.bag, w, dark, rebuild),
+        };
+        let docPtr = idPtrKept(ctrl.bag, docId);
+        msgSendVoid1Ptr(sv, objcSel("setDocumentView:"), docPtr);
+        let segPtr = cellGet(ctrl.tabSegment);
+        if (!ptrIsNull(segPtr)) {
+            msgSendVoid1I64(segPtr, objcSel("setSelectedSegment:"), intToI64(settingsTabIndex(cellGet(ctrl.viewModel.selectedTab))))
+        } else ();
+        updateBannerLabels(ctrl)
+    } else ()
+}
+
+pub def settingsControllerNew(
+    cfg: Configuration,
+    res: ConfigResolution,
+    onApply: (Configuration, String) -> Void
+): SettingsWindowController = {
+    let login = launchAtLoginNew(systemLaunchAtLoginService());
+    let vm = settingsViewModelNew(cfg, res, login);
+    cellSet(vm.onConfigurationApplied, Some(onApply));
+    let ctrl = SettingsWindowController {
+        viewModel: vm,
+        window: cellNew(None),
+        tabSegment: cellNew(ptrNull()),
+        scrollView: cellNew(ptrNull()),
+        bannerLabel: cellNew(ptrNull()),
+        validationLabel: cellNew(ptrNull()),
+        bag: retainBagNew(),
+        chromeBag: retainBagNew(),
+        onClose: cellNew(None),
+        isPreviewMode: cellNew(false),
+    };
+    cellSet(vm.onUIStateChanged, Some(() -> updateBannerLabels(ctrl)));
+    ctrl
+}
+
+def ensureWindowCreated(ctrl: SettingsWindowController): Ptr = {
+    match cellGet(ctrl.window) {
+        Some(winId) -> idPtrKept(ctrl.chromeBag, winId),
+        None -> {
+            // styleMask = titled(1) | closable(2) | miniaturizable(4) | resizable(8) = 15
+            let alloc = msgSend0(objcClass("NSWindow"), objcSel("alloc"));
+            let rawWin = msgSend1Rect1I641I641Bool(
+                alloc,
+                objcSel("initWithContentRect:styleMask:backing:defer:"),
+                cgRect(0.0, 0.0, 640.0, 680.0),
+                intToI64(15),
+                intToI64(2), // NSBackingStoreBuffered
+                false
+            );
+            let winId = idAdopt(rawWin);
+            cellSet(ctrl.window, Some(winId));
+            let titleNs = nsString("Talus 设置");
+            withId(titleNs, (tp) -> {
+                c_winTitle(rawWin, objcSel("setTitle:"), tp)
+            });
+            msgSendVoid1I64(rawWin, objcSel("setCollectionBehavior:"), intToI64(2)); // moveToActiveSpace
+            msgSendVoid1Size(rawWin, objcSel("setMinSize:"), cgSize(600.0, 560.0));
+            msgSendVoid1Bool(rawWin, objcSel("setReleasedWhenClosed:"), false);
+            msgSendVoid0(rawWin, objcSel("center"));
+
+            let winDel = makeWindowCloseDelegate(() -> {
+                vmFlushPendingSave(ctrl.viewModel);
+                match cellGet(ctrl.onClose) { Some(cb) -> cb(), None -> () }
+            });
+            msgSendVoid1Ptr(rawWin, objcSel("setDelegate:"), idPtrKept(ctrl.chromeBag, winDel));
+
+            // Root flipped view (640x680)
+            let rootId = makeFlippedView(cgRect(0.0, 0.0, 640.0, 680.0));
+            let root = idPtrKept(ctrl.chromeBag, rootId);
+            msgSendVoid1Ptr(rawWin, objcSel("setContentView:"), root);
+
+            // Top tab header bar (height 52)
+            let tabTgt = makeActionTarget((sender) -> {
+                let idx = i64ToInt(msgSendI64_0(sender, objcSel("selectedSegment")));
+                cellSet(ctrl.viewModel.selectedTab, settingsTabFromIndex(idx));
+                settingsRebuildActiveTab(ctrl)
+            });
+            let _ = idPtrKept(ctrl.chromeBag, tabTgt);
+            let seg = idPtrKept(ctrl.chromeBag, makeSegmentedControl(
+                ["通用", "快捷键与布局", "应用规则", "菜单栏"],
+                settingsTabIndex(cellGet(ctrl.viewModel.selectedTab)),
+                cgRect(120.0, 12.0, 400.0, 28.0),
+                tabTgt
+            ));
+            msgSendVoid1I64(seg, objcSel("setAutoresizingMask:"), intToI64(5)); // flex left+right
+            nsViewAddSubview(root, seg);
+            cellSet(ctrl.tabSegment, seg);
+
+            // Hairline separator below header
+            let sepTop = idPtrKept(ctrl.chromeBag, makeFlippedView(cgRect(0.0, 52.0, 640.0, 1.0)));
+            nsViewSetLayerStyle(sepTop, Some(nsColorSeparator()), None, 0.0, 0.0);
+            msgSendVoid1I64(sepTop, objcSel("setAutoresizingMask:"), intToI64(2)); // width sizable
+            nsViewAddSubview(root, sepTop);
+
+            // ScrollView (middle content area: y=53..636)
+            let svRaw = msgSend1Rect(msgSend0(objcClass("NSScrollView"), objcSel("alloc")), objcSel("initWithFrame:"), cgRect(0.0, 53.0, 640.0, 583.0));
+            let svId = idAdopt(svRaw);
+            let sv = idPtrKept(ctrl.chromeBag, svId);
+            msgSendVoid1Bool(sv, objcSel("setHasVerticalScroller:"), true);
+            msgSendVoid1Bool(sv, objcSel("setDrawsBackground:"), false);
+            msgSendVoid1I64(sv, objcSel("setAutoresizingMask:"), intToI64(18)); // width + height sizable
+            nsViewAddSubview(root, sv);
+            cellSet(ctrl.scrollView, sv);
+
+            // Hairline separator above footer
+            let sepBot = idPtrKept(ctrl.chromeBag, makeFlippedView(cgRect(0.0, 636.0, 640.0, 1.0)));
+            nsViewSetLayerStyle(sepBot, Some(nsColorSeparator()), None, 0.0, 0.0);
+            msgSendVoid1I64(sepBot, objcSel("setAutoresizingMask:"), intToI64(10)); // width + minY margin
+            nsViewAddSubview(root, sepBot);
+
+            // Footer bar (y=637..680)
+            let banner = idPtrKept(ctrl.chromeBag, makeLabel(cellGet(ctrl.viewModel.statusBanner), cgRect(18.0, 650.0, 380.0, 18.0), nsFontSystem(11.5, kFontWeightRegular()), nsColorSecondaryLabel()));
+            msgSendVoid1I64(banner, objcSel("setAutoresizingMask:"), intToI64(10));
+            nsViewAddSubview(root, banner);
+            cellSet(ctrl.bannerLabel, banner);
+
+            let valLbl = idPtrKept(ctrl.chromeBag, makeLabel("", cgRect(404.0, 650.0, 218.0, 18.0), nsFontSystem(11.5, kFontWeightMedium()), nsColorSystemRed()));
+            msgSendVoid1Bool(valLbl, objcSel("setHidden:"), true);
+            msgSendVoid1I64(valLbl, objcSel("setAutoresizingMask:"), intToI64(9));
+            nsViewAddSubview(root, valLbl);
+            cellSet(ctrl.validationLabel, valLbl);
+
+            settingsRebuildActiveTab(ctrl);
+            rawWin
+        },
+    }
+}
+
+pub def settingsControllerShow(ctrl: SettingsWindowController): Void = {
+    launchAtLoginRefresh(ctrl.viewModel.launchAtLogin);
+    installEditMenuIfNeeded();
+    let win = ensureWindowCreated(ctrl);
+    settingsRebuildActiveTab(ctrl);
+    let app = nsAppShared();
+    msgSendVoid1Bool(app, objcSel("activateIgnoringOtherApps:"), true);
+    msgSendVoid1Ptr(win, objcSel("makeKeyAndOrderFront:"), ptrNull())
+}
+
+/// Offline high-DPI preview renderer for all 4 Settings tabs (light & dark), invoked by `--render-previews <dir>`.
+pub def renderSettingsPreviews(cfg: Configuration, res: ConfigResolution, outDir: String): Bool = withAutoreleasePool(() -> {
+    let _ = mkdirAll(outDir);
+    let app = nsAppShared();
+    msgSendVoid1I64(app, objcSel("setActivationPolicy:"), intToI64(2)); // prohibited (headless)
+    let ctrl = settingsControllerNew(cfg, res, (_, _) -> ());
+    cellSet(ctrl.isPreviewMode, true);
+    let win = ensureWindowCreated(ctrl);
+    let contentView = msgSend0(win, objcSel("contentView"));
+    let tabs = [
+        ("general", TabGeneral),
+        ("layout", TabLayout),
+        ("rules", TabRules),
+        ("status", TabStatus),
+    ];
+    let ok = cellNew(true);
+    let ct = cellNew(tabs);
+    while (match cellGet(ct) { Nil -> false, _ -> true }) {
+        match cellGet(ct) {
+            Cons((name, tab), rest) -> {
+                cellSet(ctrl.viewModel.selectedTab, tab);
+                // Render Light mode
+                let lightName = nsString("NSAppearanceNameAqua");
+                let lightApp = withId(lightName, (np) -> {
+                    c_appNamed(objcClass("NSAppearance"), objcSel("appearanceNamed:"), np)
+                });
+                msgSendVoid1Ptr(app, objcSel("setAppearance:"), lightApp);
+                msgSendVoid1Ptr(win, objcSel("setAppearance:"), lightApp);
+                msgSendVoid1Ptr(contentView, objcSel("setAppearance:"), lightApp);
+                msgSendVoid1Ptr(objcClass("NSAppearance"), objcSel("setCurrentAppearance:"), lightApp);
+                settingsRebuildActiveTab(ctrl);
+                msgSendVoid0(contentView, objcSel("layoutSubtreeIfNeeded"));
+                if (!nsViewWritePng(contentView, outDir + "/settings-" + name + "-light.png", 2.0)) cellSet(ok, false) else ();
+
+                // Render Dark mode
+                let darkName = nsString("NSAppearanceNameDarkAqua");
+                let darkApp = withId(darkName, (np) -> {
+                    c_appNamed2(objcClass("NSAppearance"), objcSel("appearanceNamed:"), np)
+                });
+                msgSendVoid1Ptr(app, objcSel("setAppearance:"), darkApp);
+                msgSendVoid1Ptr(win, objcSel("setAppearance:"), darkApp);
+                msgSendVoid1Ptr(contentView, objcSel("setAppearance:"), darkApp);
+                msgSendVoid1Ptr(objcClass("NSAppearance"), objcSel("setCurrentAppearance:"), darkApp);
+                settingsRebuildActiveTab(ctrl);
+                msgSendVoid0(contentView, objcSel("layoutSubtreeIfNeeded"));
+                if (!nsViewWritePng(contentView, outDir + "/settings-" + name + "-dark.png", 2.0)) cellSet(ok, false) else ();
+
+                cellSet(ct, rest)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(ok)
+})
