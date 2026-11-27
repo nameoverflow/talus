@@ -1,0 +1,113 @@
+/// XMonad-style focused zipper (`WindowStack`). The first item is the master window.
+
+use std.option.{Option, Some, None}
+use std.list.{listLen, listAppend}
+use util.{listContainsBy, listIndexOfBy, listInsertAt, listRemoveAt, listSwapIndices, listNthOpt}
+
+pub data WindowStack a {
+    items: List a,
+    focused: Option a,
+}
+
+pub def stackNew(): WindowStack a = WindowStack { items: Nil, focused: None }
+
+pub def stackInsert(s: WindowStack a, id: a, eqFn: (a, a) -> Bool): WindowStack a =
+    if (listContainsBy(s.items, id, eqFn)) s
+    else {
+        let insertIdx = match s.focused {
+            Some(f) -> match listIndexOfBy(s.items, (x) -> eqFn(x, f)) {
+                Some(idx) -> idx,
+                None -> 0,
+            },
+            None -> 0,
+        };
+        WindowStack {
+            items: listInsertAt(s.items, insertIdx, id),
+            focused: Some(id),
+        }
+    }
+
+pub def stackRemove(s: WindowStack a, id: a, eqFn: (a, a) -> Bool): WindowStack a =
+    match listIndexOfBy(s.items, (x) -> eqFn(x, id)) {
+        None -> s,
+        Some(index) -> {
+            let wasFocused = match s.focused {
+                Some(f) -> eqFn(f, id),
+                None -> false,
+            };
+            let nextItems = listRemoveAt(s.items, index);
+            let nextFocus = if (!wasFocused) s.focused
+                else {
+                    let n = listLen(nextItems);
+                    if (n == 0) None
+                    else listNthOpt(nextItems, index % n)
+                };
+            WindowStack { items: nextItems, focused: nextFocus }
+        },
+    }
+
+pub def stackFocus(s: WindowStack a, id: a, eqFn: (a, a) -> Bool): WindowStack a =
+    if (listContainsBy(s.items, id, eqFn)) WindowStack { items: s.items, focused: Some(id) }
+    else s
+
+pub def stackFocusNext(s: WindowStack a, direction: Int, eqFn: (a, a) -> Bool): WindowStack a =
+    match s.focused {
+        None -> s,
+        Some(f) -> match listIndexOfBy(s.items, (x) -> eqFn(x, f)) {
+            None -> s,
+            Some(i) -> {
+                let n = listLen(s.items);
+                if (n == 0) s
+                else {
+                    let step = if (direction >= 0) 1 else n - 1;
+                    let target = (i + step) % n;
+                    WindowStack { items: s.items, focused: listNthOpt(s.items, target) }
+                }
+            },
+        },
+    }
+
+pub def stackSwapNext(s: WindowStack a, direction: Int, eqFn: (a, a) -> Bool): WindowStack a =
+    match s.focused {
+        None -> s,
+        Some(f) -> match listIndexOfBy(s.items, (x) -> eqFn(x, f)) {
+            None -> s,
+            Some(i) -> {
+                let n = listLen(s.items);
+                if (n <= 1) s
+                else if (direction >= 0 && i == n - 1) {
+                    match listNthOpt(s.items, n - 1) {
+                        Some(last) -> WindowStack {
+                            items: Cons(last, listRemoveAt(s.items, n - 1)),
+                            focused: s.focused,
+                        },
+                        None -> s,
+                    }
+                } else if (direction < 0 && i == 0) {
+                    match s.items {
+                        Cons(first, rest) -> WindowStack {
+                            items: listAppend(rest, [first]),
+                            focused: s.focused,
+                        },
+                        Nil -> s,
+                    }
+                } else if (direction >= 0) {
+                    WindowStack { items: listSwapIndices(s.items, i, i + 1), focused: s.focused }
+                } else {
+                    WindowStack { items: listSwapIndices(s.items, i, i - 1), focused: s.focused }
+                }
+            },
+        },
+    }
+
+pub def stackSwapMaster(s: WindowStack a, eqFn: (a, a) -> Bool): WindowStack a =
+    match s.focused {
+        None -> s,
+        Some(f) -> match listIndexOfBy(s.items, (x) -> eqFn(x, f)) {
+            None -> s,
+            Some(i) -> WindowStack {
+                items: listSwapIndices(s.items, 0, i),
+                focused: s.focused,
+            },
+        },
+    }

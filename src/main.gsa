@@ -1,0 +1,2242 @@
+/// Talus — macOS Tiling Window Manager (100% pure Geisha + AppKit + per-PID Actors).
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listLen, listRev, listFilter, listMap, listAny, listAppend}
+use std.str.{intToStr, parseInt, strStartsWith, strEndsWith, strSplitChar, strJoin, strTrim}
+use std.sync.{Chan, chanUnbounded, chanSend, chanRecv, chanTryRecv}
+use std.task.{Task, spawn, await}
+use std.actor.{Actor, actorCall}
+use sys.env.{args, getEnv}
+use sys.fs.{fileExists, mkdirAll, writeFileAtomic, fileMtimeMs}
+use sys.io.{eprintLn}
+use sys.proc.{exit, command, cmdEnv, cmdEnvMode, OverrideEnv, spawn as procSpawn}
+use sys.time.{nowMs}
+use objc.{
+    Id, NSObject,
+    objcClass, objcSel, idAdopt, idRetain, withId, withAutoreleasePool,
+    nsString, fromNSStringPtr, objcBlock1Ptr, objcBlockCustom, objcBlockHandle,
+    msgSend0, msgSend1Ptr, msgSend2Ptr, msgSend1Int, msgSend1I64, msgSend1Float, msgSend1Bool,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Int, msgSendVoid1I64, msgSendVoid1Bool,
+    msgSendInt0, msgSendI64_0, msgSendBool0
+}
+use util.{
+    minInt, maxInt, eqInt, eqI64, eqStr, listContainsBy, listFindBy, listNthOpt,
+    optEqBy, listEqualsBy, utf8TakeChars, strContains
+}
+use layout.{Rect, rectNew}
+use screen_geometry.{isParkedWindowFrame}
+use config.{
+    Configuration, ConfigResolution, StatusCommand,
+    resolvePaths, loadConfigFromPath, saveConfigToPath, defaultConfig,
+    abbreviatedPath, expandTilde
+}
+use virtual_workspaces.{defaultSessionFilePath}
+use status_markup.{
+    SpaceEntry, StatusValues, StatusPart, StatusExport, StatusWorkspaceHitRegion,
+    templateStatusParts, statusExportToJson, writeStatusAtomic0600, readCustomStatus
+}
+use status_commands.{
+    StatusCommandsEngine, statusCommandsNew, statusCommandsSetStateJson,
+    statusCommandsStateChanged, statusCommandsValue, statusCommandsStopAll
+}
+use manager.{
+    ManagerCore, ScreenSpec, CandidateWindow, WindowEffect,
+    EffSetFrame, EffSetPosition, EffFocus, EffRelinquishFocus,
+    ManagerActionOutput, ManagerStatusSnapshot,
+    managerCoreNew, managerCoreClose, managerCoreRefresh, managerCoreHandleKey,
+    managerCoreSwitchWorkspace, managerCoreMoveWindowToWorkspace,
+    managerCoreHandleAxFocus, managerCoreHandleAppActivated,
+    managerCoreRememberFocus, managerCoreBeginFocusDelivery,
+    managerCoreCancelFocusDelivery, managerCoreSetPaused,
+    managerCoreApplyConfig, managerCoreRecordSessionState,
+    managerCoreRestoreAllParked, managerCoreStatusSnapshot,
+    workspaceDigitKeyCodes,
+    kvkAnsiH, kvkAnsiL, kvkAnsiJ, kvkAnsiK, kvkAnsiComma, kvkAnsiPeriod,
+    kvkSpace, kvkReturn, kvkAnsiP, kvkAnsiT
+}
+use macos.ffi.{
+    CGPoint, CGRect, EventHotKeyID, EventTypeSpec, cgPoint, cgRect,
+    c_AXObserverCreate, c_AXObserverAddNotification, c_AXObserverGetRunLoopSource,
+    c_AXUIElementGetPidRaw, c_CFRunLoopGetMain, c_CFRunLoopAddSource, c_CFRunLoopRemoveSource,
+    c_GetApplicationEventTarget, c_InstallEventHandler, c_RegisterEventHotKey,
+    c_UnregisterEventHotKey, c_GetEventParameter,
+    c_dispatch_source_create, c_dispatch_source_set_event_handler_f, c_dispatch_resume,
+    c_posix_open, c_posix_flock, c_posix_close, c_posix_getpid, c_posix_signal,
+    kAXErrorSuccess, kAXErrorNotificationAlreadyRegistered,
+    kTalusHotkeySignature, kEventClassKeyboard, kEventHotKeyPressed,
+    kEventParamDirectObject, typeEventHotKeyID,
+    carbonCmdKey, carbonShiftKey, carbonOptionKey, carbonControlKey,
+    kOCreate, kORdWr, kLockEx, kLockNb, kSigInt, kSigTerm, sigIgnPtr,
+    axIsProcessTrusted, axIsProcessTrustedWithPrompt, axCreateApplication,
+    cfAdoptOpt, cfRunLoopCommonModes, dispatchMainQueue, dispatchSourceTypeSignal,
+    readPtrAt, resolveGlobalPtr,
+    msgSendRect0, msgSendVoid1Point, msgSend1Rect1I641Ptr1Ptr,
+    msgSend1Float1Ptr1Ptr1Ptr1Bool, msgSend1Ptr1Ptr1Ptr1Ptr,
+    nsDictGet
+}
+use macos.window_focus.{frontmostPid, isFrontmostPid}
+use macos.spaces.{windowServerFrame, nativeSpacesForScreen}
+use macos.executor.{
+    WindowExecutor, WindowGoal, ApplyRealAX, ExecEvent, ExecCustomSignal,
+    MainLoopUpdate, mainLoopUpdateNew, mainLoopUpdateRequest, mainLoopUpdateHandleSignal, mainLoopUpdateFlush,
+    setMainExecEventHandler, postMainExecEvent, scheduleDelayedSignal,
+    windowExecutorNew, executorSetOnResult, executorSetOnSettled,
+    executorHandleEvent, executorSubmit, executorObserve,
+    executorCancelFocus, executorCancelQueued, executorForget,
+    executorRetainApplications, executorFinishSynchronously,
+    executorHasPendingGeometry, executorHasPendingFocus, executorIsPending,
+    executorFocusKey, executorFocusPid, executorRequestFocus,
+    executorFocusedKeyForPid, executorLiveFrameForWindow,
+    executorSubmittedCount, executorAppliedCount
+}
+use macos.window_discovery.{
+    RunningAppInfo, WindowDiscoveryResult, collectRunningApps, discoverWindows
+}
+use macos.appkit.{
+    nsAppShared, nsAppearanceIsDark, collectScreenDescriptors, nsScreenForId,
+    makeActionTarget, actionTargetSel, makeHoverTracker, makeMenuWillOpenDelegate,
+    makeMenuItem, nsMenuAddItem, nsMenuAddSeparator
+}
+use status_render.{makeStatusIcon, renderConfiguredStatus, statusWorkspaceIndexUnderPointer}
+use settings_ui.{
+    SettingsTab, SettingsWindowController, settingsTabFromStr,
+    kSettingsDebounceSaveSignalTag,
+    settingsControllerNew, settingsControllerShow,
+    vmFlushPendingSave, vmReloadFromExternal, vmHandleDebounceSignal,
+    renderSettingsPreviews
+}
+use icon_gen.{renderAppIconPng}
+
+// ---------------------------------------------------------------------------
+// Extra ObjC/CG bindings needed only by main.gsa
+// ---------------------------------------------------------------------------
+
+extern "CGSessionCopyCurrentDictionary" def c_CGSessionCopyCurrentDictionary(): Ptr
+extern "objc_msgSend" def c_nsStatusBarItem(bar: Ptr, sel: Ptr, length: Float): Ptr
+extern "objc_msgSend" def c_nsButtonSendActionOn(btn: Ptr, sel: Ptr, mask: Int64): Int64
+extern "objc_msgSend" def c_nsMenuPopUp(menu: Ptr, sel: Ptr, item: Ptr, pt: CGPoint, view: Ptr): Bool
+extern "objc_msgSend" def c_nsSetImageScoped(btn: Ptr, sel: Ptr, img: ScopedPtr): Void
+extern "objc_msgSend" def c_nsSetStrScoped(obj: Ptr, sel: Ptr, s: ScopedPtr): Void
+extern "objc_msgSend" def c_nsSetTargetScoped(obj: Ptr, sel: Ptr, tg: ScopedPtr): Void
+extern "objc_msgSend" def c_nsAddTrackScoped(btn: Ptr, sel: Ptr, ta: ScopedPtr): Void
+extern "objc_msgSend" def c_nsNotifAddObs(nc: Ptr, sel: Ptr, name: ScopedPtr, obj: Ptr, queue: Ptr, blk: ScopedPtr): Ptr
+extern "objc_msgSend" def c_nsDistPost(nc: Ptr, sel: Ptr, name: ScopedPtr, obj: Ptr, info: Ptr, imm: Bool): Void
+extern "objc_msgSend" def c_nsEventAddGlobal(cls: Ptr, sel: Ptr, mask: Int64, blk: ScopedPtr): Ptr
+extern "objc_msgSend" def c_nsEventAddLocal(cls: Ptr, sel: Ptr, mask: Int64, blk: ScopedPtr): Ptr
+extern "objc_msgSend" def c_nsUrlWithStr(cls: Ptr, sel: Ptr, s: ScopedPtr): Ptr
+extern "objc_msgSend" def c_nsFileUrlWithPath(cls: Ptr, sel: Ptr, s: ScopedPtr): Ptr
+extern "objc_msgSend" def c_nsOpenUrl(ws: Ptr, sel: Ptr, url: Ptr): Bool
+extern "objc_msgSend" def c_nsUrlForAppToOpen(ws: Ptr, sel: Ptr, url: Ptr): Ptr
+extern "objc_msgSend" def c_nsTimerSched(cls: Ptr, sel: Ptr, iv: Float, tg: ScopedPtr, act: Ptr, info: Ptr, rep: Bool): Ptr
+extern "objc_msgSend" def c_objcSelfMain(p: ScopedPtr, sel: Ptr): Ptr
+
+def nowSec(): Float = intToFloat(i64ToInt(nowMs() / intToI64(1000))) + intToFloat(i64ToInt(nowMs() % intToI64(1000))) / 1000.0
+
+// ---------------------------------------------------------------------------
+// Main-thread custom signal tags
+// ---------------------------------------------------------------------------
+
+def kSignalStatusUpdate(): Int = 1001
+def kSignalDiscoveryDone(): Int = 1002
+def kSignalScheduledRefresh(): Int = 1003
+def kSignalDelayedSpaceRefresh(): Int = 1004
+def kSignalDelayedUnlockRefresh(): Int = 1005
+def kSignalReadinessRetry(): Int = 1006
+def kSignalOpenSettings(): Int = 1007
+def kSignalWatchMtimeRefresh(): Int = 1008
+
+// ---------------------------------------------------------------------------
+// Screen lock detection
+// ---------------------------------------------------------------------------
+
+def isSessionScreenLocked(): Bool =
+    match getEnv("TALUS_TEST_PID") {
+        Some(_) -> false,
+        None -> {
+            let lockedByDict = match cfAdoptOpt(c_CGSessionCopyCurrentDictionary()) {
+                None -> false,
+                Some(dfp) -> withForeignPtr(dfp, (dp) -> {
+                    let rawDict = c_objcSelfMain(dp, objcSel("self"));
+                    let v = nsDictGet(rawDict, "CGSSessionScreenIsLocked");
+                    if (ptrIsNull(v)) false else msgSendBool0(v, objcSel("boolValue"))
+                }),
+            };
+            if (lockedByDict) true
+            else {
+                let ws = msgSend0(objcClass("NSWorkspace"), objcSel("sharedWorkspace"));
+                let front = msgSend0(ws, objcSel("frontmostApplication"));
+                if (ptrIsNull(front)) false
+                else {
+                    let b = fromNSStringPtr(msgSend0(front, objcSel("bundleIdentifier")));
+                    b == "com.apple.loginwindow"
+                }
+            }
+        },
+    }
+
+def isBundleApp(): Bool = {
+    let b = msgSend0(objcClass("NSBundle"), objcSel("mainBundle"));
+    let p = fromNSStringPtr(msgSend0(b, objcSel("bundlePath")));
+    strEndsWith(p, ".app")
+}
+
+def reportStartupError(title: String, message: String): Void = {
+    eprintLn(title + ": " + message);
+    if (isBundleApp()) {
+        let app = nsAppShared();
+        msgSendVoid1I64(app, objcSel("setActivationPolicy:"), intToI64(1)); // accessory
+        let alert = msgSend0(msgSend0(objcClass("NSAlert"), objcSel("alloc")), objcSel("init"));
+        withId(nsString(title), (tp) -> c_nsSetStrScoped(alert, objcSel("setMessageText:"), tp));
+        withId(nsString(message), (mp) -> c_nsSetStrScoped(alert, objcSel("setInformativeText:"), mp));
+        msgSendVoid1I64(alert, objcSel("setAlertStyle:"), intToI64(0)); // warning
+        msgSendVoid1Bool(app, objcSel("activateIgnoringOtherApps:"), true);
+        let _ = msgSendI64_0(alert, objcSel("runModal"));
+        ()
+    } else ();
+    exit(1)
+}
+
+// ---------------------------------------------------------------------------
+// Manager Shell (pure Geisha `ManagerCore` + per-PID Actor `WindowExecutor`)
+// ---------------------------------------------------------------------------
+
+data DiscoveryBatchMsg {
+    DiscoveryBatchMsg {
+        revision: Int64,
+        requestedForce: Bool,
+        scope: Option (List Int),
+        screens: List ScreenSpec,
+        result: WindowDiscoveryResult,
+    }
+}
+
+def gDiscoveryChan: Chan DiscoveryBatchMsg = chanUnbounded()
+
+data Manager {
+    Manager {
+        core: ManagerCore,
+        executor: WindowExecutor,
+        ownPid: Int,
+        ignoredApps: Cell (List String),
+        isVirtualMode: Cell Bool,
+        activeWorkspace: Cell Int,
+        workspaceCount: Cell Int,
+        activeWindowCount: Cell Int,
+        currentLayoutName: Cell String,
+        paused: Cell Bool,
+        candidatesByKey: Cell (List (Int64, CandidateWindow)),
+        pidByKey: Cell (List (Int64, Int)),
+        frameByKey: Cell (List (Int64, Rect)),
+        lastSubmittedFrames: Cell (List (Int64, Rect)),
+        activeWindowKeys: Cell (List Int64),
+        dirtyFrameKeys: Cell (List Int64),
+        failedWriteAttempts: Cell (List (Int64, Int)),
+        titlesByKey: Cell (List (Int64, String)),
+        fullScreenBounds: Cell (List Rect),
+        geometryGeneration: Cell Int64,
+        discoveryRevision: Cell Int64,
+        discoveryInFlight: Cell Bool,
+        pendingDiscovery: Cell Bool,
+        pendingFullDiscovery: Cell Bool,
+        pendingDiscoveryPids: Cell (List Int),
+        pendingForce: Cell Bool,
+        scheduledRefreshPending: Cell Bool,
+        confirmedFocusKey: Cell (Option Int64),
+        focusOriginKey: Cell (Option Int64),
+        externalFocusAllowedDuringLayout: Cell Bool,
+        focusJustDelivered: Cell Bool,
+        observers: Cell (List (Int, ForeignPtr)),
+        onStatusChanged: Cell (Option (() -> Void)),
+        onStaleTCC: Cell (Option (() -> Void)),
+    }
+}
+
+def mapI64Get(m: List (Int64, a), k: Int64): Option a =
+    match listFindBy(m, (p) -> { let (kk, _) = p; kk == k }) {
+        Some((_, v)) -> Some(v),
+        None -> None,
+    }
+
+def mapI64Set(m: List (Int64, a), k: Int64, v: a): List (Int64, a) =
+    Cons((k, v), listFilter(m, (p) -> { let (kk, _) = p; kk != k }))
+
+def mapI64Rem(m: List (Int64, a), k: Int64): List (Int64, a) =
+    listFilter(m, (p) -> { let (kk, _) = p; kk != k })
+
+def rectEqExact(a: Rect, b: Rect): Bool =
+    a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h
+
+def managerCanDiscover(): Bool = axIsProcessTrusted() && !isSessionScreenLocked()
+
+def managerCacheFrame(m: Manager, key: Int64, rect: Rect, observed: Bool): Void = {
+    cellSet(m.frameByKey, mapI64Set(cellGet(m.frameByKey), key, rect));
+    if (observed) {
+        match mapI64Get(cellGet(m.lastSubmittedFrames), key) {
+            None -> cellSet(m.lastSubmittedFrames, mapI64Set(cellGet(m.lastSubmittedFrames), key, rect)),
+            Some(_) -> (),
+        };
+        match mapI64Get(cellGet(m.pidByKey), key) {
+            Some(pid) -> executorObserve(m.executor, key, pid, rect),
+            None -> (),
+        }
+    } else ();
+    cellSet(m.dirtyFrameKeys, listFilter(cellGet(m.dirtyFrameKeys), (k) -> k != key));
+    match mapI64Get(cellGet(m.candidatesByKey), key) {
+        Some(c) -> {
+            let upd = CandidateWindow {
+                key: c.key, pid: c.pid, bundleId: c.bundleId, windowId: c.windowId,
+                title: c.title, frame: rect, isResizable: c.isResizable,
+            };
+            cellSet(m.candidatesByKey, mapI64Set(cellGet(m.candidatesByKey), key, upd))
+        },
+        None -> (),
+    }
+}
+
+def managerCollectLiveFrames(m: Manager, readAll: Bool): List (Int64, Rect) = {
+    let keys = if (readAll) {
+        listMap(cellGet(m.pidByKey), (p) -> { let (k, _) = p; k })
+    } else {
+        let act = cellGet(m.activeWindowKeys);
+        listFilter(cellGet(m.dirtyFrameKeys), (k) -> listContainsBy(act, k, eqI64))
+    };
+    let ck = cellNew(keys);
+    while (match cellGet(ck) { Nil -> false, _ -> true }) {
+        match cellGet(ck) {
+            Cons(key, rk) -> {
+                if (!executorIsPending(m.executor, key)) {
+                    let srvFrame = match mapI64Get(cellGet(m.candidatesByKey), key) {
+                        Some(c) -> match c.windowId {
+                            Some(wid) -> windowServerFrame(wid),
+                            None -> None,
+                        },
+                        None -> None,
+                    };
+                    let rectOpt = match srvFrame {
+                        Some(r) -> Some(r),
+                        None -> if (readAll) {
+                            match mapI64Get(cellGet(m.pidByKey), key) {
+                                Some(pid) -> executorLiveFrameForWindow(m.executor, pid, key),
+                                None -> None,
+                            }
+                        } else None,
+                    };
+                    match rectOpt {
+                        Some(r) -> managerCacheFrame(m, key, r, true),
+                        None -> (),
+                    }
+                } else ();
+                cellSet(ck, rk)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(m.frameByKey)
+}
+
+def managerMakeGoal(m: Manager, key: Int64, pid: Int, target: Rect, resizable: Bool): WindowGoal = {
+    let isPark = listAny(cellGet(m.fullScreenBounds), (sb: Rect) -> isParkedWindowFrame(target, sb));
+    WindowGoal { key: key, pid: pid, target: target, resizable: resizable, parking: isPark }
+}
+
+def managerCurrentFrontmostKey(m: Manager, includePending: Bool, cache: Bool): Option Int64 =
+    if (includePending) {
+        match executorFocusKey(m.executor) {
+            Some(k) -> Some(k),
+            None -> managerCurrentFrontmostKey(m, false, cache),
+        }
+    } else if (!managerCanDiscover()) None
+    else {
+        let pidOpt = match frontmostPid() {
+            Some(p) -> Some(p),
+            None -> {
+                let ws = msgSend0(objcClass("NSWorkspace"), objcSel("sharedWorkspace"));
+                let app = msgSend0(ws, objcSel("frontmostApplication"));
+                if (ptrIsNull(app)) None
+                else Some(msgSendInt0(app, objcSel("processIdentifier")))
+            },
+        };
+        match pidOpt {
+            Some(pid) if (pid != m.ownPid) -> {
+                let kOpt = executorFocusedKeyForPid(m.executor, pid);
+                if (cache) {
+                    match kOpt { Some(k) -> cellSet(m.confirmedFocusKey, Some(k)), None -> () }
+                } else ();
+                kOpt
+            },
+            _ -> None,
+        }
+    }
+
+def managerApplyOutput(m: Manager, out: ManagerActionOutput): Void = {
+    cellSet(m.paused, out.paused);
+    cellSet(m.isVirtualMode, out.isVirtualMode);
+    cellSet(m.currentLayoutName, out.layoutName);
+    cellSet(m.activeWorkspace, out.activeWorkspace);
+    cellSet(m.workspaceCount, out.workspaceCount);
+    cellSet(m.activeWindowKeys, out.activeWindowKeys);
+    cellSet(m.activeWindowCount, listLen(out.activeWindowKeys));
+    match out.traceLog {
+        Some(log) -> eprintLn(log),
+        None -> (),
+    };
+
+    let authFramesOpt: Option (List (Int64, Rect)) =
+        if (out.geometryGeneration > cellGet(m.geometryGeneration)) {
+            cellSet(m.geometryGeneration, out.geometryGeneration);
+            Some(out.windowFrames)
+        } else None;
+
+    let goalsRev: Cell (List WindowGoal) = cellNew(Nil);
+    let focusKeyCell: Cell (Option Int64) = cellNew(None);
+    let focusPidCell: Cell (Option Int) = cellNew(None);
+    let focusActCell: Cell (Option (() -> Void)) = cellNew(None);
+    let explicitKeysRev: Cell (List Int64) = cellNew(Nil);
+
+    let legacyFocus = match getEnv("TALUS_LEGACY_FOCUS") { Some(v) -> v == "1", None -> false };
+
+    let ce = cellNew(out.effects);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) {
+            Cons(eff, re) -> {
+                match eff {
+                    EffSetFrame { key: k, rect: r } -> {
+                        cellSet(explicitKeysRev, Cons(k, cellGet(explicitKeysRev)));
+                        match authFramesOpt {
+                            None -> match mapI64Get(cellGet(m.pidByKey), k) {
+                                Some(pid) -> {
+                                    let resiz = match mapI64Get(cellGet(m.candidatesByKey), k) { Some(c) -> c.isResizable, None -> true };
+                                    cellSet(m.discoveryRevision, cellGet(m.discoveryRevision) + intToI64(1));
+                                    cellSet(goalsRev, Cons(managerMakeGoal(m, k, pid, r, resiz), cellGet(goalsRev)));
+                                    cellSet(m.lastSubmittedFrames, mapI64Set(cellGet(m.lastSubmittedFrames), k, r));
+                                    managerCacheFrame(m, k, r, false)
+                                },
+                                None -> (),
+                            },
+                            Some(_) -> (),
+                        }
+                    },
+                    EffSetPosition { key: k, x: x, y: y } -> {
+                        cellSet(explicitKeysRev, Cons(k, cellGet(explicitKeysRev)));
+                        match authFramesOpt {
+                            None -> match (mapI64Get(cellGet(m.pidByKey), k), mapI64Get(cellGet(m.frameByKey), k)) {
+                                (Some(pid), Some(cur)) -> {
+                                    let target = rectNew(x, y, cur.w, cur.h);
+                                    let resiz = match mapI64Get(cellGet(m.candidatesByKey), k) { Some(c) -> c.isResizable, None -> false };
+                                    cellSet(m.discoveryRevision, cellGet(m.discoveryRevision) + intToI64(1));
+                                    cellSet(goalsRev, Cons(managerMakeGoal(m, k, pid, target, resiz), cellGet(goalsRev)));
+                                    cellSet(m.lastSubmittedFrames, mapI64Set(cellGet(m.lastSubmittedFrames), k, target));
+                                    managerCacheFrame(m, k, target, false)
+                                },
+                                _ -> (),
+                            },
+                            Some(_) -> (),
+                        }
+                    },
+                    EffFocus { key: k, pid: pid } -> {
+                        cellSet(focusKeyCell, Some(k));
+                        cellSet(focusPidCell, Some(pid));
+                        let fk = k;
+                        let fp = pid;
+                        cellSet(focusActCell, Some(() -> {
+                            if (!cellGet(m.paused) && managerCanDiscover()) {
+                                match mapI64Get(cellGet(m.pidByKey), fk) {
+                                    Some(_) -> {
+                                        let _ = managerCoreBeginFocusDelivery(m.core, nowSec(), Some(fk));
+                                        executorRequestFocus(m.executor, fp, fk, legacyFocus);
+                                        cellSet(m.focusJustDelivered, true)
+                                    },
+                                    None -> (),
+                                }
+                            } else ()
+                        }))
+                    },
+                    EffRelinquishFocus -> {
+                        cellSet(focusKeyCell, None);
+                        cellSet(focusPidCell, None);
+                        cellSet(focusActCell, Some(() -> {
+                            if (!cellGet(m.paused) && !isSessionScreenLocked()) {
+                                let _ = managerCoreBeginFocusDelivery(m.core, nowSec(), None);
+                                msgSendVoid1Bool(nsAppShared(), objcSel("activateIgnoringOtherApps:"), true);
+                                cellSet(m.confirmedFocusKey, None)
+                            } else ()
+                        }))
+                    },
+                };
+                cellSet(ce, re)
+            },
+            Nil -> (),
+        }
+    };
+
+    match authFramesOpt {
+        Some(frames) -> {
+            let explicitKeys = cellGet(explicitKeysRev);
+            // Forget keys no longer in authoritative snapshot
+            let cl = cellNew(cellGet(m.lastSubmittedFrames));
+            let keptSubmitted: Cell (List (Int64, Rect)) = cellNew(Nil);
+            while (match cellGet(cl) { Nil -> false, _ -> true }) {
+                match cellGet(cl) {
+                    Cons((k, r), rl) -> {
+                        match mapI64Get(frames, k) {
+                            Some(_) -> cellSet(keptSubmitted, Cons((k, r), cellGet(keptSubmitted))),
+                            None -> executorForget(m.executor, k),
+                        };
+                        cellSet(cl, rl)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellSet(m.lastSubmittedFrames, cellGet(keptSubmitted));
+
+            let cf = cellNew(frames);
+            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                match cellGet(cf) {
+                    Cons((k, target), rf) -> {
+                        match mapI64Get(cellGet(m.pidByKey), k) {
+                            Some(pid) -> {
+                                let sameLast = match mapI64Get(cellGet(m.lastSubmittedFrames), k) {
+                                    Some(prev) -> rectEqExact(prev, target),
+                                    None -> false,
+                                };
+                                if (!sameLast || listContainsBy(explicitKeys, k, eqI64)) {
+                                    let resiz = match mapI64Get(cellGet(m.candidatesByKey), k) { Some(c) -> c.isResizable, None -> true };
+                                    cellSet(m.discoveryRevision, cellGet(m.discoveryRevision) + intToI64(1));
+                                    cellSet(goalsRev, Cons(managerMakeGoal(m, k, pid, target, resiz), cellGet(goalsRev)));
+                                    cellSet(m.lastSubmittedFrames, mapI64Set(cellGet(m.lastSubmittedFrames), k, target))
+                                } else ();
+                                managerCacheFrame(m, k, target, false)
+                            },
+                            None -> (),
+                        };
+                        cellSet(cf, rf)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        None -> (),
+    };
+
+    let goals = listRev(cellGet(goalsRev));
+    let focusAct = cellGet(focusActCell);
+    if (listLen(goals) > 0 || (match focusAct { Some(_) -> true, None -> false })) {
+        cellSet(m.focusOriginKey, cellGet(m.confirmedFocusKey));
+        cellSet(m.externalFocusAllowedDuringLayout, false)
+    } else ();
+    executorSubmit(m.executor, goals, cellGet(focusKeyCell), cellGet(focusPidCell), focusAct)
+}
+
+def managerCancelPendingFocus(m: Manager): Void = {
+    executorCancelFocus(m.executor);
+    cellSet(m.externalFocusAllowedDuringLayout, true);
+    let _ = managerCoreCancelFocusDelivery(m.core);
+    ()
+}
+
+def managerNotePointerIntent(m: Manager): Void =
+    if (executorHasPendingGeometry(m.executor) || executorHasPendingFocus(m.executor)) {
+        managerCancelPendingFocus(m)
+    } else ()
+
+def managerDeferFocusEvent(m: Manager, keyOpt: Option Int64, pidOpt: Option Int): Bool =
+    if (!(executorHasPendingGeometry(m.executor) || executorHasPendingFocus(m.executor))
+        || cellGet(m.externalFocusAllowedDuringLayout)) false
+    else if (optEqBy(keyOpt, executorFocusKey(m.executor), eqI64) && (match keyOpt { Some(_) -> true, None -> false })) false
+    else if (optEqBy(pidOpt, executorFocusPid(m.executor), eqInt) && (match pidOpt { Some(_) -> true, None -> false })) true
+    else if (optEqBy(keyOpt, cellGet(m.focusOriginKey), eqI64) && (match keyOpt { Some(_) -> true, None -> false })) true
+    else {
+        let originPid = match cellGet(m.focusOriginKey) {
+            Some(ok) -> mapI64Get(cellGet(m.pidByKey), ok),
+            None -> None,
+        };
+        let isNullOrigin = (match keyOpt { None -> true, Some(_) -> false })
+            && ((match pidOpt { None -> true, Some(_) -> false }) || optEqBy(pidOpt, originPid, eqInt));
+        if (isNullOrigin) true
+        else {
+            managerCancelPendingFocus(m);
+            false
+        }
+    }
+
+def managerRememberFocus(m: Manager): Void = {
+    let fk = managerCurrentFrontmostKey(m, true, true);
+    let _ = managerCoreRememberFocus(m.core, nowSec(), fk);
+    ()
+}
+
+def managerScheduleRefresh(m: Manager, pidOpt: Option Int): Void = {
+    match getEnv("TALUS_TRACE_EVENTS") {
+        Some(v) if (v == "1") -> eprintLn("event " + intToStr(i64ToInt(nowMs() / intToI64(1000)))),
+        _ -> (),
+    };
+    cellSet(m.discoveryRevision, cellGet(m.discoveryRevision) + intToI64(1));
+    match pidOpt {
+        Some(pid) -> if (!listContainsBy(cellGet(m.pendingDiscoveryPids), pid, eqInt)) {
+            cellSet(m.pendingDiscoveryPids, Cons(pid, cellGet(m.pendingDiscoveryPids)))
+        } else (),
+        None -> cellSet(m.pendingFullDiscovery, true),
+    };
+    if (!cellGet(m.scheduledRefreshPending)) {
+        cellSet(m.scheduledRefreshPending, true);
+        postMainExecEvent(ExecCustomSignal { tag: kSignalScheduledRefresh() })
+    } else ()
+}
+
+def managerRefresh(m: Manager, force: Bool, onlyPids: Option (List Int)): Void = {
+    if (!cellGet(m.paused) && managerCanDiscover()) {
+        if (force) cellSet(m.pendingForce, true) else ();
+        match onlyPids {
+            Some(ps) -> {
+                let cp = cellNew(ps);
+                while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                    match cellGet(cp) {
+                        Cons(p, rp) -> {
+                            if (!listContainsBy(cellGet(m.pendingDiscoveryPids), p, eqInt)) {
+                                cellSet(m.pendingDiscoveryPids, Cons(p, cellGet(m.pendingDiscoveryPids)))
+                            } else ();
+                            cellSet(cp, rp)
+                        },
+                        Nil -> (),
+                    }
+                }
+            },
+            None -> cellSet(m.pendingFullDiscovery, true),
+        };
+        if (cellGet(m.discoveryInFlight) || executorHasPendingGeometry(m.executor)) {
+            cellSet(m.pendingDiscovery, true)
+        } else {
+            let (screens, _) = collectScreenDescriptors();
+            if (listLen(screens) > 0) {
+                cellSet(m.fullScreenBounds, listMap(screens, (s: ScreenSpec) -> s.fullFrame));
+                let scope: Option (List Int) =
+                    if (cellGet(m.pendingFullDiscovery) || listLen(cellGet(m.candidatesByKey)) == 0) None
+                    else Some(cellGet(m.pendingDiscoveryPids));
+                let reqForce = cellGet(m.pendingForce);
+                cellSet(m.pendingFullDiscovery, false);
+                cellSet(m.pendingDiscoveryPids, Nil);
+                cellSet(m.pendingForce, false);
+                cellSet(m.pendingDiscovery, false);
+                cellSet(m.discoveryInFlight, true);
+
+                let rev = cellGet(m.discoveryRevision);
+                let selectedPids: Option (List Int) = match getEnv("TALUS_TEST_PID") {
+                    Some(raw) -> {
+                        let parts = strSplitChar(raw, ',');
+                        let revP: Cell (List Int) = cellNew(Nil);
+                        let cp = cellNew(parts);
+                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                            match cellGet(cp) {
+                                Cons(s, rs) -> {
+                                    match parseInt(strTrim(s)) {
+                                        Ok(p) -> cellSet(revP, Cons(p, cellGet(revP))),
+                                        Err(_) -> (),
+                                    };
+                                    cellSet(cp, rs)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        Some(listRev(cellGet(revP)))
+                    },
+                    None -> None,
+                };
+                // Collect running applications on main thread, then run per-PID Actor AX scan on background Task!
+                let apps = collectRunningApps(m.ownPid, cellGet(m.ignoredApps), selectedPids);
+                // Pre-spawn per-PID Actors on main thread (so background task only calls actorCall on Send Actors!)
+                let actorList = listMap(apps, (app: RunningAppInfo) -> {
+                    let w = macos.executor.executorWorker(m.executor, app.pid);
+                    (app, w.actor)
+                });
+                let _ = spawn(() -> {
+                    let res = discoverWindowsWithActors(actorList, scope);
+                    let _ = chanSend(gDiscoveryChan, DiscoveryBatchMsg {
+                        revision: rev,
+                        requestedForce: reqForce,
+                        scope: scope,
+                        screens: screens,
+                        result: res,
+                    });
+                    postMainExecEvent(ExecCustomSignal { tag: kSignalDiscoveryDone() })
+                });
+                ()
+            } else ()
+        }
+    } else ()
+}
+
+/// Pure Send helper running on a background Task: CG scan + parallel per-PID Actor discovery.
+def discoverWindowsWithActors(
+    appActors: List (RunningAppInfo, Actor macos.executor.AppExecState),
+    onlyPids: Option (List Int)
+): WindowDiscoveryResult = withAutoreleasePool(() -> {
+    // Re-use CG scan directly via WindowDiscovery? Even simpler: call per-PID actors directly!
+    // Read CG window lists using thread-safe CoreGraphics C APIs
+    let (visible, visibleIds) = readCGVisibleForDiscovery();
+    let existingIds = readCGExistingForDiscovery();
+
+    let livePidsRev: Cell (List Int) = cellNew(Nil);
+    let eligVis = cellNew(false);
+    let tasksRev: Cell (List (Task macos.executor.AppDiscoveryOutcome)) = cellNew(Nil);
+
+    let ca = cellNew(appActors);
+    while (match cellGet(ca) { Nil -> false, _ -> true }) {
+        match cellGet(ca) {
+            Cons((app, actor), ra) -> {
+                cellSet(livePidsRev, Cons(app.pid, cellGet(livePidsRev)));
+                let appVis = listFilter(visible, (c: screen_geometry.VisibleWindowCandidate) -> c.pid == app.pid);
+                if (listLen(appVis) > 0) cellSet(eligVis, true) else ();
+                let doEnum = match onlyPids {
+                    Some(only) -> listContainsBy(only, app.pid, eqInt),
+                    None -> true,
+                };
+                if (doEnum) {
+                    let bOpt = app.bundleId;
+                    let t = actorCall(actor, (st) -> macos.executor.discoverAppInActorPub(st, bOpt, appVis, true));
+                    cellSet(tasksRev, Cons(t, cellGet(tasksRev)))
+                } else ();
+                cellSet(ca, ra)
+            },
+            Nil -> (),
+        }
+    };
+
+    let allWinsRev: Cell (List macos.executor.DiscoveredAppWindow) = cellNew(Nil);
+    let busyRev: Cell (List Int) = cellNew(Nil);
+    let deadRev: Cell (List Int64) = cellNew(Nil);
+    let staleFlag = cellNew(false);
+
+    let ct = cellNew(listRev(cellGet(tasksRev)));
+    while (match cellGet(ct) { Nil -> false, _ -> true }) {
+        match cellGet(ct) {
+            Cons(t, rt) -> {
+                let out = await(t);
+                if (out.busy) cellSet(busyRev, Cons(out.pid, cellGet(busyRev))) else ();
+                if (out.staleApiDisabled) cellSet(staleFlag, true) else ();
+                let cw = cellNew(out.windows);
+                while (match cellGet(cw) { Nil -> false, _ -> true }) {
+                    match cellGet(cw) { Cons(w, rw) -> { cellSet(allWinsRev, Cons(w, cellGet(allWinsRev))); cellSet(cw, rw) }, Nil -> () }
+                };
+                let cd = cellNew(out.deadHandles);
+                while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                    match cellGet(cd) { Cons(d, rd) -> { cellSet(deadRev, Cons(d, cellGet(deadRev))); cellSet(cd, rd) }, Nil -> () }
+                };
+                cellSet(ct, rt)
+            },
+            Nil -> (),
+        }
+    };
+
+    WindowDiscoveryResult {
+        windows: listRev(cellGet(allWinsRev)),
+        busyPids: listRev(cellGet(busyRev)),
+        visibleWindowIds: visibleIds,
+        existingWindowIds: existingIds,
+        deadHandles: listRev(cellGet(deadRev)),
+        livePids: listRev(cellGet(livePidsRev)),
+        eligibleVisibleWindowExists: cellGet(eligVis),
+        staleApiDisabled: cellGet(staleFlag),
+    }
+})
+
+// Re-export CG helpers from window_discovery (we'll make them pub in window_discovery.gsa)
+def readCGVisibleForDiscovery(): (List screen_geometry.VisibleWindowCandidate, List Int) =
+    macos.window_discovery.readCGVisibleCandidatesPub()
+def readCGExistingForDiscovery(): List Int =
+    macos.window_discovery.readCGExistingWindowIdsPub()
+
+def managerHandleDiscoveryBatch(m: Manager, msg: DiscoveryBatchMsg): Void = {
+    cellSet(m.discoveryInFlight, false);
+    if (!cellGet(m.paused) && managerCanDiscover()) {
+        if (msg.revision != cellGet(m.discoveryRevision) || executorHasPendingGeometry(m.executor)) {
+            managerRefresh(m, msg.requestedForce, msg.scope)
+        } else {
+            let res = msg.result;
+            // Filter retained candidates: live && (busy || out-of-scope)
+            cellSet(m.candidatesByKey, listFilter(cellGet(m.candidatesByKey), (p: (Int64, CandidateWindow)) -> {
+                let (_, cand) = p;
+                let liveOk = listContainsBy(res.livePids, cand.pid, eqInt);
+                let busyOk = listContainsBy(res.busyPids, cand.pid, eqInt);
+                let outScope = match msg.scope {
+                    Some(sc) -> !listContainsBy(sc, cand.pid, eqInt),
+                    None -> false,
+                };
+                liveOk && (busyOk || outScope)
+            }));
+
+            let cw = cellNew(res.windows);
+            while (match cellGet(cw) { Nil -> false, _ -> true }) {
+                match cellGet(cw) {
+                    Cons(w, rw) -> {
+                        cellSet(m.pidByKey, mapI64Set(cellGet(m.pidByKey), w.key, w.pid));
+                        managerCacheFrame(m, w.key, w.frame, true);
+                        cellSet(m.titlesByKey, mapI64Set(cellGet(m.titlesByKey), w.key, w.title));
+                        let cand = CandidateWindow {
+                            key: w.key, pid: w.pid, bundleId: w.bundleId, windowId: w.windowId,
+                            title: w.title, frame: w.frame, isResizable: w.isResizable,
+                        };
+                        cellSet(m.candidatesByKey, mapI64Set(cellGet(m.candidatesByKey), w.key, cand));
+                        cellSet(cw, rw)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            let cd = cellNew(res.deadHandles);
+            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                match cellGet(cd) {
+                    Cons(dk, rd) -> {
+                        cellSet(m.pidByKey, mapI64Rem(cellGet(m.pidByKey), dk));
+                        cellSet(m.frameByKey, mapI64Rem(cellGet(m.frameByKey), dk));
+                        cellSet(m.lastSubmittedFrames, mapI64Rem(cellGet(m.lastSubmittedFrames), dk));
+                        cellSet(m.candidatesByKey, mapI64Rem(cellGet(m.candidatesByKey), dk));
+                        cellSet(m.dirtyFrameKeys, listFilter(cellGet(m.dirtyFrameKeys), (k) -> k != dk));
+                        cellSet(m.failedWriteAttempts, mapI64Rem(cellGet(m.failedWriteAttempts), dk));
+                        cellSet(m.titlesByKey, mapI64Rem(cellGet(m.titlesByKey), dk));
+                        executorForget(m.executor, dk);
+                        match cellGet(m.confirmedFocusKey) {
+                            Some(fk) if (fk == dk) -> cellSet(m.confirmedFocusKey, None),
+                            _ -> (),
+                        };
+                        cellSet(cd, rd)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            if (res.staleApiDisabled) {
+                match cellGet(m.onStaleTCC) { Some(cb) -> cb(), None -> () }
+            } else ();
+
+            let frontmost = managerCurrentFrontmostKey(m, true, true);
+            let candidates = listMap(cellGet(m.candidatesByKey), (p: (Int64, CandidateWindow)) -> { let (_, c) = p; c });
+            let traceEv = match getEnv("TALUS_TRACE_EVENTS") { Some(v) -> v == "1", None -> false };
+            let out = managerCoreRefresh(
+                m.core, msg.requestedForce, nowSec(), msg.screens, candidates,
+                res.busyPids, res.visibleWindowIds, res.existingWindowIds,
+                res.deadHandles, res.eligibleVisibleWindowExists, frontmost, traceEv
+            );
+            managerApplyOutput(m, out);
+            match cellGet(m.onStatusChanged) { Some(cb) -> cb(), None -> () };
+
+            if (cellGet(m.pendingDiscovery)) {
+                let nextScope = if (cellGet(m.pendingFullDiscovery)) None else Some(cellGet(m.pendingDiscoveryPids));
+                managerRefresh(m, false, nextScope)
+            } else ()
+        }
+    } else ()
+}
+
+def managerHandleAxFocus(m: Manager): Void = {
+    let actual = managerCurrentFrontmostKey(m, false, false);
+    let actualPid = match actual { Some(k) -> mapI64Get(cellGet(m.pidByKey), k), None -> None };
+    if (!managerDeferFocusEvent(m, actual, actualPid)) {
+        cellSet(m.confirmedFocusKey, actual);
+        let liveFrames = match actual {
+            Some(fk) if (!listContainsBy(cellGet(m.activeWindowKeys), fk, eqI64)) -> managerCollectLiveFrames(m, false),
+            _ -> Nil,
+        };
+        match actual {
+            Some(fk) -> match mapI64Get(cellGet(m.candidatesByKey), fk) {
+                None -> match mapI64Get(cellGet(m.pidByKey), fk) {
+                    Some(pid) -> managerScheduleRefresh(m, Some(pid)),
+                    None -> (),
+                },
+                Some(_) -> (),
+            },
+            None -> (),
+        };
+        let out = managerCoreHandleAxFocus(m.core, nowSec(), axIsProcessTrusted(), isSessionScreenLocked(), actual, liveFrames);
+        managerApplyOutput(m, out);
+        if (out.statusChanged) {
+            match cellGet(m.onStatusChanged) { Some(cb) -> cb(), None -> () }
+        } else ()
+    } else ()
+}
+
+def managerHandleAppActivated(m: Manager, appPtr: Ptr): Void = {
+    let pid = msgSendInt0(appPtr, objcSel("processIdentifier"));
+    if (pid == m.ownPid) {
+        cellSet(m.confirmedFocusKey, None)
+    } else {
+        let ws = msgSend0(objcClass("NSWorkspace"), objcSel("sharedWorkspace"));
+        let front = msgSend0(ws, objcSel("frontmostApplication"));
+        let frontPid = if (ptrIsNull(front)) -1 else msgSendInt0(front, objcSel("processIdentifier"));
+        if (frontPid == pid) {
+            let appFocused = if (managerCanDiscover()) executorFocusedKeyForPid(m.executor, pid) else None;
+            if (!managerDeferFocusEvent(m, appFocused, Some(pid))) {
+                cellSet(m.confirmedFocusKey, appFocused);
+                let liveFrames = match appFocused {
+                    Some(fk) if (!listContainsBy(cellGet(m.activeWindowKeys), fk, eqI64)) -> managerCollectLiveFrames(m, false),
+                    _ -> Nil,
+                };
+                let out = managerCoreHandleAppActivated(m.core, pid, nowSec(), axIsProcessTrusted(), isSessionScreenLocked(), appFocused, liveFrames);
+                managerApplyOutput(m, out);
+                if (out.statusChanged) {
+                    match cellGet(m.onStatusChanged) { Some(cb) -> cb(), None -> () }
+                } else ()
+            } else ()
+        } else ()
+    }
+}
+
+def managerSwitchWorkspace(m: Manager, idx: Int): Void = {
+    let fk = managerCurrentFrontmostKey(m, true, true);
+    let out = managerCoreSwitchWorkspace(m.core, idx, nowSec(), axIsProcessTrusted(), fk, managerCollectLiveFrames(m, false));
+    managerApplyOutput(m, out);
+    match cellGet(m.onStatusChanged) { Some(cb) -> cb(), None -> () }
+}
+
+def managerHandleKey(m: Manager, code: Int, shift: Bool): Void = {
+    let skipFrames = !shift && (code == kvkAnsiJ() || code == kvkAnsiK());
+    let liveFrames = if (skipFrames) Nil else managerCollectLiveFrames(m, false);
+    let fk = managerCurrentFrontmostKey(m, true, true);
+    let out = managerCoreHandleKey(m.core, code, shift, nowSec(), axIsProcessTrusted(), fk, liveFrames);
+    managerApplyOutput(m, out);
+    match out.pausedToggled {
+        Some(toggled) -> {
+            if (!toggled) managerRefresh(m, true, None) else ();
+            printLn(if (toggled) "Paused" else "Resumed")
+        },
+        None -> (),
+    }
+}
+
+def managerApplyConfig(m: Manager, cfg: Configuration): Void = {
+    let willVirt = cfg.workspaceMode == "virtual";
+    if (willVirt != cellGet(m.isVirtualMode)) managerCancelPendingFocus(m) else ();
+    cellSet(m.discoveryRevision, cellGet(m.discoveryRevision) + intToI64(1));
+    cellSet(m.ignoredApps, cfg.ignoreApps);
+    let fk = managerCurrentFrontmostKey(m, true, true);
+    let out = managerCoreApplyConfig(m.core, cfg, nowSec(), axIsProcessTrusted(), fk, managerCollectLiveFrames(m, false));
+    managerApplyOutput(m, out);
+    if (axIsProcessTrusted()) managerRefresh(m, true, None) else ()
+}
+
+def managerRestoreAllParked(m: Manager): Void = {
+    executorFinishSynchronously(m.executor);
+    let out = managerCoreRestoreAllParked(m.core, axIsProcessTrusted(), managerCollectLiveFrames(m, true));
+    managerApplyOutput(m, out);
+    executorFinishSynchronously(m.executor)
+}
+
+def managerSetPaused(m: Manager, nextPaused: Bool): Void =
+    if (cellGet(m.paused) != nextPaused) {
+        if (nextPaused) {
+            executorCancelQueued(m.executor);
+            let _ = managerCoreCancelFocusDelivery(m.core);
+            ()
+        } else ();
+        cellSet(m.paused, nextPaused);
+        managerCoreSetPaused(m.core, nextPaused)
+    } else ()
+
+// Global manager cell for C callbacks (AXObserver & Carbon hotkey handler — strictly main thread!)
+def gManagerRef: Cell (Option Manager) = cellNew(None)
+
+def axObserverCallback(_obs: Ptr, element: Ptr, notif: Ptr, _refcon: Ptr): Void = withAutoreleasePool(() -> {
+    match cellGet(gManagerRef) {
+        None -> (),
+        Some(m) -> {
+            let name = fromNSStringPtr(notif);
+            if (name == "AXFocusedWindowChanged") {
+                managerHandleAxFocus(m)
+            } else {
+                let pid = withAlloca(4, (buf) -> {
+                    scopedPtrWriteI32Le(buf, 0, 0);
+                    let _ = c_AXUIElementGetPidRaw(element, buf);
+                    scopedPtrReadI32Le(buf, 0)
+                });
+                managerRememberFocus(m);
+                managerScheduleRefresh(m, if (pid == 0) None else Some(pid))
+            }
+        },
+    }
+})
+
+def managerObserveApplications(m: Manager): Void = {
+    if (managerCanDiscover()) {
+        let apps = collectRunningApps(m.ownPid, Nil, None);
+        let livePids = listMap(apps, (a: RunningAppInfo) -> a.pid);
+        executorRetainApplications(m.executor, livePids);
+
+        // Remove observers for exited PIDs
+        let keptObsRev: Cell (List (Int, ForeignPtr)) = cellNew(Nil);
+        let co = cellNew(cellGet(m.observers));
+        while (match cellGet(co) { Nil -> false, _ -> true }) {
+            match cellGet(co) {
+                Cons((pid, obsFp), ro) -> {
+                    if (listContainsBy(livePids, pid, eqInt)) {
+                        cellSet(keptObsRev, Cons((pid, obsFp), cellGet(keptObsRev)))
+                    } else {
+                        let rl = c_CFRunLoopGetMain();
+                        let mode = cfRunLoopCommonModes();
+                        withForeignPtr(obsFp, (op) -> {
+                            let src = c_AXObserverGetRunLoopSource(op);
+                            if (!ptrIsNull(src) && !ptrIsNull(mode)) {
+                                // Remove source via retained ForeignPtr wrapper
+                                let srcFp = macos.ffi.cfRetain(src);
+                                withForeignPtr(srcFp, (sp) -> c_CFRunLoopRemoveSource(rl, sp, mode))
+                            } else ()
+                        })
+                    };
+                    cellSet(co, ro)
+                },
+                Nil -> (),
+            }
+        };
+        cellSet(m.observers, listRev(cellGet(keptObsRev)));
+
+        // Add observers for newly launched regular apps
+        let sCreated = nsString("AXWindowCreated");
+        let sFocused = nsString("AXFocusedWindowChanged");
+        let sDestroyed = nsString("AXUIElementDestroyed");
+        let ca = cellNew(apps);
+        while (match cellGet(ca) { Nil -> false, _ -> true }) {
+            match cellGet(ca) {
+                Cons(app, ra) -> {
+                    let pid = app.pid;
+                    let already = match listFindBy(cellGet(m.observers), (p) -> { let (op, _) = p; op == pid }) {
+                        Some(_) -> true,
+                        None -> false,
+                    };
+                    if (!already) {
+                        let obsOpt: Option ForeignPtr = withAlloca(8, (outBuf) -> {
+                            scopedPtrWriteI64Le(outBuf, intToI64(0), intToI64(0));
+                            let err = c_AXObserverCreate(pid, cFnPtr(axObserverCallback), outBuf);
+                            if (err == kAXErrorSuccess()) cfAdoptOpt(readPtrAt(outBuf, 0)) else None
+                        });
+                        match obsOpt {
+                            Some(obsFp) -> {
+                                let axApp = axCreateApplication(pid);
+                                let addErr = withForeignPtr(obsFp, (op) ->
+                                    withForeignPtr(axApp, (ap) ->
+                                        withId(sCreated, (np) -> c_AXObserverAddNotification(op, ap, np, ptrNull()))
+                                    )
+                                );
+                                if (addErr == kAXErrorSuccess() || addErr == kAXErrorNotificationAlreadyRegistered()) {
+                                    let _ = withForeignPtr(obsFp, (op) ->
+                                        withForeignPtr(axApp, (ap) ->
+                                            withId(sFocused, (np) -> c_AXObserverAddNotification(op, ap, np, ptrNull()))
+                                        )
+                                    );
+                                    let _ = withForeignPtr(obsFp, (op) ->
+                                        withForeignPtr(axApp, (ap) ->
+                                            withId(sDestroyed, (np) -> c_AXObserverAddNotification(op, ap, np, ptrNull()))
+                                        )
+                                    );
+                                    let rl = c_CFRunLoopGetMain();
+                                    let mode = cfRunLoopCommonModes();
+                                    withForeignPtr(obsFp, (op) -> {
+                                        let src = c_AXObserverGetRunLoopSource(op);
+                                        if (!ptrIsNull(src) && !ptrIsNull(mode)) {
+                                            let srcFp = macos.ffi.cfRetain(src);
+                                            withForeignPtr(srcFp, (sp) -> c_CFRunLoopAddSource(rl, sp, mode))
+                                        } else ()
+                                    });
+                                    cellSet(m.observers, Cons((pid, obsFp), cellGet(m.observers)))
+                                } else ()
+                            },
+                            None -> (),
+                        }
+                    } else ();
+                    cellSet(ca, ra)
+                },
+                Nil -> (),
+            }
+        }
+    } else ()
+}
+
+def managerNew(cfg: Configuration): Manager = {
+    let sessionPath = defaultSessionFilePath();
+    let core = managerCoreNew(cfg, sessionPath);
+    let exec = windowExecutorNew(ApplyRealAX, true);
+    let m = Manager {
+        core: core,
+        executor: exec,
+        ownPid: c_posix_getpid(),
+        ignoredApps: cellNew(cfg.ignoreApps),
+        isVirtualMode: cellNew(cfg.workspaceMode == "virtual"),
+        activeWorkspace: cellNew(0),
+        workspaceCount: cellNew(cfg.workspaceCount),
+        activeWindowCount: cellNew(0),
+        currentLayoutName: cellNew("Tall"),
+        paused: cellNew(false),
+        candidatesByKey: cellNew(Nil),
+        pidByKey: cellNew(Nil),
+        frameByKey: cellNew(Nil),
+        lastSubmittedFrames: cellNew(Nil),
+        activeWindowKeys: cellNew(Nil),
+        dirtyFrameKeys: cellNew(Nil),
+        failedWriteAttempts: cellNew(Nil),
+        titlesByKey: cellNew(Nil),
+        fullScreenBounds: cellNew(Nil),
+        geometryGeneration: cellNew(intToI64(0)),
+        discoveryRevision: cellNew(intToI64(0)),
+        discoveryInFlight: cellNew(false),
+        pendingDiscovery: cellNew(false),
+        pendingFullDiscovery: cellNew(false),
+        pendingDiscoveryPids: cellNew(Nil),
+        pendingForce: cellNew(false),
+        scheduledRefreshPending: cellNew(false),
+        confirmedFocusKey: cellNew(None),
+        focusOriginKey: cellNew(None),
+        externalFocusAllowedDuringLayout: cellNew(false),
+        focusJustDelivered: cellNew(false),
+        observers: cellNew(Nil),
+        onStatusChanged: cellNew(None),
+        onStaleTCC: cellNew(None),
+    };
+    executorSetOnResult(exec, (key, err) -> {
+        cellSet(m.discoveryRevision, cellGet(m.discoveryRevision) + intToI64(1));
+        if (err == kAXErrorSuccess()) {
+            cellSet(m.failedWriteAttempts, mapI64Rem(cellGet(m.failedWriteAttempts), key))
+        } else {
+            cellSet(m.dirtyFrameKeys, Cons(key, cellGet(m.dirtyFrameKeys)));
+            let attempts = match mapI64Get(cellGet(m.failedWriteAttempts), key) { Some(n) -> n, None -> 0 };
+            if (!cellGet(m.paused) && attempts < 2 && managerCanDiscover()) {
+                match (mapI64Get(cellGet(m.pidByKey), key), mapI64Get(cellGet(m.frameByKey), key)) {
+                    (Some(pid), Some(target)) -> {
+                        cellSet(m.failedWriteAttempts, mapI64Set(cellGet(m.failedWriteAttempts), key, attempts + 1));
+                        cellSet(m.discoveryRevision, cellGet(m.discoveryRevision) + intToI64(1));
+                        let resiz = match mapI64Get(cellGet(m.candidatesByKey), key) { Some(c) -> c.isResizable, None -> true };
+                        executorSubmit(m.executor, [managerMakeGoal(m, key, pid, target, resiz)], None, None, None)
+                    },
+                    _ -> (),
+                }
+            } else ()
+        }
+    });
+    executorSetOnSettled(exec, () -> {
+        match getEnv("TALUS_TRACE_EVENTS") {
+            Some(v) if (v == "1") -> eprintLn(
+                "execution settled submitted=" + intToStr(i64ToInt(executorSubmittedCount(m.executor)))
+                + " applied=" + intToStr(i64ToInt(executorAppliedCount(m.executor)))
+            ),
+            _ -> (),
+        };
+        if (cellGet(m.focusJustDelivered)) {
+            cellSet(m.focusJustDelivered, false);
+            managerRememberFocus(m)
+        } else ();
+        if (cellGet(m.pendingDiscovery)) {
+            let scope = if (cellGet(m.pendingFullDiscovery)) None else Some(cellGet(m.pendingDiscoveryPids));
+            managerRefresh(m, false, scope)
+        } else ();
+        match cellGet(m.onStatusChanged) { Some(cb) -> cb(), None -> () }
+    });
+    m
+}
+
+// ---------------------------------------------------------------------------
+// Carbon HotkeyRegistry
+// ---------------------------------------------------------------------------
+
+data HotkeyRegistry {
+    HotkeyRegistry {
+        refs: Cell (List Ptr),
+    }
+}
+
+def hotkeyRegistryNew(): HotkeyRegistry = HotkeyRegistry { refs: cellNew(Nil) }
+
+def hotkeyRegisterOne(reg: HotkeyRegistry, code: Int, modBits: Int, shifted: Bool): Void = {
+    let id = code | (if (shifted) 0x10000 else 0);
+    let mods = modBits | (if (shifted) carbonShiftKey() else 0);
+    let hkid = EventHotKeyID { signature: kTalusHotkeySignature(), id: id };
+    let refOpt: Option Ptr = withAlloca(8, (outBuf) -> {
+        scopedPtrWriteI64Le(outBuf, intToI64(0), intToI64(0));
+        let st = c_RegisterEventHotKey(code, mods, hkid, c_GetApplicationEventTarget(), 0, outBuf);
+        if (st != 0) {
+            eprintLn("Could not register shortcut key " + intToStr(code) + ": " + intToStr(st));
+            None
+        } else {
+            let p = readPtrAt(outBuf, 0);
+            if (ptrIsNull(p)) None else Some(p)
+        }
+    });
+    match refOpt {
+        Some(r) -> cellSet(reg.refs, Cons(r, cellGet(reg.refs))),
+        None -> (),
+    }
+}
+
+def hotkeyRegistryApply(reg: HotkeyRegistry, modifiers: List String, workspaceMode: String, workspaceCount: Int): Void = {
+    let cr = cellNew(cellGet(reg.refs));
+    while (match cellGet(cr) { Nil -> false, _ -> true }) {
+        match cellGet(cr) {
+            Cons(r, rr) -> { let _ = c_UnregisterEventHotKey(r); cellSet(cr, rr) },
+            Nil -> (),
+        }
+    };
+    cellSet(reg.refs, Nil);
+    let modBits = cellNew(0);
+    if (listContainsBy(modifiers, "control", eqStr)) cellSet(modBits, cellGet(modBits) | carbonControlKey()) else ();
+    if (listContainsBy(modifiers, "option", eqStr)) cellSet(modBits, cellGet(modBits) | carbonOptionKey()) else ();
+    if (listContainsBy(modifiers, "command", eqStr)) cellSet(modBits, cellGet(modBits) | carbonCmdKey()) else ();
+    let mb = cellGet(modBits);
+
+    let baseCodes = [kvkAnsiH(), kvkAnsiL(), kvkAnsiJ(), kvkAnsiK(), kvkAnsiComma(), kvkAnsiPeriod(), kvkSpace(), kvkReturn(), kvkAnsiP(), kvkAnsiT()];
+    let cb = cellNew(baseCodes);
+    while (match cellGet(cb) { Nil -> false, _ -> true }) {
+        match cellGet(cb) {
+            Cons(code, rc) -> {
+                hotkeyRegisterOne(reg, code, mb, false);
+                if (code == kvkAnsiJ() || code == kvkAnsiK()) hotkeyRegisterOne(reg, code, mb, true) else ();
+                cellSet(cb, rc)
+            },
+            Nil -> (),
+        }
+    };
+    if (workspaceMode == "virtual") {
+        let clamped = minInt(9, maxInt(1, workspaceCount));
+        let digits = workspaceDigitKeyCodes();
+        let i = cellNew(0);
+        while (cellGet(i) < clamped) {
+            match listNthOpt(digits, cellGet(i)) {
+                Some(code) -> {
+                    hotkeyRegisterOne(reg, code, mb, false);
+                    hotkeyRegisterOne(reg, code, mb, true)
+                },
+                None -> (),
+            };
+            cellSet(i, cellGet(i) + 1)
+        }
+    } else ()
+}
+
+def gStatusUpdateCallback: Cell (Option (() -> Void)) = cellNew(None)
+
+def carbonHotkeyHandler(_nextHandler: Ptr, event: Ptr, _userData: Ptr): Int = withAutoreleasePool(() -> {
+    let hkId = withAlloca(8, (buf) -> {
+        scopedPtrWriteI32Le(buf, 0, 0);
+        scopedPtrWriteI32Le(buf, 4, 0);
+        let _ = c_GetEventParameter(event, kEventParamDirectObject(), typeEventHotKeyID(), ptrNull(), 8, ptrNull(), buf);
+        scopedPtrReadI32Le(buf, 4)
+    });
+    match cellGet(gManagerRef) {
+        Some(m) -> managerHandleKey(m, hkId & 0xFFFF, (hkId & 0x10000) != 0),
+        None -> (),
+    };
+    match cellGet(gStatusUpdateCallback) {
+        Some(cb) -> cb(),
+        None -> (),
+    };
+    0
+})
+
+def installCarbonHotkeyHandler(): Void = {
+    let _ = withAlloca(16, (buf) -> {
+        scopedPtrWriteI32Le(buf, 0, kEventClassKeyboard());
+        scopedPtrWriteI32Le(buf, 4, kEventHotKeyPressed());
+        c_InstallEventHandler(c_GetApplicationEventTarget(), cFnPtr(carbonHotkeyHandler), 1, buf, ptrNull(), scopedPtrOffset(buf, 8))
+    });
+    ()
+}
+
+// ---------------------------------------------------------------------------
+// StatusMenu (NSStatusItem + Hover + Click Hit-Test + Dropdown Menu)
+// ---------------------------------------------------------------------------
+
+data StatusMenu {
+    StatusMenu {
+        manager: Manager,
+        config: Cell Configuration,
+        commands: Cell StatusCommandsEngine,
+        statusItem: Id NSObject,
+        buttonPtr: Ptr,
+        menu: Id NSObject,
+        axWarningItem: Ptr,
+        axSeparator: Ptr,
+        workspaceItems: List Ptr,
+        workspaceSeparator: Ptr,
+        pauseItem: Ptr,
+        openFileItem: Ptr,
+        retainedTargets: Cell (List (Id NSObject)),
+        lastExportJson: Cell (Option String),
+        lastStateJson: Cell (Option String),
+        reportedExportError: Cell Bool,
+        cachedParts: Cell (Option (List StatusPart)),
+        cachedDark: Cell (Option Bool),
+        cachedHover: Cell (Option Int),
+        lastSpokenStatus: Cell String,
+        workspaceHitRects: Cell (List StatusWorkspaceHitRegion),
+        hoveredWorkspace: Cell (Option Int),
+        statusUpdate: MainLoopUpdate,
+        onOpenSettings: Cell (Option (() -> Void)),
+        onOpenConfigFile: Cell (Option (() -> Void)),
+        onReloadConfig: Cell (Option (() -> Void)),
+        onQuit: Cell (Option (() -> Void)),
+        savePathCell: Cell String,
+    }
+}
+
+def statusMenuUpdateTooltip(sm: StatusMenu): Void = {
+    let tip = match cellGet(sm.hoveredWorkspace) {
+        Some(ws) if (cellGet(sm.manager.isVirtualMode)) -> {
+            let lbl = match listNthOpt(cellGet(sm.config).spaceLabels, ws) {
+                Some(l) -> ":" + l,
+                None -> "",
+            };
+            "点击切换到工作区 " + intToStr(ws + 1) + lbl + "（右键打开 Talus 菜单）"
+        },
+        _ -> if (cellGet(sm.manager.isVirtualMode)) {
+            "Talus: " + cellGet(sm.lastSpokenStatus) + "（点击工作区切换，右键或点图标打开菜单）"
+        } else {
+            "Talus: " + cellGet(sm.lastSpokenStatus)
+        },
+    };
+    withId(nsString(tip), (tp) -> c_nsSetStrScoped(sm.buttonPtr, objcSel("setToolTip:"), tp))
+}
+
+def statusMenuRenderCurrentImage(sm: StatusMenu, force: Bool): Void = {
+    match cellGet(sm.cachedParts) {
+        None -> (),
+        Some(parts) -> {
+            let dark = nsAppearanceIsDark(sm.buttonPtr);
+            let hov = cellGet(sm.hoveredWorkspace);
+            let unchanged = !force
+                && optEqBy(cellGet(sm.cachedDark), Some(dark), (a, b) -> a == b)
+                && optEqBy(cellGet(sm.cachedHover), hov, eqInt);
+            if (!unchanged) {
+                let rendered = renderConfiguredStatus(parts, dark, cellGet(sm.config).statusShowIcon, hov);
+                macos.appkit.nsImageSetAccessibilityDescription(rendered.image, "Talus: " + cellGet(sm.lastSpokenStatus));
+                withId(nsString(""), (ep) -> c_nsSetStrScoped(sm.buttonPtr, objcSel("setTitle:"), ep));
+                withId(rendered.image, (ip) -> c_nsSetImageScoped(sm.buttonPtr, objcSel("setImage:"), ip));
+                msgSendVoid1I64(sm.buttonPtr, objcSel("setImagePosition:"), intToI64(1)); // NSImageOnly
+                cellSet(sm.workspaceHitRects, rendered.workspaceRegions);
+                cellSet(sm.cachedDark, Some(dark));
+                cellSet(sm.cachedHover, hov)
+            } else ()
+        },
+    }
+}
+
+def statusMenuSetHovered(sm: StatusMenu, next: Option Int): Void =
+    if (!optEqBy(cellGet(sm.hoveredWorkspace), next, eqInt)) {
+        cellSet(sm.hoveredWorkspace, next);
+        statusMenuUpdateTooltip(sm);
+        statusMenuRenderCurrentImage(sm, false)
+    } else ()
+
+def statusMenuUpdateNow(sm: StatusMenu): Void = {
+    let trusted = axIsProcessTrusted();
+    msgSendVoid1Bool(sm.axWarningItem, objcSel("setHidden:"), trusted);
+    msgSendVoid1Bool(sm.axSeparator, objcSel("setHidden:"), trusted);
+
+    let cfg = cellGet(sm.config);
+    let m = sm.manager;
+    let fk = match executorFocusKey(m.executor) { Some(k) -> Some(k), None -> cellGet(m.confirmedFocusKey) };
+    let snap = managerCoreStatusSnapshot(m.core, nowSec(), fk);
+    cellSet(m.isVirtualMode, snap.isVirtualMode);
+    cellSet(m.paused, snap.paused);
+    cellSet(m.currentLayoutName, snap.layoutName);
+    cellSet(m.activeWorkspace, snap.activeWorkspace);
+    cellSet(m.workspaceCount, snap.workspaceCount);
+    cellSet(m.activeWindowCount, snap.windowCount);
+
+    let locked = isSessionScreenLocked();
+    let tmplStr = match cfg.statusTemplate { Some(t) -> t, None -> "" };
+    let needsTitle = strContains(tmplStr, "%title%")
+        || strContains(cfg.statusFormat, "{title}")
+        || listLen(cfg.statusCommands) > 0
+        || (match cfg.statusStateFile { Some(p) -> strLen(p) > 0, None -> false });
+    let title = if (trusted && !locked && needsTitle) {
+        let app = nsAppShared();
+        if (msgSendBool0(app, objcSel("isActive"))) {
+            let kw = msgSend0(app, objcSel("keyWindow"));
+            if (ptrIsNull(kw)) "" else fromNSStringPtr(msgSend0(kw, objcSel("title")))
+        } else {
+            match fk {
+                Some(k) -> match mapI64Get(cellGet(m.titlesByKey), k) { Some(t) -> t, None -> "" },
+                None -> "",
+            }
+        }
+    } else "";
+
+    let custom = match cfg.statusTextFile { Some(p) -> readCustomStatus(p), None -> "" };
+    let spaceList: Option (List SpaceEntry) =
+        if (snap.isVirtualMode) Some(snap.virtualSpaceEntries)
+        else {
+            let scrPtr = match snap.focusedScreenId {
+                Some(sid) -> nsScreenForId(sid),
+                None -> msgSend0(objcClass("NSScreen"), objcSel("mainScreen")),
+            };
+            nativeSpacesForScreen(scrPtr)
+        };
+
+    let values = StatusValues {
+        spaces: spaceList,
+        layout: snap.layoutName,
+        title: title,
+        count: snap.windowCount,
+        custom: custom,
+        paused: snap.paused,
+        spaceLabels: cfg.spaceLabels,
+        spaceIcons: cfg.workspaceIcons,
+    };
+
+    let exportObj = StatusExport {
+        spaces: spaceList,
+        layout: values.layout,
+        title: utf8TakeChars(title, 512),
+        count: values.count,
+        paused: values.paused,
+    };
+    let jsonStr = statusExportToJson(exportObj);
+    let cmds = cellGet(sm.commands);
+    statusCommandsSetStateJson(cmds, Some(jsonStr));
+    if (!optEqBy(cellGet(sm.lastStateJson), Some(jsonStr), eqStr)) {
+        cellSet(sm.lastStateJson, Some(jsonStr));
+        statusCommandsStateChanged(cmds, cfg.statusCommands)
+    } else ();
+    match cfg.statusStateFile {
+        Some(path) if (strLen(path) > 0) -> {
+            let dest = expandTilde(path, getEnv("HOME"));
+            if (!optEqBy(cellGet(sm.lastExportJson), Some(jsonStr), eqStr) || !fileExists(dest)) {
+                match writeStatusAtomic0600(jsonStr, dest) {
+                    Ok(_) -> {
+                        cellSet(sm.lastExportJson, Some(jsonStr));
+                        cellSet(sm.reportedExportError, false)
+                    },
+                    Err(err) -> if (!cellGet(sm.reportedExportError)) {
+                        eprintLn("Talus status export failed: " + err);
+                        cellSet(sm.reportedExportError, true)
+                    } else (),
+                }
+            } else ()
+        },
+        _ -> (),
+    };
+
+    let parts = templateStatusParts(cfg, values, (idx) ->
+        match listNthOpt(cfg.statusCommands, idx) {
+            Some(blk) -> statusCommandsValue(cmds, idx, blk),
+            None -> "",
+        }
+    );
+    let spoken = strJoin(listMap(parts, (part: StatusPart) -> {
+        let tok = match part.symbolName {
+            Some(sym) -> match part.workspaceIndex {
+                Some(ws) -> match listNthOpt(cfg.spaceLabels, ws) { Some(l) -> l, None -> sym },
+                None -> sym,
+            },
+            None -> part.text,
+        };
+        if (part.isCurrent) "[" + tok + "]" else tok
+    }), "");
+
+    let dark = nsAppearanceIsDark(sm.buttonPtr);
+    let partsSame = match cellGet(sm.cachedParts) {
+        Some(prev) -> listEqualsBy(prev, parts, (a, b) -> a == b),
+        None -> false,
+    };
+    if (!partsSame
+        || !optEqBy(cellGet(sm.cachedDark), Some(dark), (a, b) -> a == b)
+        || !optEqBy(cellGet(sm.cachedHover), cellGet(sm.hoveredWorkspace), eqInt)) {
+        cellSet(sm.lastSpokenStatus, spoken);
+        cellSet(sm.cachedParts, Some(parts));
+        statusMenuRenderCurrentImage(sm, true);
+        statusMenuUpdateTooltip(sm);
+        match getEnv("TALUS_TRACE_STATUS") {
+            Some(v) if (v == "1") -> eprintLn("status: " + spoken),
+            _ -> (),
+        }
+    } else ()
+}
+
+def gStatusCmdNotifyChan: Chan Int = chanUnbounded()
+
+def startStatusCmdNotifyBridge(): Void = {
+    let ch = gStatusCmdNotifyChan;
+    let _ = spawn(() -> {
+        let running = cellNew(true);
+        while (cellGet(running)) {
+            match chanRecv(ch) {
+                Some(_) -> postMainExecEvent(ExecCustomSignal { tag: kSignalStatusUpdate() }),
+                None -> cellSet(running, false),
+            }
+        }
+    });
+    ()
+}
+
+def statusMenuApplyConfig(sm: StatusMenu, nextCfg: Configuration): Void = {
+    let cur = cellGet(sm.config);
+    let cmdsChanged = !listEqualsBy(cur.statusCommands, nextCfg.statusCommands, (a, b) -> a == b)
+        || !optEqBy(cur.statusStateFile, nextCfg.statusStateFile, eqStr);
+    if (cmdsChanged) {
+        statusCommandsStopAll(cellGet(sm.commands));
+        let nextCmds = statusCommandsNew(nextCfg.statusStateFile, Some(gStatusCmdNotifyChan));
+        cellSet(sm.commands, nextCmds);
+        cellSet(sm.lastStateJson, None)
+    } else ();
+    cellSet(sm.config, nextCfg);
+    cellSet(sm.cachedParts, None);
+    mainLoopUpdateRequest(sm.statusUpdate)
+}
+
+def statusMenuNew(m: Manager, cfg: Configuration, savePath: String): StatusMenu = {
+    let bar = msgSend0(objcClass("NSStatusBar"), objcSel("systemStatusBar"));
+    let itemRaw = c_nsStatusBarItem(bar, objcSel("statusItemWithLength:"), -1.0); // NSVariableStatusItemLength
+    let statusItem = idRetain(itemRaw);
+    let btnPtr = msgSend0(itemRaw, objcSel("button"));
+    let menuRaw = msgSend0(msgSend0(objcClass("NSMenu"), objcSel("alloc")), objcSel("init"));
+    let menuId = idAdopt(menuRaw);
+
+    let retained: Cell (List (Id NSObject)) = cellNew(Nil);
+    let keep = (id: Id NSObject) -> {
+        cellSet(retained, Cons(id, cellGet(retained)));
+        withId(id, (p) -> c_objcSelfMain(p, objcSel("self")))
+    };
+
+    startStatusCmdNotifyBridge();
+    let cmds = statusCommandsNew(cfg.statusStateFile, Some(gStatusCmdNotifyChan));
+
+    // Build menu items
+    let axTgt = makeActionTarget((_) -> {
+        let url = withId(nsString("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"), (sp) ->
+            c_nsUrlWithStr(objcClass("NSURL"), objcSel("URLWithString:"), sp)
+        );
+        if (!ptrIsNull(url)) {
+            let _ = c_nsOpenUrl(msgSend0(objcClass("NSWorkspace"), objcSel("sharedWorkspace")), objcSel("openURL:"), url);
+            ()
+        } else ()
+    });
+    let _ = keep(axTgt);
+    let axItemId = makeMenuItem("⚠️ 授予辅助功能权限…", "", Some(axTgt));
+    let axItemPtr = keep(axItemId);
+    nsMenuAddItem(menuRaw, axItemId);
+    let axSepRaw = msgSend0(objcClass("NSMenuItem"), objcSel("separatorItem"));
+    msgSendVoid1Ptr(menuRaw, objcSel("addItem:"), axSepRaw);
+
+    // 9 virtual workspace items
+    let wsItemsRev: Cell (List Ptr) = cellNew(Nil);
+    let wi = cellNew(0);
+    while (cellGet(wi) < 9) {
+        let idx = cellGet(wi);
+        let wsIdx = idx;
+        let wsTgt = makeActionTarget((_) -> {
+            managerSwitchWorkspace(m, wsIdx);
+            postMainExecEvent(ExecCustomSignal { tag: kSignalStatusUpdate() })
+        });
+        let _ = keep(wsTgt);
+        let mi = makeMenuItem("工作区 " + intToStr(idx + 1), "", Some(wsTgt));
+        let mp = keep(mi);
+        msgSendVoid1I64(mp, objcSel("setTag:"), intToI64(idx));
+        msgSendVoid1Bool(mp, objcSel("setHidden:"), true);
+        nsMenuAddItem(menuRaw, mi);
+        cellSet(wsItemsRev, Cons(mp, cellGet(wsItemsRev)));
+        cellSet(wi, idx + 1)
+    };
+    let wsSepRaw = msgSend0(objcClass("NSMenuItem"), objcSel("separatorItem"));
+    msgSendVoid1Bool(wsSepRaw, objcSel("setHidden:"), true);
+    msgSendVoid1Ptr(menuRaw, objcSel("addItem:"), wsSepRaw);
+
+    let pauseTgt = makeActionTarget((_) -> {
+        let nextP = !cellGet(m.paused);
+        managerSetPaused(m, nextP);
+        if (!nextP) managerRefresh(m, true, None) else ();
+        postMainExecEvent(ExecCustomSignal { tag: kSignalStatusUpdate() })
+    });
+    let _ = keep(pauseTgt);
+    let pauseItemId = makeMenuItem("暂停平铺", "", Some(pauseTgt));
+    let pauseItemPtr = keep(pauseItemId);
+    nsMenuAddItem(menuRaw, pauseItemId);
+    nsMenuAddSeparator(menuRaw);
+
+    let smCell: Cell (Option StatusMenu) = cellNew(None);
+
+    let settingsTgt = makeActionTarget((_) -> match cellGet(smCell) {
+        Some(sm) -> match cellGet(sm.onOpenSettings) { Some(cb) -> cb(), None -> () },
+        None -> (),
+    });
+    let _ = keep(settingsTgt);
+    nsMenuAddItem(menuRaw, makeMenuItem("设置…", ",", Some(settingsTgt)));
+
+    let openFileTgt = makeActionTarget((_) -> match cellGet(smCell) {
+        Some(sm) -> match cellGet(sm.onOpenConfigFile) { Some(cb) -> cb(), None -> () },
+        None -> (),
+    });
+    let _ = keep(openFileTgt);
+    let openFileId = makeMenuItem("打开配置文件…", "", Some(openFileTgt));
+    let openFilePtr = keep(openFileId);
+    nsMenuAddItem(menuRaw, openFileId);
+
+    let reloadTgt = makeActionTarget((_) -> match cellGet(smCell) {
+        Some(sm) -> match cellGet(sm.onReloadConfig) { Some(cb) -> cb(), None -> () },
+        None -> (),
+    });
+    let _ = keep(reloadTgt);
+    nsMenuAddItem(menuRaw, makeMenuItem("重新加载配置", "r", Some(reloadTgt)));
+
+    nsMenuAddSeparator(menuRaw);
+    let quitTgt = makeActionTarget((_) -> match cellGet(smCell) {
+        Some(sm) -> match cellGet(sm.onQuit) { Some(cb) -> cb(), None -> () },
+        None -> (),
+    });
+    let _ = keep(quitTgt);
+    nsMenuAddItem(menuRaw, makeMenuItem("退出 Talus", "q", Some(quitTgt)));
+
+    let upd = mainLoopUpdateNew(kSignalStatusUpdate(), () -> match cellGet(smCell) {
+        Some(sm) -> statusMenuUpdateNow(sm),
+        None -> (),
+    });
+
+    let sm = StatusMenu {
+        manager: m,
+        config: cellNew(cfg),
+        commands: cellNew(cmds),
+        statusItem: statusItem,
+        buttonPtr: btnPtr,
+        menu: menuId,
+        axWarningItem: axItemPtr,
+        axSeparator: axSepRaw,
+        workspaceItems: listRev(cellGet(wsItemsRev)),
+        workspaceSeparator: wsSepRaw,
+        pauseItem: pauseItemPtr,
+        openFileItem: openFilePtr,
+        retainedTargets: retained,
+        lastExportJson: cellNew(None),
+        lastStateJson: cellNew(None),
+        reportedExportError: cellNew(false),
+        cachedParts: cellNew(None),
+        cachedDark: cellNew(None),
+        cachedHover: cellNew(None),
+        lastSpokenStatus: cellNew(""),
+        workspaceHitRects: cellNew(Nil),
+        hoveredWorkspace: cellNew(None),
+        statusUpdate: upd,
+        onOpenSettings: cellNew(None),
+        onOpenConfigFile: cellNew(None),
+        onReloadConfig: cellNew(None),
+        onQuit: cellNew(None),
+        savePathCell: cellNew(savePath),
+    };
+    cellSet(smCell, Some(sm));
+
+    // Menu delegate (menuWillOpen)
+    let menuDel = makeMenuWillOpenDelegate(() -> {
+        let trusted = axIsProcessTrusted();
+        msgSendVoid1Bool(sm.axWarningItem, objcSel("setHidden:"), trusted);
+        msgSendVoid1Bool(sm.axSeparator, objcSel("setHidden:"), trusted);
+        let fk = match executorFocusKey(m.executor) { Some(k) -> Some(k), None -> cellGet(m.confirmedFocusKey) };
+        let snap = managerCoreStatusSnapshot(m.core, nowSec(), fk);
+        let curCfg = cellGet(sm.config);
+        if (snap.isVirtualMode) {
+            let i = cellNew(0);
+            let cw = cellNew(sm.workspaceItems);
+            while (match cellGet(cw) { Nil -> false, _ -> true }) {
+                match cellGet(cw) {
+                    Cons(wp, rw) -> {
+                        let idx = cellGet(i);
+                        if (idx < snap.workspaceCount) {
+                            let lbl = match listNthOpt(curCfg.spaceLabels, idx) { Some(l) -> " · " + l, None -> "" };
+                            let wc = match listNthOpt(snap.virtualSpaceEntries, idx) {
+                                Some(e) -> match e.windowCount { Some(c) -> c, None -> 0 },
+                                None -> 0,
+                            };
+                            let suf = if (wc > 0) "  (" + intToStr(wc) + ")" else "";
+                            let title = "工作区 " + intToStr(idx + 1) + lbl + suf;
+                            withId(nsString(title), (tp) -> c_nsSetStrScoped(wp, objcSel("setTitle:"), tp));
+                            msgSendVoid1I64(wp, objcSel("setState:"), if (idx == snap.activeWorkspace) intToI64(1) else intToI64(0));
+                            msgSendVoid1Bool(wp, objcSel("setHidden:"), false)
+                        } else {
+                            msgSendVoid1Bool(wp, objcSel("setHidden:"), true)
+                        };
+                        cellSet(i, idx + 1);
+                        cellSet(cw, rw)
+                    },
+                    Nil -> (),
+                }
+            };
+            msgSendVoid1Bool(sm.workspaceSeparator, objcSel("setHidden:"), false)
+        } else {
+            let cw = cellNew(sm.workspaceItems);
+            while (match cellGet(cw) { Nil -> false, _ -> true }) {
+                match cellGet(cw) { Cons(wp, rw) -> { msgSendVoid1Bool(wp, objcSel("setHidden:"), true); cellSet(cw, rw) }, Nil -> () }
+            };
+            msgSendVoid1Bool(sm.workspaceSeparator, objcSel("setHidden:"), true)
+        };
+        let pTitle = if (snap.paused) "恢复平铺" else "暂停平铺";
+        withId(nsString(pTitle), (tp) -> c_nsSetStrScoped(sm.pauseItem, objcSel("setTitle:"), tp));
+        let fTitle = "打开配置文件 (" + abbreviatedPath(cellGet(sm.savePathCell)) + ")";
+        withId(nsString(fTitle), (tp) -> c_nsSetStrScoped(sm.openFileItem, objcSel("setTitle:"), tp))
+    });
+    msgSendVoid1Ptr(menuRaw, objcSel("setDelegate:"), keep(menuDel));
+
+    // Configure status bar button, click handler, and hover tracking
+    if (!ptrIsNull(btnPtr)) {
+        let icon = makeStatusIcon();
+        withId(icon, (ip) -> c_nsSetImageScoped(btnPtr, objcSel("setImage:"), ip));
+        msgSendVoid1I64(btnPtr, objcSel("setImagePosition:"), intToI64(1));
+        withId(nsString("Talus"), (tp) -> c_nsSetStrScoped(btnPtr, objcSel("setToolTip:"), tp));
+
+        let clickTgt = makeActionTarget((_) -> {
+            let ev = msgSend0(nsAppShared(), objcSel("currentEvent"));
+            let evType = if (ptrIsNull(ev)) 0 else i64ToInt(msgSendI64_0(ev, objcSel("type")));
+            let evMods = if (ptrIsNull(ev)) intToI64(0) else msgSendI64_0(ev, objcSel("modifierFlags"));
+            // NSEventTypeRightMouseUp == 4; NSEventModifierFlagControl == 1 << 18 (0x40000)
+            let isRight = evType == 4 || ((evMods & intToI64(0x40000)) != intToI64(0));
+            let handledWs = if (!isRight && cellGet(m.isVirtualMode) && !cellGet(m.paused) && axIsProcessTrusted()) {
+                match statusWorkspaceIndexUnderPointer(sm.buttonPtr, cellGet(sm.workspaceHitRects)) {
+                    Some(wsIdx) -> {
+                        managerSwitchWorkspace(m, wsIdx);
+                        mainLoopUpdateRequest(sm.statusUpdate);
+                        true
+                    },
+                    None -> false,
+                }
+            } else false;
+            if (!handledWs) {
+                mainLoopUpdateFlush(sm.statusUpdate);
+                match cellGet(sm.hoveredWorkspace) {
+                    Some(_) -> {
+                        cellSet(sm.hoveredWorkspace, None);
+                        statusMenuUpdateTooltip(sm);
+                        statusMenuRenderCurrentImage(sm, true)
+                    },
+                    None -> (),
+                };
+                msgSendVoid1Bool(sm.buttonPtr, objcSel("highlight:"), true);
+                let bounds = msgSendRect0(sm.buttonPtr, objcSel("bounds"));
+                let _ = c_nsMenuPopUp(menuRaw, objcSel("popUpMenuPositioningItem:atLocation:inView:"), ptrNull(), cgPoint(0.0, bounds.size.h + 5.0), sm.buttonPtr);
+                msgSendVoid1Bool(sm.buttonPtr, objcSel("highlight:"), false)
+            } else ()
+        });
+        let _ = keep(clickTgt);
+        withId(clickTgt, (tp) -> c_nsSetTargetScoped(btnPtr, objcSel("setTarget:"), tp));
+        msgSendVoid1Ptr(btnPtr, objcSel("setAction:"), actionTargetSel());
+        // NSEventMaskLeftMouseUp(1<<2 = 4) | NSEventMaskRightMouseUp(1<<4 = 16) = 20
+        let _ = c_nsButtonSendActionOn(btnPtr, objcSel("sendActionOn:"), intToI64(20));
+
+        // Hover tracking area: mouseEnteredAndExited(1) | mouseMoved(2) | activeAlways(128) | inVisibleRect(512) = 643
+        let tracker = makeHoverTracker(
+            () -> {
+                if (cellGet(m.isVirtualMode) && !cellGet(m.paused) && axIsProcessTrusted()) {
+                    statusMenuSetHovered(sm, statusWorkspaceIndexUnderPointer(sm.buttonPtr, cellGet(sm.workspaceHitRects)))
+                } else {
+                    statusMenuSetHovered(sm, None)
+                }
+            },
+            () -> statusMenuSetHovered(sm, None)
+        );
+        let trackOwner = keep(tracker);
+        let taRaw = msgSend1Rect1I641Ptr1Ptr(
+            msgSend0(objcClass("NSTrackingArea"), objcSel("alloc")),
+            objcSel("initWithRect:options:owner:userInfo:"),
+            cgRect(0.0, 0.0, 0.0, 0.0),
+            intToI64(643),
+            trackOwner,
+            ptrNull()
+        );
+        let taId = idAdopt(taRaw);
+        withId(taId, (tap) -> c_nsAddTrackScoped(btnPtr, objcSel("addTrackingArea:"), tap));
+        let _ = keep(taId);
+        ()
+    } else ();
+    sm
+}
+
+// ---------------------------------------------------------------------------
+// Local pointer monitor custom block (NSEvent * _Nullable (^)(NSEvent *))
+// ---------------------------------------------------------------------------
+
+def localEventMonitorInvoke(blk: Ptr, ev: Ptr): Ptr = {
+    let f: () -> Void = gcHandleGet(objcBlockHandle(blk));
+    f();
+    ev
+}
+
+// ---------------------------------------------------------------------------
+// Clean shutdown callback cell for SIGINT/SIGTERM dispatch_source
+// ---------------------------------------------------------------------------
+
+def gShutdownFn: Cell (Option (() -> Void)) = cellNew(None)
+
+def signalShutdownTramp(_ctx: Ptr): Void = withAutoreleasePool(() -> {
+    match cellGet(gShutdownFn) {
+        Some(f) -> f(),
+        None -> exit(0),
+    }
+})
+
+// ---------------------------------------------------------------------------
+// CLI parsing & entry point
+// ---------------------------------------------------------------------------
+
+def findFlagValue(argv: List String, flag: String): Option String = {
+    let cur = cellNew(argv);
+    let res: Cell (Option String) = cellNew(None);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(a, Cons(v, rest)) if (a == flag) -> { cellSet(res, Some(v)); cellSet(cur, Nil) },
+            Cons(_, rest) -> cellSet(cur, rest),
+            Nil -> (),
+        }
+    };
+    cellGet(res)
+}
+
+def findTabArg(argv: List String): Option SettingsTab = {
+    let cur = cellNew(argv);
+    let res: Cell (Option SettingsTab) = cellNew(None);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(a, rest) if (strStartsWith(a, "--tab=")) -> {
+                cellSet(res, settingsTabFromStr(ptrSliceFromStr(a, 6, strLen(a) - 6)));
+                cellSet(cur, Nil)
+            },
+            Cons(_, rest) -> cellSet(cur, rest),
+            Nil -> (),
+        }
+    };
+    cellGet(res)
+}
+
+def main(): Void = withAutoreleasePool(() -> {
+    let allArgs = args();
+    let cliArgs = match allArgs { Cons(_, rest) -> rest, Nil -> Nil };
+    let progPath = match allArgs { Cons(p, _) -> p, Nil -> "talus" };
+
+    // 0. App icon generator (`--render-icon <out.png>`)
+    match findFlagValue(cliArgs, "--render-icon") {
+        Some(outPng) -> {
+            if (renderAppIconPng(outPng)) exit(0)
+            else { eprintLn("Unable to render app icon to " + outPng); exit(1) }
+        },
+        None -> (),
+    };
+
+    // 1. Offline Settings UI preview renderer (`--render-previews <dir>`)
+    match findFlagValue(cliArgs, "--render-previews") {
+        Some(outDir) -> {
+            let res = resolvePaths();
+            let base = match loadConfigFromPath(res.loadPath) { Ok(c) -> c, Err(_) -> defaultConfig() };
+            let previewCfg = Configuration {
+                modifiers: base.modifiers,
+                workspaceMode: "virtual",
+                workspaceCount: maxInt(5, base.workspaceCount),
+                masterRatio: base.masterRatio,
+                ratioStep: base.ratioStep,
+                masterCount: base.masterCount,
+                outerGap: base.outerGap,
+                innerGap: base.innerGap,
+                ignoreApps: match base.ignoreApps { Nil -> ["com.apple.systempreferences", "com.1password.1password"], xs -> xs },
+                appWorkspaces: match base.appWorkspaces {
+                    Nil -> [("com.apple.Safari", config.WsIndex(2)), ("com.mitchellh.ghostty", config.WsIndex(1))],
+                    xs -> xs,
+                },
+                floatWindows: base.floatWindows,
+                statusFormat: base.statusFormat,
+                statusTemplate: Some("%spaces%  <fc=#80808066>│</fc>  <fc=#14B8A6>%layout%</fc> · %count%"),
+                statusShowIcon: true,
+                workspaceCurrent: "<fc=#FFFFFF,#0F766E> %icon%%fullscreen% </fc>",
+                workspaceOther: " %icon%%fullscreen% ",
+                statusFonts: base.statusFonts,
+                statusFontSize: base.statusFontSize,
+                statusCommands: base.statusCommands,
+                spaceLabels: match base.spaceLabels { Nil -> ["Code", "Web", "Docs", "Chat", "Misc"], xs -> xs },
+                workspaceIcons: match base.workspaceIcons { Nil -> ["terminal", "globe", "doc.text", "bubble.left.and.bubble.right", "square.grid.2x2"], xs -> xs },
+                statusTextFile: base.statusTextFile,
+                statusStateFile: base.statusStateFile,
+            };
+            let ok = renderSettingsPreviews(previewCfg, res, outDir);
+            if (ok) {
+                printLn("Rendered Talus settings previews to " + outDir);
+                exit(0)
+            } else {
+                eprintLn("Failed to render settings previews");
+                exit(1)
+            }
+        },
+        None -> (),
+    };
+
+    let settingsOnly = listContainsBy(cliArgs, "--settings-only", eqStr);
+    let openSettingsOnLaunch = settingsOnly || listContainsBy(cliArgs, "--settings", eqStr);
+    let initialTab = findTabArg(cliArgs);
+
+    let resCell: Cell ConfigResolution = cellNew(resolvePaths());
+    let cfgCell: Cell Configuration = cellNew(match loadConfigFromPath(cellGet(resCell).loadPath) {
+        Ok(c) -> c,
+        Err(err) -> {
+            reportStartupError("Talus 配置读取错误", cellGet(resCell).loadPath + "\n" + err);
+            defaultConfig()
+        },
+    });
+
+    // 2. Standalone `--settings-only` mode
+    if (settingsOnly) {
+        let app = nsAppShared();
+        msgSendVoid1I64(app, objcSel("setActivationPolicy:"), intToI64(0)); // regular
+        let ctrl = settingsControllerNew(cellGet(cfgCell), cellGet(resCell), (updated, _) -> cellSet(cfgCell, updated));
+        setMainExecEventHandler((ev) -> match ev {
+            ExecCustomSignal { tag: t } if (t == kSettingsDebounceSaveSignalTag()) -> vmHandleDebounceSignal(ctrl.viewModel),
+            _ -> (),
+        });
+        match initialTab { Some(t) -> cellSet(ctrl.viewModel.selectedTab, t), None -> () };
+        cellSet(ctrl.onClose, Some(() -> msgSendVoid1Ptr(app, objcSel("terminate:"), ptrNull())));
+        settingsControllerShow(ctrl);
+        msgSendVoid0(app, objcSel("run"));
+        exit(0)
+    } else ();
+
+    // 3. Single-instance flock (skipped in automated tests)
+    let isAutomatedTest = match getEnv("TALUS_TEST_PID") { Some(_) -> true, None -> false };
+    let supportDir = expandTilde("~/Library/Application Support/Talus", getEnv("HOME"));
+    match mkdirAll(supportDir) {
+        Ok(_) -> (),
+        Err(e) -> reportStartupError("Talus cannot start", "Cannot create " + supportDir + ": " + e),
+    };
+    let lockFdCell = cellNew(-1);
+    if (!isAutomatedTest) {
+        let fd = c_posix_open(supportDir + "/talus.lock", kOCreate() | kORdWr(), 0o600);
+        if (fd < 0) reportStartupError("Talus cannot start", "Cannot open the application lock file.") else ();
+        cellSet(lockFdCell, fd);
+        if (c_posix_flock(fd, kLockEx() | kLockNb()) != 0) {
+            if (openSettingsOnLaunch || isBundleApp()) {
+                let dnc = msgSend0(objcClass("NSDistributedNotificationCenter"), objcSel("defaultCenter"));
+                withId(nsString("local.talus.openSettings"), (np) ->
+                    c_nsDistPost(dnc, objcSel("postNotificationName:object:userInfo:deliverImmediately:"), np, ptrNull(), ptrNull(), true)
+                );
+                exit(0)
+            } else {
+                reportStartupError("Talus is already running", "Use the existing Talus menu bar icon to pause, configure, or quit.")
+            }
+        } else ()
+    } else ();
+
+    // 4. Accessibility check
+    let wasTrustedCell = cellNew(axIsProcessTrustedWithPrompt(!isAutomatedTest));
+    if (isAutomatedTest && !cellGet(wasTrustedCell)) {
+        reportStartupError("Accessibility permission needed", "Allow Talus in System Settings -> Privacy & Security -> Accessibility, then reopen Talus.")
+    } else ();
+
+    let app = nsAppShared();
+    msgSendVoid1I64(app, objcSel("setActivationPolicy:"), intToI64(1)); // accessory (LSUIElement)
+
+    let manager = managerNew(cellGet(cfgCell));
+    cellSet(gManagerRef, Some(manager));
+    let hotkeys = hotkeyRegistryNew();
+    let settingsCtrlCell: Cell (Option SettingsWindowController) = cellNew(None);
+
+    let watchedPathCell = cellNew(cellGet(resCell).loadPath);
+    let watchedMtimeCell = cellNew(match fileMtimeMs(cellGet(resCell).loadPath) { Ok(v) -> v, Err(_) -> intToI64(0) });
+    let lastErrMtimeCell = cellNew(intToI64(-1));
+
+    let statusMenu = statusMenuNew(manager, cellGet(cfgCell), cellGet(resCell).savePath);
+    let reqStatusUpdate = () -> mainLoopUpdateRequest(statusMenu.statusUpdate);
+    cellSet(manager.onStatusChanged, Some(reqStatusUpdate));
+    cellSet(gStatusUpdateCallback, Some(reqStatusUpdate));
+
+    let hotkeysEnabled = !isAutomatedTest || (match getEnv("TALUS_TEST_HOTKEYS") { Some(v) -> v == "1", None -> false });
+
+    let applyLiveConfig = (updated: Configuration, nextRes: ConfigResolution) -> {
+        let prev = cellGet(cfgCell);
+        let hkChanged = !listEqualsBy(updated.modifiers, prev.modifiers, eqStr)
+            || updated.workspaceMode != prev.workspaceMode
+            || updated.workspaceCount != prev.workspaceCount;
+        cellSet(cfgCell, updated);
+        cellSet(resCell, nextRes);
+        cellSet(statusMenu.savePathCell, nextRes.savePath);
+        managerApplyConfig(manager, updated);
+        if (hkChanged && hotkeysEnabled) {
+            hotkeyRegistryApply(hotkeys, updated.modifiers, updated.workspaceMode, updated.workspaceCount)
+        } else ();
+        statusMenuApplyConfig(statusMenu, updated)
+    };
+
+    let openSettingsWindow = () -> {
+        match cellGet(settingsCtrlCell) {
+            Some(existing) -> {
+                match initialTab { Some(t) -> cellSet(existing.viewModel.selectedTab, t), None -> () };
+                settingsControllerShow(existing)
+            },
+            None -> {
+                let ctrl = settingsControllerNew(cellGet(cfgCell), cellGet(resCell), (updated, savedPath) -> {
+                    let nextRes = ConfigResolution { loadPath: savedPath, savePath: savedPath, migratedFromJson: false };
+                    applyLiveConfig(updated, nextRes);
+                    cellSet(watchedPathCell, savedPath);
+                    scheduleDelayedSignal(250, kSignalWatchMtimeRefresh())
+                });
+                match initialTab { Some(t) -> cellSet(ctrl.viewModel.selectedTab, t), None -> () };
+                cellSet(settingsCtrlCell, Some(ctrl));
+                settingsControllerShow(ctrl)
+            },
+        }
+    };
+
+    let reloadFromDisk = (manual: Bool) -> {
+        let nextRes = resolvePaths();
+        let mtime = match fileMtimeMs(nextRes.loadPath) { Ok(v) -> v, Err(_) -> intToI64(0) };
+        let shouldLoad = if (manual) true else {
+            let recentSelfWrite = match cellGet(settingsCtrlCell) {
+                Some(sc) -> (nowMs() - cellGet(sc.viewModel.lastWrittenMs)) < intToI64(1000),
+                None -> false,
+            };
+            if (recentSelfWrite) {
+                cellSet(watchedPathCell, nextRes.loadPath);
+                cellSet(watchedMtimeCell, mtime);
+                false
+            } else {
+                nextRes.loadPath != cellGet(watchedPathCell) || mtime != cellGet(watchedMtimeCell)
+            }
+        };
+        if (shouldLoad) {
+            cellSet(watchedPathCell, nextRes.loadPath);
+            cellSet(watchedMtimeCell, mtime);
+            match loadConfigFromPath(nextRes.loadPath) {
+                Ok(loaded) -> {
+                    if (!(loaded == cellGet(cfgCell)) || !(nextRes == cellGet(resCell)) || manual) {
+                        applyLiveConfig(loaded, nextRes);
+                        match cellGet(settingsCtrlCell) {
+                            Some(sc) -> vmReloadFromExternal(sc.viewModel, loaded, nextRes),
+                            None -> (),
+                        }
+                    } else ()
+                },
+                Err(err) -> if (manual || cellGet(lastErrMtimeCell) != mtime) {
+                    cellSet(lastErrMtimeCell, mtime);
+                    eprintLn("Talus reload failed (" + nextRes.loadPath + "): " + err)
+                } else (),
+            }
+        } else ()
+    };
+
+    let performCleanShutdown = () -> {
+        match cellGet(settingsCtrlCell) { Some(sc) -> vmFlushPendingSave(sc.viewModel), None -> () };
+        managerCoreRecordSessionState(manager.core);
+        managerCoreClose(manager.core);
+        managerRestoreAllParked(manager);
+        statusCommandsStopAll(cellGet(statusMenu.commands));
+        let fd = cellGet(lockFdCell);
+        if (fd >= 0) {
+            let _ = c_posix_close(fd);
+            cellSet(lockFdCell, -1)
+        } else ()
+    };
+
+    let relaunchForFreshTCC = (reason: String, extraEnv: List (String, String)) -> {
+        eprintLn("Talus relaunching for fresh Accessibility audit token (" + reason + ")...");
+        performCleanShutdown();
+        let filteredArgs = listFilter(cliArgs, (a) -> a != "--settings" && a != "--settings-only" && !strStartsWith(a, "--tab="));
+        let cmd = cmdEnvMode(command(progPath, filteredArgs), OverrideEnv(extraEnv));
+        let _ = procSpawn(cmd);
+        exit(0)
+    };
+
+    cellSet(manager.onStaleTCC, Some(() -> {
+        if (!isAutomatedTest) {
+            let nowS = i64ToInt(nowMs() / intToI64(1000));
+            let lastReexec = match getEnv("TALUS_API_DISABLED_REEXEC_AT") {
+                Some(s) -> match parseInt(s) { Ok(v) -> v, Err(_) -> 0 },
+                None -> 0,
+            };
+            if (nowS - lastReexec >= 60) {
+                relaunchForFreshTCC("per-app kAXErrorAPIDisabled while trusted", [("TALUS_API_DISABLED_REEXEC_AT", intToStr(nowS))])
+            } else ()
+        } else ()
+    }));
+
+    cellSet(statusMenu.onOpenSettings, Some(openSettingsWindow));
+    cellSet(statusMenu.onReloadConfig, Some(() -> reloadFromDisk(true)));
+    cellSet(statusMenu.onQuit, Some(() -> {
+        performCleanShutdown();
+        msgSendVoid1Ptr(app, objcSel("terminate:"), ptrNull())
+    }));
+    cellSet(statusMenu.onOpenConfigFile, Some(() -> {
+        let sp = cellGet(resCell).savePath;
+        if (!fileExists(sp)) {
+            let _ = saveConfigToPath(cellGet(cfgCell), sp);
+            cellSet(watchedPathCell, sp);
+            cellSet(watchedMtimeCell, match fileMtimeMs(sp) { Ok(v) -> v, Err(_) -> intToI64(0) })
+        } else ();
+        let url = withId(nsString(sp), (pp) -> c_nsFileUrlWithPath(objcClass("NSURL"), objcSel("fileURLWithPath:"), pp));
+        let ws = msgSend0(objcClass("NSWorkspace"), objcSel("sharedWorkspace"));
+        if (!ptrIsNull(url) && !ptrIsNull(c_nsUrlForAppToOpen(ws, objcSel("URLForApplicationToOpenURL:"), url))) {
+            let _ = c_nsOpenUrl(ws, objcSel("openURL:"), url);
+            ()
+        } else {
+            let _ = procSpawn(command("/usr/bin/open", ["-t", sp]));
+            ()
+        }
+    }));
+
+    // Central main-thread event dispatcher (executor completions + custom signals)
+    setMainExecEventHandler((ev: ExecEvent) -> {
+        if (!executorHandleEvent(manager.executor, ev)) {
+            match ev {
+                ExecCustomSignal { tag: t } ->
+                    if (mainLoopUpdateHandleSignal(statusMenu.statusUpdate, t)) ()
+                    else if (t == kSignalDiscoveryDone()) {
+                        let running = cellNew(true);
+                        while (cellGet(running)) {
+                            match chanTryRecv(gDiscoveryChan) {
+                                Some(batch) -> managerHandleDiscoveryBatch(manager, batch),
+                                None -> cellSet(running, false),
+                            }
+                        }
+                    } else if (t == kSignalScheduledRefresh()) {
+                        cellSet(manager.scheduledRefreshPending, false);
+                        let pids = if (cellGet(manager.pendingFullDiscovery)) None else Some(cellGet(manager.pendingDiscoveryPids));
+                        managerRefresh(manager, false, pids)
+                    } else if (t == kSignalDelayedSpaceRefresh()) {
+                        managerObserveApplications(manager);
+                        managerRefresh(manager, false, None);
+                        reqStatusUpdate()
+                    } else if (t == kSignalDelayedUnlockRefresh()) {
+                        managerObserveApplications(manager);
+                        managerRefresh(manager, true, None);
+                        reqStatusUpdate()
+                    } else if (t == kSignalOpenSettings()) {
+                        openSettingsWindow()
+                    } else if (t == kSignalWatchMtimeRefresh()) {
+                        let p = cellGet(watchedPathCell);
+                        cellSet(watchedMtimeCell, match fileMtimeMs(p) { Ok(v) -> v, Err(_) -> intToI64(0) })
+                    } else if (t == kSettingsDebounceSaveSignalTag()) {
+                        match cellGet(settingsCtrlCell) {
+                            Some(sc) -> vmHandleDebounceSignal(sc.viewModel),
+                            None -> (),
+                        }
+                    } else (),
+                _ -> (),
+            }
+        } else ()
+    });
+
+    // Retain all observer tokens/blocks for lifetime of main()
+    let retainedBlocks: Cell (List ForeignPtr) = cellNew(Nil);
+    let keepBlk = (fp: ForeignPtr) -> { cellSet(retainedBlocks, Cons(fp, cellGet(retainedBlocks))); fp };
+    let mainOpQ = msgSend0(objcClass("NSOperationQueue"), objcSel("mainQueue"));
+
+    // NSApplicationWillTerminateNotification
+    let defNc = msgSend0(objcClass("NSNotificationCenter"), objcSel("defaultCenter"));
+    let termBlk = keepBlk(objcBlock1Ptr((_note) -> performCleanShutdown()));
+    let _ = withId(nsString("NSApplicationWillTerminateNotification"), (np) ->
+        withForeignPtr(termBlk, (bp) -> c_nsNotifAddObs(defNc, objcSel("addObserverForName:object:queue:usingBlock:"), np, ptrNull(), mainOpQ, bp))
+    );
+
+    // DistributedNotificationCenter: local.talus.openSettings & com.apple.screenIsUnlocked
+    let distNc = msgSend0(objcClass("NSDistributedNotificationCenter"), objcSel("defaultCenter"));
+    let openSetBlk = keepBlk(objcBlock1Ptr((_note) -> openSettingsWindow()));
+    let _ = withId(nsString("local.talus.openSettings"), (np) ->
+        withForeignPtr(openSetBlk, (bp) -> c_nsNotifAddObs(distNc, objcSel("addObserverForName:object:queue:usingBlock:"), np, ptrNull(), mainOpQ, bp))
+    );
+    let unlockBlk = keepBlk(objcBlock1Ptr((_note) -> scheduleDelayedSignal(200, kSignalDelayedUnlockRefresh())));
+    let _ = withId(nsString("com.apple.screenIsUnlocked"), (np) ->
+        withForeignPtr(unlockBlk, (bp) -> c_nsNotifAddObs(distNc, objcSel("addObserverForName:object:queue:usingBlock:"), np, ptrNull(), mainOpQ, bp))
+    );
+
+    // NSWorkspace notifications
+    let wsNc = msgSend0(msgSend0(objcClass("NSWorkspace"), objcSel("sharedWorkspace")), objcSel("notificationCenter"));
+    let wsNames = [
+        "NSWorkspaceDidLaunchApplicationNotification",
+        "NSWorkspaceDidTerminateApplicationNotification",
+        "NSWorkspaceDidHideApplicationNotification",
+        "NSWorkspaceDidUnhideApplicationNotification",
+        "NSWorkspaceActiveSpaceDidChangeNotification",
+        "NSWorkspaceScreensDidWakeNotification",
+    ];
+    let cwn = cellNew(wsNames);
+    while (match cellGet(cwn) { Nil -> false, _ -> true }) {
+        match cellGet(cwn) {
+            Cons(nName, rn) -> {
+                let isDelayed = nName == "NSWorkspaceActiveSpaceDidChangeNotification" || nName == "NSWorkspaceScreensDidWakeNotification";
+                let blk = keepBlk(objcBlock1Ptr((note) -> {
+                    managerObserveApplications(manager);
+                    let ui = msgSend0(note, objcSel("userInfo"));
+                    let appObj = if (ptrIsNull(ui)) ptrNull() else nsDictGet(ui, "NSWorkspaceApplicationKey");
+                    let pidOpt = if (ptrIsNull(appObj)) None else Some(msgSendInt0(appObj, objcSel("processIdentifier")));
+                    managerScheduleRefresh(manager, pidOpt);
+                    reqStatusUpdate();
+                    if (isDelayed) scheduleDelayedSignal(400, kSignalDelayedSpaceRefresh()) else ()
+                }));
+                let _ = withId(nsString(nName), (np) ->
+                    withForeignPtr(blk, (bp) -> c_nsNotifAddObs(wsNc, objcSel("addObserverForName:object:queue:usingBlock:"), np, ptrNull(), mainOpQ, bp))
+                );
+                cellSet(cwn, rn)
+            },
+            Nil -> (),
+        }
+    };
+
+    let actBlk = keepBlk(objcBlock1Ptr((note) -> {
+        let ui = msgSend0(note, objcSel("userInfo"));
+        let appObj = if (ptrIsNull(ui)) ptrNull() else nsDictGet(ui, "NSWorkspaceApplicationKey");
+        if (!ptrIsNull(appObj)) managerHandleAppActivated(manager, appObj) else ();
+        reqStatusUpdate()
+    }));
+    let _ = withId(nsString("NSWorkspaceDidActivateApplicationNotification"), (np) ->
+        withForeignPtr(actBlk, (bp) -> c_nsNotifAddObs(wsNc, objcSel("addObserverForName:object:queue:usingBlock:"), np, ptrNull(), mainOpQ, bp))
+    );
+
+    // Global & local pointer monitors: leftMouseDown(1<<1=2) | rightMouseDown(1<<3=8) | otherMouseDown(1<<25=33554432)
+    let ptrMask = intToI64(2 | 8 | 0x0200_0000);
+    let globalPtrBlk = keepBlk(objcBlock1Ptr((_ev) -> managerNotePointerIntent(manager)));
+    let _ = withForeignPtr(globalPtrBlk, (bp) -> c_nsEventAddGlobal(objcClass("NSEvent"), objcSel("addGlobalMonitorForEventsMatchingMask:handler:"), ptrMask, bp));
+    let localPtrBlk = keepBlk(objcBlockCustom(cFnPtr(localEventMonitorInvoke), gcHandleNew(() -> managerNotePointerIntent(manager))));
+    let _ = withForeignPtr(localPtrBlk, (bp) -> c_nsEventAddLocal(objcClass("NSEvent"), objcSel("addLocalMonitorForEventsMatchingMask:handler:"), ptrMask, bp));
+
+    // Carbon hotkeys
+    installCarbonHotkeyHandler();
+    if (hotkeysEnabled) {
+        let curCfg = cellGet(cfgCell);
+        hotkeyRegistryApply(hotkeys, curCfg.modifiers, curCfg.workspaceMode, curCfg.workspaceCount)
+    } else ();
+
+    // 2s periodic timer: reconciliation, TCC grant detection, external dotfile hot-reload
+    let timerTgt = makeActionTarget((_) -> {
+        let nowTrusted = axIsProcessTrusted();
+        if (nowTrusted && !cellGet(wasTrustedCell)) {
+            if (!isAutomatedTest) {
+                relaunchForFreshTCC("Accessibility permission granted", Nil)
+            } else ();
+            cellSet(wasTrustedCell, true);
+            managerObserveApplications(manager);
+            managerRefresh(manager, true, None)
+        } else {
+            cellSet(wasTrustedCell, nowTrusted);
+            managerObserveApplications(manager);
+            managerRefresh(manager, false, None)
+        };
+        reloadFromDisk(false);
+        reqStatusUpdate()
+    });
+    let _ = withId(timerTgt, (tp) ->
+        c_nsTimerSched(objcClass("NSTimer"), objcSel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"), 2.0, tp, actionTargetSel(), ptrNull(), true)
+    );
+
+    // SIGINT & SIGTERM clean shutdown via libdispatch signal sources
+    cellSet(gShutdownFn, Some(() -> {
+        performCleanShutdown();
+        exit(0)
+    }));
+    let _ = c_posix_signal(kSigInt(), sigIgnPtr());
+    let _ = c_posix_signal(kSigTerm(), sigIgnPtr());
+    let sigType = dispatchSourceTypeSignal();
+    let mainQ = dispatchMainQueue();
+    let sigIntSrc = c_dispatch_source_create(sigType, intToI64(kSigInt()), intToI64(0), mainQ);
+    let sigTermSrc = c_dispatch_source_create(sigType, intToI64(kSigTerm()), intToI64(0), mainQ);
+    c_dispatch_source_set_event_handler_f(sigIntSrc, cFnPtr(signalShutdownTramp));
+    c_dispatch_source_set_event_handler_f(sigTermSrc, cFnPtr(signalShutdownTramp));
+    c_dispatch_resume(sigIntSrc);
+    c_dispatch_resume(sigTermSrc);
+
+    // Kick off initial status render, window discovery, and optional Settings window
+    statusMenuUpdateNow(statusMenu);
+    let startCfg = cellGet(cfgCell);
+    printLn("Running (" + startCfg.workspaceMode + " mode). " + strJoin(startCfg.modifiers, "+") + "+P pauses; Control-C quits.");
+    if (cellGet(wasTrustedCell)) {
+        managerObserveApplications(manager);
+        managerRefresh(manager, true, None)
+    } else ();
+    if (openSettingsOnLaunch) {
+        postMainExecEvent(ExecCustomSignal { tag: kSignalOpenSettings() })
+    } else ();
+
+    msgSendVoid0(app, objcSel("run"));
+    performCleanShutdown()
+})

@@ -1,0 +1,1413 @@
+/// Configuration model, TOML/JSON decoding, validation, path resolution,
+/// and comment-preserving TOML persistence via `std.toml.patch`.
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listLen, listRev, listAppend, listMap, listFilter, listAny, listAll}
+use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
+use std.str.{
+    intToStr, i64ToStr, floatToStr, parseInt, strStartsWith, strEndsWith,
+    strTrim, strSplitChar, strJoin
+}
+use std.math.{abs}
+use std.codec.{Value, VNull, VBool, VInt, VFloat, VStr, VArr, VObj}
+use std.toml.{parse as tomlParse, stringify as tomlStringify, patch as tomlPatch}
+use std.json.{parse as jsonParse, stringify as jsonStringify}
+use std.path.{pathDirname}
+use sys.fs.{fileExists, readFile, writeFileAtomic, mkdirAll}
+use sys.env.{getEnv}
+use util.{
+    roundFloat, roundToInt, isFiniteFloat, i64ToFloat, strToLowerAscii,
+    strContainsAsciiCI, strTrimEndSlash, utf8CharCount, utf8Codepoints,
+    isAsciiAlpha, isAsciiAlnum, listContainsBy, listIndexOfBy, listSortBy,
+    strLessEq, listNthOpt, listEqualsBy, optEqBy, floatNear
+}
+
+pub data ConfigResolution {
+    loadPath: String,
+    savePath: String,
+    migratedFromJson: Bool,
+}
+
+pub instance Eq ConfigResolution {
+    def eq(a: ConfigResolution, b: ConfigResolution): Bool =
+        a.loadPath == b.loadPath && a.savePath == b.savePath && a.migratedFromJson == b.migratedFromJson
+}
+
+pub data WorkspaceTarget {
+    WsIndex(Int),
+    WsLabel(String),
+}
+
+pub instance Eq WorkspaceTarget {
+    def eq(a: WorkspaceTarget, b: WorkspaceTarget): Bool = match (a, b) {
+        (WsIndex(x), WsIndex(y)) -> x == y,
+        (WsLabel(x), WsLabel(y)) -> x == y,
+        _ -> false,
+    }
+}
+
+pub def resolveWorkspaceTarget(
+    target: WorkspaceTarget,
+    workspaceCount: Int,
+    spaceLabels: List String
+): Option Int = match target {
+    WsIndex(n) ->
+        if (n >= 1 && n <= workspaceCount) Some(n - 1)
+        else None,
+    WsLabel(name) ->
+        match listIndexOfBy(spaceLabels, (s) -> s == name) {
+            Some(idx) if (idx < workspaceCount) -> Some(idx),
+            _ -> match parseInt(name) {
+                Ok(n) if (n >= 1 && n <= workspaceCount) -> Some(n - 1),
+                _ -> None,
+            },
+        },
+}
+
+pub data FloatWindowRule {
+    app: String,
+    titles: Option (List String),
+    exceptTitles: Option (List String),
+}
+
+pub instance Eq FloatWindowRule {
+    def eq(a: FloatWindowRule, b: FloatWindowRule): Bool =
+        a.app == b.app
+        && optEqBy(a.titles, b.titles, (x, y) -> listEqualsBy(x, y, (s1, s2) -> s1 == s2))
+        && optEqBy(a.exceptTitles, b.exceptTitles, (x, y) -> listEqualsBy(x, y, (s1, s2) -> s1 == s2))
+}
+
+def cpToLowerAscii(cp: Int): Int =
+    if (cp >= 65 && cp <= 90) cp + 32 else cp
+
+def matchesGlob(text: String, pattern: String): Bool = {
+    let tList = listMap(utf8Codepoints(text), cpToLowerAscii);
+    let pList = listMap(utf8Codepoints(pattern), cpToLowerAscii);
+    let tLen = listLen(tList);
+    let pLen = listLen(pList);
+    let tArr = arrayNew(if (tLen == 0) 1 else tLen, 0);
+    let pArr = arrayNew(if (pLen == 0) 1 else pLen, 0);
+    let fill = (xs: List Int, arr: MutArray Int) -> {
+        let cur = cellNew(xs);
+        let idx = cellNew(0);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(v, r) -> {
+                    arraySet(arr, cellGet(idx), v);
+                    cellSet(idx, cellGet(idx) + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    };
+    fill(tList, tArr);
+    fill(pList, pArr);
+    let ti = cellNew(0);
+    let pi = cellNew(0);
+    let starIdx = cellNew(-1);
+    let matchIdx = cellNew(0);
+    let ok = cellNew(true);
+    while (cellGet(ti) < tLen && cellGet(ok)) {
+        let p = cellGet(pi);
+        let t = cellGet(ti);
+        if (p < pLen && arrayGet(pArr, p) == arrayGet(tArr, t)) {
+            cellSet(pi, p + 1);
+            cellSet(ti, t + 1)
+        } else if (p < pLen && arrayGet(pArr, p) == 42) {
+            cellSet(starIdx, p);
+            cellSet(matchIdx, t);
+            cellSet(pi, p + 1)
+        } else if (cellGet(starIdx) >= 0) {
+            cellSet(pi, cellGet(starIdx) + 1);
+            cellSet(matchIdx, cellGet(matchIdx) + 1);
+            cellSet(ti, cellGet(matchIdx))
+        } else {
+            cellSet(ok, false)
+        }
+    };
+    if (!cellGet(ok)) false
+    else {
+        while (cellGet(pi) < pLen && arrayGet(pArr, cellGet(pi)) == 42) {
+            cellSet(pi, cellGet(pi) + 1)
+        };
+        cellGet(pi) == pLen
+    }
+}
+
+def hasStarByte(s: String): Bool = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    let found = cellNew(false);
+    while (cellGet(i) < n && !cellGet(found)) {
+        if (strByteAt(s, cellGet(i)) == 42) cellSet(found, true) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+def matchesGlobOrExact(text: String, pattern: String): Bool =
+    if (hasStarByte(pattern)) matchesGlob(text, pattern)
+    else text == pattern
+
+pub def floatRuleMatches(rule: FloatWindowRule, bundleId: Option String, windowTitle: String): Bool =
+    match bundleId {
+        None -> false,
+        Some(bundle) ->
+            if (bundle != rule.app) false
+            else {
+                let normTitle = strTrim(windowTitle);
+                let excluded = match rule.exceptTitles {
+                    Some(excepts) if (listLen(excepts) > 0) ->
+                        listAny(excepts, (ex) -> matchesGlobOrExact(normTitle, strTrim(ex))),
+                    _ -> false,
+                };
+                if (excluded) false
+                else match rule.titles {
+                    Some(titles) if (listLen(titles) > 0) ->
+                        listAny(titles, (pat) -> {
+                            let p = strTrim(pat);
+                            if (hasStarByte(p)) matchesGlob(normTitle, p)
+                            else if (strLen(p) == 0) strLen(normTitle) == 0
+                            else strContainsAsciiCI(normTitle, p)
+                        }),
+                    _ -> true,
+                }
+            },
+    }
+
+pub data StatusCommand {
+    name: String,
+    executable: String,
+    arguments: Option (List String),
+    interval: Option Float,
+    timeout: Option Float,
+    markup: Option Bool,
+    onChange: Option Bool,
+}
+
+pub instance Eq StatusCommand {
+    def eq(a: StatusCommand, b: StatusCommand): Bool =
+        a.name == b.name
+        && a.executable == b.executable
+        && optEqBy(a.arguments, b.arguments, (x, y) -> listEqualsBy(x, y, (s1, s2) -> s1 == s2))
+        && optEqBy(a.interval, b.interval, (x, y) -> x == y)
+        && optEqBy(a.timeout, b.timeout, (x, y) -> x == y)
+        && optEqBy(a.markup, b.markup, (x, y) -> x == y)
+        && optEqBy(a.onChange, b.onChange, (x, y) -> x == y)
+}
+
+def isReservedCommandName(name: String): Bool =
+    name == "spaces" || name == "layout" || name == "title" || name == "count"
+    || name == "custom" || name == "label" || name == "index"
+    || name == "fullscreen" || name == "occupied" || name == "icon"
+
+def isValidCommandName(name: String): Bool = {
+    let n = strLen(name);
+    if (n == 0 || n > 32) false
+    else if (!isAsciiAlpha(strByteAt(name, 0))) false
+    else {
+        let i = cellNew(1);
+        let ok = cellNew(true);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let b = strByteAt(name, cellGet(i));
+            if (!(isAsciiAlnum(b) || b == 95 || b == 45)) cellSet(ok, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok) && !isReservedCommandName(name)
+    }
+}
+
+pub def validateStatusCommand(cmd: StatusCommand): Result Void String = {
+    let errMsg = "invalid status command: check name, executable, arguments, interval and timeout";
+    if (!isValidCommandName(cmd.name)) Err(errMsg)
+    else if (!strStartsWith(cmd.executable, "/") || strLen(cmd.executable) > 1024) Err(errMsg)
+    else {
+        let argsBad = match cmd.arguments {
+            Some(args) -> listLen(args) > 32 || listAny(args, (a) -> strLen(a) > 1024),
+            None -> false,
+        };
+        if (argsBad) Err(errMsg)
+        else {
+            let interval = match cmd.interval { Some(v) -> v, None -> 10.0 };
+            let timeout = match cmd.timeout { Some(v) -> v, None -> 2.0 };
+            if (!isFiniteFloat(interval) || interval < 1.0 || interval > 3600.0
+                || !isFiniteFloat(timeout) || timeout < 0.1 || timeout > 10.0) Err(errMsg)
+            else Ok(())
+        }
+    }
+}
+
+pub data Configuration {
+    modifiers: List String,
+    workspaceMode: String,
+    workspaceCount: Int,
+    masterRatio: Float,
+    ratioStep: Float,
+    masterCount: Int,
+    outerGap: Float,
+    innerGap: Float,
+    ignoreApps: List String,
+    /// Sorted list of `(bundleId, WorkspaceTarget)` entries (canonical BTreeMap order).
+    appWorkspaces: List (String, WorkspaceTarget),
+    floatWindows: List FloatWindowRule,
+    statusFormat: String,
+    statusTemplate: Option String,
+    statusShowIcon: Bool,
+    workspaceCurrent: String,
+    workspaceOther: String,
+    statusFonts: List String,
+    statusFontSize: Float,
+    statusCommands: List StatusCommand,
+    spaceLabels: List String,
+    workspaceIcons: List String,
+    statusTextFile: Option String,
+    statusStateFile: Option String,
+}
+
+pub instance Eq Configuration {
+    def eq(a: Configuration, b: Configuration): Bool =
+        listEqualsBy(a.modifiers, b.modifiers, (x, y) -> x == y)
+        && a.workspaceMode == b.workspaceMode
+        && a.workspaceCount == b.workspaceCount
+        && a.masterRatio == b.masterRatio
+        && a.ratioStep == b.ratioStep
+        && a.masterCount == b.masterCount
+        && a.outerGap == b.outerGap
+        && a.innerGap == b.innerGap
+        && listEqualsBy(a.ignoreApps, b.ignoreApps, (x, y) -> x == y)
+        && listEqualsBy(a.appWorkspaces, b.appWorkspaces, (p1, p2) -> {
+            let (k1, v1) = p1;
+            let (k2, v2) = p2;
+            k1 == k2 && v1 == v2
+        })
+        && listEqualsBy(a.floatWindows, b.floatWindows, (x, y) -> x == y)
+        && a.statusFormat == b.statusFormat
+        && optEqBy(a.statusTemplate, b.statusTemplate, (x, y) -> x == y)
+        && a.statusShowIcon == b.statusShowIcon
+        && a.workspaceCurrent == b.workspaceCurrent
+        && a.workspaceOther == b.workspaceOther
+        && listEqualsBy(a.statusFonts, b.statusFonts, (x, y) -> x == y)
+        && a.statusFontSize == b.statusFontSize
+        && listEqualsBy(a.statusCommands, b.statusCommands, (x, y) -> x == y)
+        && listEqualsBy(a.spaceLabels, b.spaceLabels, (x, y) -> x == y)
+        && listEqualsBy(a.workspaceIcons, b.workspaceIcons, (x, y) -> x == y)
+        && optEqBy(a.statusTextFile, b.statusTextFile, (x, y) -> x == y)
+        && optEqBy(a.statusStateFile, b.statusStateFile, (x, y) -> x == y)
+}
+
+pub def defaultConfig(): Configuration = Configuration {
+    modifiers: ["control", "option"],
+    workspaceMode: "native",
+    workspaceCount: 5,
+    masterRatio: 0.5,
+    ratioStep: 0.03,
+    masterCount: 1,
+    outerGap: 0.0,
+    innerGap: 0.0,
+    ignoreApps: Nil,
+    appWorkspaces: Nil,
+    floatWindows: Nil,
+    statusFormat: "{spaces}  {layout}",
+    statusTemplate: None,
+    statusShowIcon: true,
+    workspaceCurrent: "<fc=#10201E,#89CFC2> %label%%fullscreen% </fc>",
+    workspaceOther: "%label%%fullscreen%",
+    statusFonts: Nil,
+    statusFontSize: 11.5,
+    statusCommands: Nil,
+    spaceLabels: Nil,
+    workspaceIcons: Nil,
+    statusTextFile: None,
+    statusStateFile: None,
+}
+
+pub def sortAppWorkspaces(entries: List (String, WorkspaceTarget)): List (String, WorkspaceTarget) =
+    listSortBy(entries, (a, b) -> {
+        let (ka, _) = a;
+        let (kb, _) = b;
+        strLessEq(ka, kb)
+    })
+
+pub def lookupAppWorkspace(entries: List (String, WorkspaceTarget), bundle: String): Option WorkspaceTarget = {
+    let cur = cellNew(entries);
+    let res: Cell (Option WorkspaceTarget) = cellNew(None);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match cellGet(cur) {
+            Nil -> cellSet(running, false),
+            Cons((k, v), r) ->
+                if (k == bundle) { cellSet(res, Some(v)); cellSet(running, false) }
+                else cellSet(cur, r),
+        }
+    };
+    cellGet(res)
+}
+
+pub def upsertAppWorkspace(
+    entries: List (String, WorkspaceTarget),
+    bundle: String,
+    target: WorkspaceTarget
+): List (String, WorkspaceTarget) = {
+    let filtered = listFilter(entries, (p) -> { let (k, _) = p; k != bundle });
+    sortAppWorkspaces(Cons((bundle, target), filtered))
+}
+
+pub def removeAppWorkspaceEntry(
+    entries: List (String, WorkspaceTarget),
+    bundle: String
+): List (String, WorkspaceTarget) =
+    listFilter(entries, (p) -> { let (k, _) = p; k != bundle })
+
+pub def expandTilde(path: String, homeDirOpt: Option String): String =
+    if (path == "~" || strStartsWith(path, "~/")) {
+        let home = match homeDirOpt {
+            Some(h) -> h,
+            None -> match getEnv("HOME") { Some(h) -> h, None -> "" },
+        };
+        if (strLen(home) == 0) path
+        else if (path == "~") home
+        else strTrimEndSlash(home) + ptrSliceFromStr(path, 1, strLen(path) - 1)
+    } else path
+
+pub def abbreviatedPath(path: String): String = {
+    let home = match getEnv("HOME") { Some(h) -> strTrimEndSlash(h), None -> "" };
+    if (strLen(home) > 0 && strStartsWith(path, home + "/")) {
+        "~" + ptrSliceFromStr(path, strLen(home), strLen(path) - strLen(home))
+    } else path
+}
+
+def normalizeLexicalPath(path: String): String = {
+    let expanded = expandTilde(path, None);
+    let isAbs = strStartsWith(expanded, "/");
+    let comps = strSplitChar(expanded, '/');
+    let stack: Cell (List String) = cellNew(Nil);
+    let cur = cellNew(comps);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(c, r) -> {
+                if (c == "" || c == ".") ()
+                else if (c == "..") {
+                    match cellGet(stack) {
+                        Cons(_, rest) -> cellSet(stack, rest),
+                        Nil -> (),
+                    }
+                } else {
+                    cellSet(stack, Cons(c, cellGet(stack)))
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    let joined = strJoin(listRev(cellGet(stack)), "/");
+    if (isAbs) "/" + joined else joined
+}
+
+def isAllowedModifier(m: String): Bool =
+    m == "control" || m == "option" || m == "command"
+
+def hasDuplicateStrings(xs: List String): Bool = {
+    let seen: Cell (List String) = cellNew(Nil);
+    let cur = cellNew(xs);
+    let dup = cellNew(false);
+    while (match cellGet(cur) { Nil -> false, _ -> !cellGet(dup) }) {
+        match cellGet(cur) {
+            Cons(h, t) -> {
+                if (listContainsBy(cellGet(seen), h, (a, b) -> a == b)) cellSet(dup, true)
+                else cellSet(seen, Cons(h, cellGet(seen)));
+                cellSet(cur, t)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(dup)
+}
+
+pub def validateConfig(cfg: Configuration): Result Void String = {
+    if (listLen(cfg.modifiers) == 0 || hasDuplicateStrings(cfg.modifiers) || !listAll(cfg.modifiers, isAllowedModifier)) {
+        Err("modifiers must be distinct control, option or command names")
+    } else if (cfg.workspaceMode != "native" && cfg.workspaceMode != "virtual") {
+        Err("workspaceMode must be 'native' or 'virtual'")
+    } else if (cfg.workspaceCount < 1 || cfg.workspaceCount > 9) {
+        Err("workspaceCount must be between 1 and 9")
+    } else if (listLen(cfg.appWorkspaces) > 64 || listAny(cfg.appWorkspaces, (entry) -> {
+        let (bundle, target) = entry;
+        let trimmed = strTrim(bundle);
+        if (strLen(trimmed) == 0 || bundle != trimmed || utf8CharCount(bundle) > 200) true
+        else match target {
+            WsIndex(n) -> n < 1 || n > 9,
+            WsLabel(s) -> strLen(s) == 0 || utf8CharCount(s) > 16,
+        }
+    })) {
+        Err("appWorkspaces entries must map non-empty bundle IDs to workspace 1..9 or a valid label")
+    } else if (listLen(cfg.floatWindows) > 64 || listAny(cfg.floatWindows, (rule: FloatWindowRule) -> {
+        let ta = strTrim(rule.app);
+        let badApp = strLen(ta) == 0 || rule.app != ta || utf8CharCount(rule.app) > 200;
+        let badTitles = match rule.titles {
+            Some(ts) -> listLen(ts) > 32 || listAny(ts, (t) -> utf8CharCount(t) > 200),
+            None -> false,
+        };
+        let badExcepts = match rule.exceptTitles {
+            Some(ts) -> listLen(ts) > 32 || listAny(ts, (t) -> utf8CharCount(t) > 200),
+            None -> false,
+        };
+        badApp || badTitles || badExcepts
+    })) {
+        Err("floatWindows entries must specify a non-empty app bundle ID and at most 32 title patterns")
+    } else if (!isFiniteFloat(cfg.masterRatio) || cfg.masterRatio < 0.2 || cfg.masterRatio > 0.8) {
+        Err("masterRatio must be between 0.2 and 0.8")
+    } else if (!isFiniteFloat(cfg.ratioStep) || cfg.ratioStep <= 0.0 || cfg.ratioStep > 0.2) {
+        Err("ratioStep must be greater than 0 and at most 0.2")
+    } else {
+        let cmdNames = listMap(cfg.statusCommands, (c: StatusCommand) -> c.name);
+        let tmplLen = match cfg.statusTemplate { Some(s) -> utf8CharCount(s), None -> 0 };
+        let validStatus =
+            listLen(cfg.spaceLabels) <= 32
+            && listAll(cfg.spaceLabels, (s) -> strLen(s) > 0 && utf8CharCount(s) <= 16)
+            && listLen(cfg.workspaceIcons) <= 32
+            && listAll(cfg.workspaceIcons, (s) -> strLen(s) > 0 && utf8CharCount(s) <= 64)
+            && tmplLen <= 1024
+            && utf8CharCount(cfg.workspaceCurrent) <= 512
+            && utf8CharCount(cfg.workspaceOther) <= 512
+            && listLen(cfg.statusFonts) <= 16
+            && listAll(cfg.statusFonts, (s) -> strLen(s) > 0 && utf8CharCount(s) <= 100)
+            && isFiniteFloat(cfg.statusFontSize)
+            && cfg.statusFontSize >= 8.0 && cfg.statusFontSize <= 14.0
+            && listLen(cfg.statusCommands) <= 16
+            && !hasDuplicateStrings(cmdNames)
+            && utf8CharCount(cfg.statusFormat) <= 160;
+        if (!validStatus) {
+            Err("invalid status template, workspace format, labels or fonts")
+        } else {
+            let cmdErr: Cell (Option String) = cellNew(None);
+            let cur = cellNew(cfg.statusCommands);
+            while (match cellGet(cur) { Nil -> false, _ -> match cellGet(cmdErr) { None -> true, Some(_) -> false } }) {
+                match cellGet(cur) {
+                    Cons(c, r) -> {
+                        match validateStatusCommand(c) {
+                            Ok(_) -> (),
+                            Err(e) -> cellSet(cmdErr, Some(e)),
+                        };
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            match cellGet(cmdErr) {
+                Some(e) -> Err(e),
+                None -> {
+                    let conflict = match (cfg.statusTextFile, cfg.statusStateFile) {
+                        (Some(inp), Some(outp)) if (strLen(inp) > 0 && strLen(outp) > 0) ->
+                            normalizeLexicalPath(inp) == normalizeLexicalPath(outp),
+                        _ -> false,
+                    };
+                    if (conflict) Err("statusTextFile and statusStateFile must be different files")
+                    else if (cfg.masterCount < 1 || cfg.masterCount > 20) Err("masterCount must be between 1 and 20")
+                    else if (!isFiniteFloat(cfg.outerGap) || !isFiniteFloat(cfg.innerGap)
+                        || cfg.outerGap < 0.0 || cfg.outerGap > 64.0
+                        || cfg.innerGap < 0.0 || cfg.innerGap > 64.0) Err("outerGap and innerGap must be between 0 and 64")
+                    else Ok(())
+                },
+            }
+        }
+    }
+}
+
+pub def resolvePathsWith(
+    homeDirectory: String,
+    talusConfigEnv: Option String,
+    existsFn: String -> Bool
+): ConfigResolution = {
+    let envCustom = match talusConfigEnv {
+        Some(custom) if (strLen(custom) > 0) -> Some(expandTilde(custom, Some(homeDirectory))),
+        _ -> None,
+    };
+    match envCustom {
+        Some(expanded) -> ConfigResolution {
+            loadPath: expanded,
+            savePath: expanded,
+            migratedFromJson: false,
+        },
+        None -> {
+            let home = strTrimEndSlash(homeDirectory);
+            let dotfile = home + "/.talus.toml";
+            let xdg = home + "/.config/talus/config.toml";
+            let supportToml = home + "/Library/Application Support/Talus/config.toml";
+            let supportJson = home + "/Library/Application Support/Talus/config.json";
+            if (existsFn(dotfile)) {
+                ConfigResolution { loadPath: dotfile, savePath: dotfile, migratedFromJson: false }
+            } else if (existsFn(xdg)) {
+                ConfigResolution { loadPath: xdg, savePath: xdg, migratedFromJson: false }
+            } else if (existsFn(supportToml)) {
+                ConfigResolution { loadPath: supportToml, savePath: supportToml, migratedFromJson: false }
+            } else if (existsFn(supportJson)) {
+                ConfigResolution { loadPath: supportJson, savePath: dotfile, migratedFromJson: true }
+            } else {
+                ConfigResolution { loadPath: dotfile, savePath: dotfile, migratedFromJson: false }
+            }
+        },
+    }
+}
+
+pub def resolvePaths(): ConfigResolution = {
+    let home = match getEnv("HOME") { Some(h) -> h, None -> "" };
+    resolvePathsWith(home, getEnv("TALUS_CONFIG"), fileExists)
+}
+
+// ---- Value decoding helpers (shared by TOML & JSON decoders) ----
+
+def reqString(v: Value, key: String): Result String String = match v {
+    VStr(s) -> Ok(s),
+    _ -> Err("'" + key + "' must be a string"),
+}
+
+def reqBool(v: Value, key: String): Result Bool String = match v {
+    VBool(b) -> Ok(b),
+    _ -> Err("'" + key + "' must be true or false"),
+}
+
+def reqInt(v: Value, key: String): Result Int String = match v {
+    VInt(i) -> Ok(i64ToInt(i)),
+    _ -> Err("'" + key + "' must be an integer"),
+}
+
+def reqDouble(v: Value, key: String): Result Float String = match v {
+    VFloat(f) -> Ok(f),
+    VInt(i) -> Ok(i64ToFloat(i)),
+    _ -> Err("'" + key + "' must be a number"),
+}
+
+def reqStringArray(v: Value, key: String): Result (List String) String = match v {
+    VArr(xs) -> {
+        let outRev: Cell (List String) = cellNew(Nil);
+        let cur = cellNew(xs);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+            match cellGet(cur) {
+                Cons(VStr(s), r) -> {
+                    cellSet(outRev, Cons(s, cellGet(outRev)));
+                    cellSet(cur, r)
+                },
+                Cons(_, _) -> cellSet(errOpt, Some("every item in '" + key + "' must be a string")),
+                Nil -> (),
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(listRev(cellGet(outRev))),
+        }
+    },
+    _ -> Err("'" + key + "' must be an array of strings"),
+}
+
+def parseAppWorkspacesVal(v: Value, key: String): Result (List (String, WorkspaceTarget)) String = match v {
+    VObj(fs) -> {
+        let outRev: Cell (List (String, WorkspaceTarget)) = cellNew(Nil);
+        let cur = cellNew(fs);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+            match cellGet(cur) {
+                Cons((bundle, VInt(n)), r) -> {
+                    cellSet(outRev, Cons((bundle, WsIndex(i64ToInt(n))), cellGet(outRev)));
+                    cellSet(cur, r)
+                },
+                Cons((bundle, VStr(s)), r) -> {
+                    cellSet(outRev, Cons((bundle, WsLabel(s)), cellGet(outRev)));
+                    cellSet(cur, r)
+                },
+                Cons((bundle, _), _) ->
+                    cellSet(errOpt, Some("'" + key + "." + bundle + "' must be an integer (1..9) or workspace label string")),
+                Nil -> (),
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(sortAppWorkspaces(listRev(cellGet(outRev)))),
+        }
+    },
+    _ -> Err("'" + key + "' must be a table mapping bundle IDs to workspace number or name"),
+}
+
+def parseCommandTable(fs: List (String, Value), prefix: String, allowUnknown: Bool): Result StatusCommand String = {
+    let name: Cell (Option String) = cellNew(None);
+    let executable: Cell (Option String) = cellNew(None);
+    let arguments: Cell (Option (List String)) = cellNew(None);
+    let interval: Cell (Option Float) = cellNew(None);
+    let timeout: Cell (Option Float) = cellNew(None);
+    let markup: Cell (Option Bool) = cellNew(None);
+    let onChange: Cell (Option Bool) = cellNew(None);
+    let seenArgs = cellNew(false);
+    let seenOnChange = cellNew(false);
+    let errOpt: Cell (Option String) = cellNew(None);
+    let cur = cellNew(fs);
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons((k, v), r) -> {
+                if (k == "name") {
+                    match reqString(v, prefix + ".name") { Ok(s) -> cellSet(name, Some(s)), Err(e) -> cellSet(errOpt, Some(e)) }
+                } else if (k == "executable") {
+                    match reqString(v, prefix + ".executable") { Ok(s) -> cellSet(executable, Some(s)), Err(e) -> cellSet(errOpt, Some(e)) }
+                } else if (k == "arguments" || k == "args") {
+                    if (cellGet(seenArgs)) cellSet(errOpt, Some("duplicate '" + prefix + "." + k + "'"))
+                    else {
+                        cellSet(seenArgs, true);
+                        match v {
+                            VNull -> (),
+                            _ -> match reqStringArray(v, prefix + "." + k) {
+                                Ok(arr) -> cellSet(arguments, Some(arr)),
+                                Err(e) -> cellSet(errOpt, Some(e)),
+                            },
+                        }
+                    }
+                } else if (k == "interval") {
+                    match v {
+                        VNull -> (),
+                        _ -> match reqDouble(v, prefix + ".interval") { Ok(d) -> cellSet(interval, Some(d)), Err(e) -> cellSet(errOpt, Some(e)) },
+                    }
+                } else if (k == "timeout") {
+                    match v {
+                        VNull -> (),
+                        _ -> match reqDouble(v, prefix + ".timeout") { Ok(d) -> cellSet(timeout, Some(d)), Err(e) -> cellSet(errOpt, Some(e)) },
+                    }
+                } else if (k == "markup") {
+                    match v {
+                        VNull -> (),
+                        _ -> match reqBool(v, prefix + ".markup") { Ok(b) -> cellSet(markup, Some(b)), Err(e) -> cellSet(errOpt, Some(e)) },
+                    }
+                } else if (k == "on_change" || k == "onChange") {
+                    if (cellGet(seenOnChange)) cellSet(errOpt, Some("duplicate '" + prefix + "." + k + "'"))
+                    else {
+                        cellSet(seenOnChange, true);
+                        match v {
+                            VNull -> (),
+                            _ -> match reqBool(v, prefix + "." + k) { Ok(b) -> cellSet(onChange, Some(b)), Err(e) -> cellSet(errOpt, Some(e)) },
+                        }
+                    }
+                } else if (!allowUnknown) {
+                    cellSet(errOpt, Some("unknown command key '" + prefix + "." + k + "'"))
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> match (cellGet(name), cellGet(executable)) {
+            (Some(n), Some(ex)) -> Ok(StatusCommand {
+                name: n,
+                executable: ex,
+                arguments: cellGet(arguments),
+                interval: cellGet(interval),
+                timeout: cellGet(timeout),
+                markup: cellGet(markup),
+                onChange: cellGet(onChange),
+            }),
+            (None, _) -> Err("'" + prefix + "' is missing 'name'"),
+            (_, None) -> Err("'" + prefix + "' is missing 'executable'"),
+        },
+    }
+}
+
+def parseCommandListVal(v: Value, key: String, allowUnknown: Bool): Result (List StatusCommand) String = match v {
+    VArr(items) -> {
+        let outRev: Cell (List StatusCommand) = cellNew(Nil);
+        let cur = cellNew(items);
+        let idx = cellNew(0);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+            match cellGet(cur) {
+                Cons(VObj(fs), r) -> {
+                    match parseCommandTable(fs, key + "[" + intToStr(cellGet(idx)) + "]", allowUnknown) {
+                        Ok(cmd) -> cellSet(outRev, Cons(cmd, cellGet(outRev))),
+                        Err(e) -> cellSet(errOpt, Some(e)),
+                    };
+                    cellSet(idx, cellGet(idx) + 1);
+                    cellSet(cur, r)
+                },
+                Cons(_, _) -> cellSet(errOpt, Some("'" + key + "[" + intToStr(cellGet(idx)) + "]' entry must be a table")),
+                Nil -> (),
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(listRev(cellGet(outRev))),
+        }
+    },
+    _ -> Err("'" + key + "' must be an array of tables"),
+}
+
+def parseFloatRuleTable(fs: List (String, Value), prefix: String, allowUnknown: Bool): Result FloatWindowRule String = {
+    let app: Cell (Option String) = cellNew(None);
+    let titles: Cell (Option (List String)) = cellNew(None);
+    let exceptTitles: Cell (Option (List String)) = cellNew(None);
+    let seenApp = cellNew(false);
+    let seenTitles = cellNew(false);
+    let seenExcept = cellNew(false);
+    let errOpt: Cell (Option String) = cellNew(None);
+    let cur = cellNew(fs);
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons((k, v), r) -> {
+                if (k == "app" || k == "bundle_id" || k == "bundleId") {
+                    if (cellGet(seenApp)) cellSet(errOpt, Some("duplicate '" + prefix + "." + k + "'"))
+                    else {
+                        cellSet(seenApp, true);
+                        match reqString(v, prefix + "." + k) { Ok(s) -> cellSet(app, Some(s)), Err(e) -> cellSet(errOpt, Some(e)) }
+                    }
+                } else if (k == "titles") {
+                    if (cellGet(seenTitles)) cellSet(errOpt, Some("duplicate '" + prefix + "." + k + "'"))
+                    else {
+                        cellSet(seenTitles, true);
+                        match v {
+                            VNull -> (),
+                            _ -> match reqStringArray(v, prefix + "." + k) { Ok(ts) -> cellSet(titles, Some(ts)), Err(e) -> cellSet(errOpt, Some(e)) },
+                        }
+                    }
+                } else if (k == "except_titles" || k == "exceptTitles") {
+                    if (cellGet(seenExcept)) cellSet(errOpt, Some("duplicate '" + prefix + "." + k + "'"))
+                    else {
+                        cellSet(seenExcept, true);
+                        match v {
+                            VNull -> (),
+                            _ -> match reqStringArray(v, prefix + "." + k) { Ok(ts) -> cellSet(exceptTitles, Some(ts)), Err(e) -> cellSet(errOpt, Some(e)) },
+                        }
+                    }
+                } else if (!allowUnknown) {
+                    cellSet(errOpt, Some("unknown float rule key '" + prefix + "." + k + "'"))
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> match cellGet(app) {
+            Some(a) -> Ok(FloatWindowRule {
+                app: a,
+                titles: cellGet(titles),
+                exceptTitles: cellGet(exceptTitles),
+            }),
+            None -> Err("'" + prefix + "' is missing 'app'"),
+        },
+    }
+}
+
+def parseFloatRuleListVal(v: Value, key: String, allowUnknown: Bool): Result (List FloatWindowRule) String = match v {
+    VArr(items) -> {
+        let outRev: Cell (List FloatWindowRule) = cellNew(Nil);
+        let cur = cellNew(items);
+        let idx = cellNew(0);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+            match cellGet(cur) {
+                Cons(VObj(fs), r) -> {
+                    match parseFloatRuleTable(fs, key + "[" + intToStr(cellGet(idx)) + "]", allowUnknown) {
+                        Ok(rule) -> cellSet(outRev, Cons(rule, cellGet(outRev))),
+                        Err(e) -> cellSet(errOpt, Some(e)),
+                    };
+                    cellSet(idx, cellGet(idx) + 1);
+                    cellSet(cur, r)
+                },
+                Cons(_, _) -> cellSet(errOpt, Some("'" + key + "[" + intToStr(cellGet(idx)) + "]' entry must be a table")),
+                Nil -> (),
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(listRev(cellGet(outRev))),
+        }
+    },
+    _ -> Err("'" + key + "' must be an array of tables"),
+}
+
+def decodeConfigFromValue(rootVal: Value, allowUnknown: Bool): Result Configuration String = match rootVal {
+    VObj(fs) -> {
+        let d = defaultConfig();
+        let modifiers = cellNew(d.modifiers);
+        let workspaceMode = cellNew(d.workspaceMode);
+        let workspaceCount = cellNew(d.workspaceCount);
+        let masterRatio = cellNew(d.masterRatio);
+        let ratioStep = cellNew(d.ratioStep);
+        let masterCount = cellNew(d.masterCount);
+        let outerGap = cellNew(d.outerGap);
+        let innerGap = cellNew(d.innerGap);
+        let ignoreApps = cellNew(d.ignoreApps);
+        let appWorkspaces = cellNew(d.appWorkspaces);
+        let floatWindows = cellNew(d.floatWindows);
+        let statusFormat = cellNew(d.statusFormat);
+        let statusTemplate = cellNew(d.statusTemplate);
+        let statusShowIcon = cellNew(d.statusShowIcon);
+        let workspaceCurrent = cellNew(d.workspaceCurrent);
+        let workspaceOther = cellNew(d.workspaceOther);
+        let statusFonts = cellNew(d.statusFonts);
+        let statusFontSize = cellNew(d.statusFontSize);
+        let statusCommands = cellNew(d.statusCommands);
+        let spaceLabels = cellNew(d.spaceLabels);
+        let workspaceIcons = cellNew(d.workspaceIcons);
+        let statusTextFile = cellNew(d.statusTextFile);
+        let statusStateFile = cellNew(d.statusStateFile);
+
+        let seen: Cell (List String) = cellNew(Nil);
+        let errOpt: Cell (Option String) = cellNew(None);
+
+        let claim = (canonical: String, label: String) -> {
+            if (listContainsBy(cellGet(seen), canonical, (a, b) -> a == b)) {
+                cellSet(errOpt, Some("duplicate setting '" + label + "'"));
+                false
+            } else {
+                cellSet(seen, Cons(canonical, cellGet(seen)));
+                true
+            }
+        };
+
+        let cur = cellNew(fs);
+        while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+            match cellGet(cur) {
+                Cons((key, value), rest) -> {
+                    if (key == "modifiers") {
+                        if (claim("modifiers", key)) {
+                            match reqStringArray(value, key) { Ok(v) -> cellSet(modifiers, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "workspace_mode" || key == "workspaceMode") {
+                        if (claim("workspaceMode", key)) {
+                            match reqString(value, key) { Ok(v) -> cellSet(workspaceMode, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "workspace_count" || key == "workspaceCount") {
+                        if (claim("workspaceCount", key)) {
+                            match reqInt(value, key) { Ok(n) -> cellSet(workspaceCount, if (n < 0) 0 else n), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "master_ratio" || key == "masterRatio") {
+                        if (claim("masterRatio", key)) {
+                            match reqDouble(value, key) { Ok(v) -> cellSet(masterRatio, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "ratio_step" || key == "ratioStep") {
+                        if (claim("ratioStep", key)) {
+                            match reqDouble(value, key) { Ok(v) -> cellSet(ratioStep, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "master_count" || key == "masterCount") {
+                        if (claim("masterCount", key)) {
+                            match reqInt(value, key) { Ok(n) -> cellSet(masterCount, if (n < 0) 0 else n), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "outer_gap" || key == "outerGap" || key == "screen_padding" || key == "screenPadding" || key == "margin" || key == "padding") {
+                        if (claim("outerGap", key)) {
+                            match reqDouble(value, key) { Ok(v) -> cellSet(outerGap, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "inner_gap" || key == "innerGap" || key == "window_gap" || key == "windowGap" || key == "gap" || key == "spacing") {
+                        if (claim("innerGap", key)) {
+                            match reqDouble(value, key) { Ok(v) -> cellSet(innerGap, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "ignore_apps" || key == "ignoreApps") {
+                        if (claim("ignoreApps", key)) {
+                            match reqStringArray(value, key) { Ok(v) -> cellSet(ignoreApps, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "app_workspaces" || key == "appWorkspaces") {
+                        if (claim("appWorkspaces", key)) {
+                            match parseAppWorkspacesVal(value, key) { Ok(v) -> cellSet(appWorkspaces, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "float_windows" || key == "floatWindows") {
+                        if (claim("floatWindows", key)) {
+                            match parseFloatRuleListVal(value, key, allowUnknown) { Ok(v) -> cellSet(floatWindows, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "status_format" || key == "statusFormat") {
+                        if (claim("statusFormat", key)) {
+                            match reqString(value, key) { Ok(v) -> cellSet(statusFormat, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "status_template" || key == "statusTemplate") {
+                        if (claim("statusTemplate", key)) {
+                            match value {
+                                VNull -> cellSet(statusTemplate, None),
+                                _ -> match reqString(value, key) { Ok(v) -> cellSet(statusTemplate, Some(v)), Err(e) -> cellSet(errOpt, Some(e)) },
+                            }
+                        } else ()
+                    } else if (key == "status_show_icon" || key == "statusShowIcon") {
+                        if (claim("statusShowIcon", key)) {
+                            match reqBool(value, key) { Ok(v) -> cellSet(statusShowIcon, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "workspace_current" || key == "workspaceCurrent") {
+                        if (claim("workspaceCurrent", key)) {
+                            match reqString(value, key) { Ok(v) -> cellSet(workspaceCurrent, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "workspace_other" || key == "workspaceOther") {
+                        if (claim("workspaceOther", key)) {
+                            match reqString(value, key) { Ok(v) -> cellSet(workspaceOther, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "status_fonts" || key == "statusFonts") {
+                        if (claim("statusFonts", key)) {
+                            match reqStringArray(value, key) { Ok(v) -> cellSet(statusFonts, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "status_font_size" || key == "statusFontSize") {
+                        if (claim("statusFontSize", key)) {
+                            match reqDouble(value, key) { Ok(v) -> cellSet(statusFontSize, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "space_labels" || key == "spaceLabels") {
+                        if (claim("spaceLabels", key)) {
+                            match reqStringArray(value, key) { Ok(v) -> cellSet(spaceLabels, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "workspace_icons" || key == "workspaceIcons") {
+                        if (claim("workspaceIcons", key)) {
+                            match reqStringArray(value, key) { Ok(v) -> cellSet(workspaceIcons, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "status_text_file" || key == "statusTextFile") {
+                        if (claim("statusTextFile", key)) {
+                            match value {
+                                VNull -> cellSet(statusTextFile, None),
+                                _ -> match reqString(value, key) { Ok(v) -> cellSet(statusTextFile, Some(v)), Err(e) -> cellSet(errOpt, Some(e)) },
+                            }
+                        } else ()
+                    } else if (key == "status_state_file" || key == "statusStateFile") {
+                        if (claim("statusStateFile", key)) {
+                            match value {
+                                VNull -> cellSet(statusStateFile, None),
+                                _ -> match reqString(value, key) { Ok(v) -> cellSet(statusStateFile, Some(v)), Err(e) -> cellSet(errOpt, Some(e)) },
+                            }
+                        } else ()
+                    } else if (key == "commands" || key == "status_commands" || key == "statusCommands") {
+                        if (claim("statusCommands", key)) {
+                            match parseCommandListVal(value, key, allowUnknown) { Ok(v) -> cellSet(statusCommands, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                        } else ()
+                    } else if (key == "shortcuts" || key == "keys") {
+                        match value {
+                            VObj(subFs) -> {
+                                let cs = cellNew(subFs);
+                                while (match cellGet(cs) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+                                    match cellGet(cs) {
+                                        Cons((sk, sv), sr) -> {
+                                            if (sk == "modifiers") {
+                                                if (claim("modifiers", key + "." + sk)) {
+                                                    match reqStringArray(sv, key + "." + sk) { Ok(v) -> cellSet(modifiers, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (!allowUnknown) {
+                                                cellSet(errOpt, Some("unknown key '" + key + "." + sk + "'"))
+                                            } else ();
+                                            cellSet(cs, sr)
+                                        },
+                                        Nil -> (),
+                                    }
+                                }
+                            },
+                            _ -> cellSet(errOpt, Some("'" + key + "' must be a table")),
+                        }
+                    } else if (key == "workspaces") {
+                        match value {
+                            VObj(subFs) -> {
+                                let cs = cellNew(subFs);
+                                while (match cellGet(cs) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+                                    match cellGet(cs) {
+                                        Cons((sk, sv), sr) -> {
+                                            if (sk == "mode" || sk == "workspace_mode" || sk == "workspaceMode") {
+                                                if (claim("workspaceMode", "workspaces." + sk)) {
+                                                    match reqString(sv, "workspaces." + sk) { Ok(v) -> cellSet(workspaceMode, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "count" || sk == "workspace_count" || sk == "workspaceCount") {
+                                                if (claim("workspaceCount", "workspaces." + sk)) {
+                                                    match reqInt(sv, "workspaces." + sk) { Ok(n) -> cellSet(workspaceCount, if (n < 0) 0 else n), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "labels" || sk == "space_labels" || sk == "spaceLabels") {
+                                                if (claim("spaceLabels", "workspaces." + sk)) {
+                                                    match reqStringArray(sv, "workspaces." + sk) { Ok(v) -> cellSet(spaceLabels, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (!allowUnknown) {
+                                                cellSet(errOpt, Some("unknown key 'workspaces." + sk + "'"))
+                                            } else ();
+                                            cellSet(cs, sr)
+                                        },
+                                        Nil -> (),
+                                    }
+                                }
+                            },
+                            _ -> cellSet(errOpt, Some("'workspaces' must be a table")),
+                        }
+                    } else if (key == "layout") {
+                        match value {
+                            VObj(subFs) -> {
+                                let cs = cellNew(subFs);
+                                while (match cellGet(cs) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+                                    match cellGet(cs) {
+                                        Cons((sk, sv), sr) -> {
+                                            if (sk == "master_ratio" || sk == "masterRatio") {
+                                                if (claim("masterRatio", "layout." + sk)) {
+                                                    match reqDouble(sv, "layout." + sk) { Ok(v) -> cellSet(masterRatio, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "ratio_step" || sk == "ratioStep") {
+                                                if (claim("ratioStep", "layout." + sk)) {
+                                                    match reqDouble(sv, "layout." + sk) { Ok(v) -> cellSet(ratioStep, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "master_count" || sk == "masterCount") {
+                                                if (claim("masterCount", "layout." + sk)) {
+                                                    match reqInt(sv, "layout." + sk) { Ok(n) -> cellSet(masterCount, if (n < 0) 0 else n), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "outer_gap" || sk == "outerGap" || sk == "screen_padding" || sk == "screenPadding" || sk == "margin" || sk == "padding") {
+                                                if (claim("outerGap", "layout." + sk)) {
+                                                    match reqDouble(sv, "layout." + sk) { Ok(v) -> cellSet(outerGap, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "inner_gap" || sk == "innerGap" || sk == "window_gap" || sk == "windowGap" || sk == "gap" || sk == "spacing") {
+                                                if (claim("innerGap", "layout." + sk)) {
+                                                    match reqDouble(sv, "layout." + sk) { Ok(v) -> cellSet(innerGap, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (!allowUnknown) {
+                                                cellSet(errOpt, Some("unknown key 'layout." + sk + "'"))
+                                            } else ();
+                                            cellSet(cs, sr)
+                                        },
+                                        Nil -> (),
+                                    }
+                                }
+                            },
+                            _ -> cellSet(errOpt, Some("'layout' must be a table")),
+                        }
+                    } else if (key == "rules") {
+                        match value {
+                            VObj(subFs) -> {
+                                let cs = cellNew(subFs);
+                                while (match cellGet(cs) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+                                    match cellGet(cs) {
+                                        Cons((sk, sv), sr) -> {
+                                            if (sk == "ignore_apps" || sk == "ignoreApps") {
+                                                if (claim("ignoreApps", "rules." + sk)) {
+                                                    match reqStringArray(sv, "rules." + sk) { Ok(v) -> cellSet(ignoreApps, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "app_workspaces" || sk == "appWorkspaces" || sk == "assign" || sk == "workspaces") {
+                                                if (claim("appWorkspaces", "rules." + sk)) {
+                                                    match parseAppWorkspacesVal(sv, "rules." + sk) { Ok(v) -> cellSet(appWorkspaces, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "float_windows" || sk == "floatWindows") {
+                                                if (claim("floatWindows", "rules." + sk)) {
+                                                    match parseFloatRuleListVal(sv, "rules." + sk, allowUnknown) { Ok(v) -> cellSet(floatWindows, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (!allowUnknown) {
+                                                cellSet(errOpt, Some("unknown key 'rules." + sk + "'"))
+                                            } else ();
+                                            cellSet(cs, sr)
+                                        },
+                                        Nil -> (),
+                                    }
+                                }
+                            },
+                            _ -> cellSet(errOpt, Some("'rules' must be a table")),
+                        }
+                    } else if (key == "status") {
+                        match value {
+                            VObj(subFs) -> {
+                                let cs = cellNew(subFs);
+                                while (match cellGet(cs) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+                                    match cellGet(cs) {
+                                        Cons((sk, sv), sr) -> {
+                                            if (sk == "show_icon" || sk == "statusShowIcon") {
+                                                if (claim("statusShowIcon", "status." + sk)) {
+                                                    match reqBool(sv, "status." + sk) { Ok(v) -> cellSet(statusShowIcon, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "space_labels" || sk == "spaceLabels") {
+                                                if (claim("spaceLabels", "status." + sk)) {
+                                                    match reqStringArray(sv, "status." + sk) { Ok(v) -> cellSet(spaceLabels, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "workspace_icons" || sk == "workspaceIcons") {
+                                                if (claim("workspaceIcons", "status." + sk)) {
+                                                    match reqStringArray(sv, "status." + sk) { Ok(v) -> cellSet(workspaceIcons, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "template" || sk == "statusTemplate") {
+                                                if (claim("statusTemplate", "status." + sk)) {
+                                                    match reqString(sv, "status." + sk) { Ok(v) -> cellSet(statusTemplate, Some(v)), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "format" || sk == "statusFormat") {
+                                                if (claim("statusFormat", "status." + sk)) {
+                                                    match reqString(sv, "status." + sk) { Ok(v) -> cellSet(statusFormat, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "workspace_current" || sk == "workspaceCurrent") {
+                                                if (claim("workspaceCurrent", "status." + sk)) {
+                                                    match reqString(sv, "status." + sk) { Ok(v) -> cellSet(workspaceCurrent, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "workspace_other" || sk == "workspaceOther") {
+                                                if (claim("workspaceOther", "status." + sk)) {
+                                                    match reqString(sv, "status." + sk) { Ok(v) -> cellSet(workspaceOther, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "fonts" || sk == "statusFonts") {
+                                                if (claim("statusFonts", "status." + sk)) {
+                                                    match reqStringArray(sv, "status." + sk) { Ok(v) -> cellSet(statusFonts, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "font_size" || sk == "statusFontSize") {
+                                                if (claim("statusFontSize", "status." + sk)) {
+                                                    match reqDouble(sv, "status." + sk) { Ok(v) -> cellSet(statusFontSize, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "text_file" || sk == "statusTextFile") {
+                                                if (claim("statusTextFile", "status." + sk)) {
+                                                    match reqString(sv, "status." + sk) { Ok(v) -> cellSet(statusTextFile, Some(v)), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "state_file" || sk == "statusStateFile") {
+                                                if (claim("statusStateFile", "status." + sk)) {
+                                                    match reqString(sv, "status." + sk) { Ok(v) -> cellSet(statusStateFile, Some(v)), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (sk == "commands" || sk == "statusCommands") {
+                                                if (claim("statusCommands", "status." + sk)) {
+                                                    match parseCommandListVal(sv, "status." + sk, allowUnknown) { Ok(v) -> cellSet(statusCommands, v), Err(e) -> cellSet(errOpt, Some(e)) }
+                                                } else ()
+                                            } else if (!allowUnknown) {
+                                                cellSet(errOpt, Some("unknown key 'status." + sk + "'"))
+                                            } else ();
+                                            cellSet(cs, sr)
+                                        },
+                                        Nil -> (),
+                                    }
+                                }
+                            },
+                            _ -> cellSet(errOpt, Some("'status' must be a table")),
+                        }
+                    } else if (!allowUnknown) {
+                        cellSet(errOpt, Some("unknown configuration key '" + key + "'"))
+                    } else ();
+                    cellSet(cur, rest)
+                },
+                Nil -> (),
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(Configuration {
+                modifiers: cellGet(modifiers),
+                workspaceMode: cellGet(workspaceMode),
+                workspaceCount: cellGet(workspaceCount),
+                masterRatio: cellGet(masterRatio),
+                ratioStep: cellGet(ratioStep),
+                masterCount: cellGet(masterCount),
+                outerGap: cellGet(outerGap),
+                innerGap: cellGet(innerGap),
+                ignoreApps: cellGet(ignoreApps),
+                appWorkspaces: cellGet(appWorkspaces),
+                floatWindows: cellGet(floatWindows),
+                statusFormat: cellGet(statusFormat),
+                statusTemplate: cellGet(statusTemplate),
+                statusShowIcon: cellGet(statusShowIcon),
+                workspaceCurrent: cellGet(workspaceCurrent),
+                workspaceOther: cellGet(workspaceOther),
+                statusFonts: cellGet(statusFonts),
+                statusFontSize: cellGet(statusFontSize),
+                statusCommands: cellGet(statusCommands),
+                spaceLabels: cellGet(spaceLabels),
+                workspaceIcons: cellGet(workspaceIcons),
+                statusTextFile: cellGet(statusTextFile),
+                statusStateFile: cellGet(statusStateFile),
+            }),
+        }
+    },
+    _ -> Err("configuration root must be a table"),
+}
+
+pub def decodeToml(source: String): Result Configuration String = {
+    let val = tomlParse(source)?;
+    decodeConfigFromValue(val, false)
+}
+
+pub def decodeJson(source: String): Result Configuration String = {
+    let val = jsonParse(source)?;
+    decodeConfigFromValue(val, true)
+}
+
+// ---- TOML canonical Value construction & comment-preserving patch ----
+
+def cleanFloat(val: Float): Float = roundFloat(val * 10000.0) / 10000.0
+
+def gapValue(gap: Float): Value =
+    if (abs(gap - roundFloat(gap)) < 0.0001) VInt(intToI64(roundToInt(gap)))
+    else VFloat(cleanFloat(gap))
+
+def strArrVal(xs: List String): Value = VArr(listMap(xs, (s) -> VStr(s)))
+
+def objHasKey(fs: List (String, Value), key: String): Bool =
+    listAny(fs, (p) -> { let (k, _) = p; k == key })
+
+def objLookup(fs: List (String, Value), key: String): Option Value = {
+    let cur = cellNew(fs);
+    let res: Cell (Option Value) = cellNew(None);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match cellGet(cur) {
+            Nil -> cellSet(running, false),
+            Cons((k, v), r) ->
+                if (k == key) { cellSet(res, Some(v)); cellSet(running, false) }
+                else cellSet(cur, r),
+        }
+    };
+    cellGet(res)
+}
+
+pub def configToTomlValue(cfg: Configuration, existingOpt: Option Value): Value = {
+    let defaults = defaultConfig();
+    let existingFs = match existingOpt {
+        Some(VObj(fs)) -> fs,
+        _ -> Nil,
+    };
+    let existingLayoutFs = match objLookup(existingFs, "layout") {
+        Some(VObj(lfs)) -> lfs,
+        _ -> Nil,
+    };
+    let rootRev: Cell (List (String, Value)) = cellNew(Nil);
+    let pushRoot = (k: String, v: Value) -> cellSet(rootRev, Cons((k, v), cellGet(rootRev)));
+
+    pushRoot("modifiers", strArrVal(cfg.modifiers));
+
+    let hasWsSection = cfg.workspaceMode != defaults.workspaceMode
+        || cfg.workspaceCount != defaults.workspaceCount
+        || objHasKey(existingFs, "workspaces");
+    if (hasWsSection) {
+        let wsRev: Cell (List (String, Value)) = cellNew(Nil);
+        cellSet(wsRev, Cons(("mode", VStr(cfg.workspaceMode)), cellGet(wsRev)));
+        cellSet(wsRev, Cons(("count", VInt(intToI64(cfg.workspaceCount))), cellGet(wsRev)));
+        if (listLen(cfg.spaceLabels) > 0) {
+            cellSet(wsRev, Cons(("labels", strArrVal(cfg.spaceLabels)), cellGet(wsRev)))
+        } else ();
+        pushRoot("workspaces", VObj(listRev(cellGet(wsRev))))
+    } else ();
+
+    let layRev: Cell (List (String, Value)) = cellNew(Nil);
+    cellSet(layRev, Cons(("master_ratio", VFloat(cleanFloat(cfg.masterRatio))), cellGet(layRev)));
+    cellSet(layRev, Cons(("ratio_step", VFloat(cleanFloat(cfg.ratioStep))), cellGet(layRev)));
+    cellSet(layRev, Cons(("master_count", VInt(intToI64(cfg.masterCount))), cellGet(layRev)));
+    if (cfg.outerGap != 0.0 || objHasKey(existingLayoutFs, "outer_gap")) {
+        cellSet(layRev, Cons(("outer_gap", gapValue(cfg.outerGap)), cellGet(layRev)))
+    } else ();
+    if (cfg.innerGap != 0.0 || objHasKey(existingLayoutFs, "inner_gap")) {
+        cellSet(layRev, Cons(("inner_gap", gapValue(cfg.innerGap)), cellGet(layRev)))
+    } else ();
+    pushRoot("layout", VObj(listRev(cellGet(layRev))));
+
+    let hasRules = listLen(cfg.ignoreApps) > 0
+        || listLen(cfg.appWorkspaces) > 0
+        || listLen(cfg.floatWindows) > 0
+        || objHasKey(existingFs, "rules");
+    if (hasRules) {
+        let rulesRev: Cell (List (String, Value)) = cellNew(Nil);
+        if (listLen(cfg.ignoreApps) > 0) {
+            cellSet(rulesRev, Cons(("ignore_apps", strArrVal(cfg.ignoreApps)), cellGet(rulesRev)))
+        } else ();
+        if (listLen(cfg.appWorkspaces) > 0) {
+            let awsFs = listMap(sortAppWorkspaces(cfg.appWorkspaces), (p) -> {
+                let (b, t) = p;
+                match t {
+                    WsIndex(n) -> (b, VInt(intToI64(n))),
+                    WsLabel(s) -> (b, VStr(s)),
+                }
+            });
+            cellSet(rulesRev, Cons(("app_workspaces", VObj(awsFs)), cellGet(rulesRev)))
+        } else ();
+        if (listLen(cfg.floatWindows) > 0) {
+            let fwArr = listMap(cfg.floatWindows, (r: FloatWindowRule) -> {
+                let fRev: Cell (List (String, Value)) = cellNew([("app", VStr(r.app))]);
+                match r.titles {
+                    Some(ts) -> cellSet(fRev, Cons(("titles", strArrVal(ts)), cellGet(fRev))),
+                    None -> (),
+                };
+                match r.exceptTitles {
+                    Some(ts) -> cellSet(fRev, Cons(("except_titles", strArrVal(ts)), cellGet(fRev))),
+                    None -> (),
+                };
+                VObj(listRev(cellGet(fRev)))
+            });
+            cellSet(rulesRev, Cons(("float_windows", VArr(fwArr)), cellGet(rulesRev)))
+        } else ();
+        pushRoot("rules", VObj(listRev(cellGet(rulesRev))))
+    } else ();
+
+    let stRev: Cell (List (String, Value)) = cellNew(Nil);
+    cellSet(stRev, Cons(("show_icon", VBool(cfg.statusShowIcon)), cellGet(stRev)));
+    if (listLen(cfg.spaceLabels) > 0 && !hasWsSection) {
+        cellSet(stRev, Cons(("space_labels", strArrVal(cfg.spaceLabels)), cellGet(stRev)))
+    } else ();
+    if (listLen(cfg.workspaceIcons) > 0) {
+        cellSet(stRev, Cons(("workspace_icons", strArrVal(cfg.workspaceIcons)), cellGet(stRev)))
+    } else ();
+    match cfg.statusTemplate {
+        Some(tmpl) -> cellSet(stRev, Cons(("template", VStr(tmpl)), cellGet(stRev))),
+        None -> if (cfg.statusFormat != defaults.statusFormat) {
+            cellSet(stRev, Cons(("format", VStr(cfg.statusFormat)), cellGet(stRev)))
+        } else (),
+    };
+    let hasTmpl = match cfg.statusTemplate { Some(_) -> true, None -> false };
+    if (cfg.workspaceCurrent != defaults.workspaceCurrent || hasTmpl) {
+        cellSet(stRev, Cons(("workspace_current", VStr(cfg.workspaceCurrent)), cellGet(stRev)))
+    } else ();
+    if (cfg.workspaceOther != defaults.workspaceOther || hasTmpl) {
+        cellSet(stRev, Cons(("workspace_other", VStr(cfg.workspaceOther)), cellGet(stRev)))
+    } else ();
+    if (listLen(cfg.statusFonts) > 0) {
+        cellSet(stRev, Cons(("fonts", strArrVal(cfg.statusFonts)), cellGet(stRev)))
+    } else ();
+    if (abs(cfg.statusFontSize - defaults.statusFontSize) > 0.0001) {
+        cellSet(stRev, Cons(("font_size", VFloat(cleanFloat(cfg.statusFontSize))), cellGet(stRev)))
+    } else ();
+    match cfg.statusTextFile {
+        Some(tf) -> cellSet(stRev, Cons(("text_file", VStr(tf)), cellGet(stRev))),
+        None -> (),
+    };
+    match cfg.statusStateFile {
+        Some(sf) -> cellSet(stRev, Cons(("state_file", VStr(sf)), cellGet(stRev))),
+        None -> (),
+    };
+    if (listLen(cfg.statusCommands) > 0) {
+        let cmdArr = listMap(cfg.statusCommands, (c: StatusCommand) -> {
+            let cRev: Cell (List (String, Value)) = cellNew([("executable", VStr(c.executable)), ("name", VStr(c.name))]);
+            match c.arguments { Some(a) -> cellSet(cRev, Cons(("arguments", strArrVal(a)), cellGet(cRev))), None -> () };
+            match c.interval { Some(iv) -> cellSet(cRev, Cons(("interval", VFloat(cleanFloat(iv))), cellGet(cRev))), None -> () };
+            match c.timeout { Some(to) -> cellSet(cRev, Cons(("timeout", VFloat(cleanFloat(to))), cellGet(cRev))), None -> () };
+            match c.markup { Some(mk) -> cellSet(cRev, Cons(("markup", VBool(mk)), cellGet(cRev))), None -> () };
+            match c.onChange { Some(oc) -> cellSet(cRev, Cons(("on_change", VBool(oc)), cellGet(cRev))), None -> () };
+            VObj(listRev(cellGet(cRev)))
+        });
+        cellSet(stRev, Cons(("commands", VArr(cmdArr)), cellGet(stRev)))
+    } else ();
+    pushRoot("status", VObj(listRev(cellGet(stRev))));
+
+    VObj(listRev(cellGet(rootRev)))
+}
+
+pub def toToml(cfg: Configuration): String =
+    "# Talus configuration (~/.talus.toml)\n" + tomlStringify(configToTomlValue(cfg, None))
+
+/// Updates an existing TOML document in-place via `std.toml.patch` so user comments stay intact,
+/// falling back to canonical `toToml` when starting fresh or if verification fails.
+pub def toTomlPreservingComments(cfg: Configuration, existingToml: Option String): String =
+    match existingToml {
+        None -> toToml(cfg),
+        Some(src) -> match tomlParse(src) {
+            Err(_) -> toToml(cfg),
+            Ok(parsedOrig) -> {
+                let targetVal = configToTomlValue(cfg, Some(parsedOrig));
+                match tomlPatch(src, targetVal) {
+                    Ok(patched) -> match decodeToml(patched) {
+                        Ok(reparsed) if (reparsed == cfg) -> patched,
+                        _ -> toToml(cfg),
+                    },
+                    Err(_) -> toToml(cfg),
+                }
+            },
+        },
+    }
+
+pub def loadConfigFromPath(path: String): Result Configuration String =
+    if (!fileExists(path)) Ok(defaultConfig())
+    else {
+        let raw = readFile(path)?;
+        let lower = strToLowerAscii(path);
+        let cfg = if (strEndsWith(lower, ".json")) decodeJson(raw)? else decodeToml(raw)?;
+        validateConfig(cfg)?;
+        Ok(cfg)
+    }
+
+pub def saveConfigToPath(cfg: Configuration, path: String): Result Void String = {
+    validateConfig(cfg)?;
+    let dir = pathDirname(path);
+    if (strLen(dir) > 0 && dir != ".") {
+        let _ = mkdirAll(dir)?;
+        ()
+    } else ();
+    let lower = strToLowerAscii(path);
+    let content = if (strEndsWith(lower, ".json")) {
+        jsonStringify(configToTomlValue(cfg, None))
+    } else {
+        let existing = match readFile(path) { Ok(s) -> Some(s), Err(_) -> None };
+        toTomlPreservingComments(cfg, existing)
+    };
+    writeFileAtomic(path, content)
+}

@@ -1,0 +1,1049 @@
+/// Per-application Actor-based window execution & main-queue dispatch bridge.
+///
+/// Hard concurrency invariant (enforced by Geisha's `Send` checker):
+/// - `AXUIElement` `ForeignPtr`s NEVER cross thread boundaries and are NEVER cast to `Int64`.
+/// - Each application PID owns one `Actor AppExecState` whose serial thread creates, caches,
+///   discovers, moves/resizes, focuses, and releases all `AXUIElement` handles for that PID.
+/// - The main thread exchanges only pure-value `Send` ADTs (`WindowGoal`, `AppDiscoveryResult`,
+///   `ExecEvent`) via `MVar`/`Chan`/`Actor`.
+
+use std.option.{Option, Some, None}
+use std.list.{listLen, listRev, listFilter, listAny}
+use std.sync.{
+    AtomicInt, atomicNew, atomicAdd,
+    MVar, mvarNew, mvarTake, mvarPut,
+    Chan, chanUnbounded, chanSend, chanTryRecv
+}
+use std.actor.{Actor, actorSpawn, actorSend, actorCall, actorAsk, actorStop}
+use std.task.{Task}
+use util.{eqInt, eqI64, listContainsBy, listFindBy}
+use layout.{Rect, rectNew}
+use screen_geometry.{VisibleWindowCandidate, matchesVisibleWindow}
+use macos.ffi.{
+    c_AXUIElementCopyAttributeValue, c_AXUIElementSetMessagingTimeout,
+    c_AXUIElementIsAttributeSettable, c_AXUIElementGetWindow,
+    c_CFArrayGetCount, c_CFArrayGetValueAtIndex,
+    c_dispatch_async_f, c_dispatch_after_f, c_dispatch_time,
+    kAXErrorSuccess, kAXErrorCannotComplete, kAXErrorInvalidUIElement, kAXErrorAPIDisabled,
+    kDispatchTimeNow,
+    cfAdopt, cfAdoptOpt, cfRetain, cfEqual, cfValueAsString, cfValueAsBool,
+    axCreateApplication, dispatchMainQueue, readPtrAt
+}
+use macos.ax_io.{axValue, axCopyString, axCopyBool, axGetFrame, axSetFrame, axSetPosition}
+use macos.window_focus.{requestWindowFocus, activateRunningAppPid}
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    nsString, withId, withAutoreleasePool
+}
+
+extern "object_getClass" def c_object_getClass(obj: Ptr): Ptr
+extern "objc_msgSend" def c_performOnMain(obj: Ptr, sel: Ptr, aSel: Ptr, arg: Ptr, wait: Bool): Void
+
+// ---------------------------------------------------------------------------
+// Main-thread dispatch bridge (Send-safe channel + ObjC main-thread wakeup)
+// ---------------------------------------------------------------------------
+
+pub data ExecEvent {
+    ExecCompleted {
+        pid: Int,
+        sequence: Int64,
+        key: Int64,
+        axError: Int,
+    },
+    ExecWorkerIdle {
+        pid: Int,
+    },
+    ExecSettleCheck,
+    ExecLegacyActivate {
+        pid: Int,
+    },
+    ExecCustomSignal {
+        tag: Int,
+    },
+}
+
+// Global Send-safe channel for main-thread events
+def gMainExecChan: Chan ExecEvent = chanUnbounded()
+def gMainExecHandler: Cell (ExecEvent -> Void) = cellNew((_: ExecEvent) -> ())
+
+pub def setMainExecEventHandler(handler: ExecEvent -> Void): Void =
+    cellSet(gMainExecHandler, handler)
+
+def pumpMainExecImp(_self: Ptr, _cmd: Ptr): Void = withAutoreleasePool(() -> {
+    let h = cellGet(gMainExecHandler);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match chanTryRecv(gMainExecChan) {
+            Some(ev) -> h(ev),
+            None -> cellSet(running, false),
+        }
+    }
+})
+
+extern init def registerTalusMainEventPump(): Void = {
+    let cls = objcAllocateClass("NSObject", "TalusMainEventPump");
+    if (!ptrIsNull(cls)) {
+        let meta = c_object_getClass(cls);
+        if (!ptrIsNull(meta)) {
+            let _ = objcAddMethod(meta, "pump", cFnPtr(pumpMainExecImp), "v@:");
+            ()
+        } else ();
+        objcRegisterClass(cls)
+    } else ()
+}
+
+/// Post an `ExecEvent` from any thread to the macOS main thread (100% Send-safe, zero Cell capture).
+pub def postMainExecEvent(ev: ExecEvent): Void = {
+    let _ = chanSend(gMainExecChan, ev);
+    let cls = objcClass("TalusMainEventPump");
+    if (!ptrIsNull(cls)) {
+        c_performOnMain(cls, objcSel("performSelectorOnMainThread:withObject:waitUntilDone:"), objcSel("pump"), ptrNull(), false)
+    } else ()
+}
+
+/// Drain any queued `ExecEvent`s synchronously on the current thread (used in headless unit tests).
+pub def drainMainExecEventsSync(): Void = {
+    let h = cellGet(gMainExecHandler);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match chanTryRecv(gMainExecChan) {
+            Some(ev) -> h(ev),
+            None -> cellSet(running, false),
+        }
+    }
+}
+
+def gDelayedSignalTags: Chan Int = chanUnbounded()
+
+def delayedSignalFromChanTramp(_ctx: Ptr): Void = {
+    match chanTryRecv(gDelayedSignalTags) {
+        Some(tag) -> postMainExecEvent(ExecCustomSignal { tag: tag }),
+        None -> (),
+    }
+}
+
+/// Schedule a delayed main-queue custom signal (`ExecCustomSignal { tag }`) after `delayMs`.
+pub def scheduleDelayedSignal(delayMs: Int, tag: Int): Void = {
+    let q = dispatchMainQueue();
+    if (!ptrIsNull(q)) {
+        let _ = chanSend(gDelayedSignalTags, tag);
+        let when = c_dispatch_time(kDispatchTimeNow(), intToI64(delayMs) * intToI64(1_000_000));
+        c_dispatch_after_f(when, q, ptrNull(), cFnPtr(delayedSignalFromChanTramp))
+    } else ()
+}
+
+// ---------------------------------------------------------------------------
+// MainLoopUpdate (coalesces UI refreshes onto the next main-loop turn)
+// ---------------------------------------------------------------------------
+
+pub data MainLoopUpdate {
+    MainLoopUpdate {
+        pending: Cell Bool,
+        signalTag: Int,
+        updateFn: () -> Void,
+    }
+}
+
+pub def mainLoopUpdateNew(signalTag: Int, updateFn: () -> Void): MainLoopUpdate =
+    MainLoopUpdate {
+        pending: cellNew(false),
+        signalTag: signalTag,
+        updateFn: updateFn,
+    }
+
+pub def mainLoopUpdateRequest(u: MainLoopUpdate): Void =
+    if (!cellGet(u.pending)) {
+        cellSet(u.pending, true);
+        postMainExecEvent(ExecCustomSignal { tag: u.signalTag })
+    } else ()
+
+pub def mainLoopUpdateHandleSignal(u: MainLoopUpdate, tag: Int): Bool =
+    if (tag == u.signalTag) {
+        if (cellGet(u.pending)) {
+            cellSet(u.pending, false);
+            (u.updateFn)()
+        } else ();
+        true
+    } else false
+
+pub def mainLoopUpdateFlush(u: MainLoopUpdate): Void = {
+    cellSet(u.pending, false);
+    (u.updateFn)()
+}
+
+// ---------------------------------------------------------------------------
+// Pure-value Send data types exchanged with per-PID Actors
+// ---------------------------------------------------------------------------
+
+pub data WindowGoal {
+    WindowGoal {
+        key: Int64,
+        pid: Int,
+        target: Rect,
+        resizable: Bool,
+        parking: Bool,
+    }
+}
+
+pub data ExecRequest {
+    ExecRequest {
+        sequence: Int64,
+        goal: WindowGoal,
+    }
+}
+
+/// Optional test harness hook (100% Send) to intercept window geometry writes in unit tests.
+pub data TestApplyMsg {
+    TestApplyMsg {
+        goal: WindowGoal,
+        current: Option Rect,
+        reply: MVar Int,
+    }
+}
+
+pub data ApplyBackend {
+    ApplyRealAX,
+    ApplyTestChannel(Chan TestApplyMsg),
+}
+
+pub data DiscoveredAppWindow {
+    DiscoveredAppWindow {
+        key: Int64,
+        pid: Int,
+        bundleId: Option String,
+        windowId: Option Int,
+        title: String,
+        frame: Rect,
+        isResizable: Bool,
+    }
+}
+
+pub data AppDiscoveryOutcome {
+    AppDiscoveryOutcome {
+        pid: Int,
+        windows: List DiscoveredAppWindow,
+        busy: Bool,
+        staleApiDisabled: Bool,
+        deadHandles: List Int64,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-PID MVar coalescing queue (Send!)
+// ---------------------------------------------------------------------------
+
+data AppQueueState {
+    AppQueueState {
+        targets: List (Int64, ExecRequest),
+        order: List Int64,
+        frames: List (Int64, Rect),
+        forgottenDuringWrite: List Int64,
+        pumping: Bool,
+        running: Option Int64,
+    }
+}
+
+def emptyQueueState(): AppQueueState = AppQueueState {
+    targets: Nil,
+    order: Nil,
+    frames: Nil,
+    forgottenDuringWrite: Nil,
+    pumping: false,
+    running: None,
+}
+
+def qMapGet(m: List (Int64, a), k: Int64): Option a =
+    match listFindBy(m, (p) -> { let (kk, _) = p; kk == k }) {
+        Some((_, v)) -> Some(v),
+        None -> None,
+    }
+
+def qMapSet(m: List (Int64, a), k: Int64, v: a): List (Int64, a) =
+    Cons((k, v), listFilter(m, (p) -> { let (kk, _) = p; kk != k }))
+
+def qMapRemove(m: List (Int64, a), k: Int64): List (Int64, a) =
+    listFilter(m, (p) -> { let (kk, _) = p; kk != k })
+
+def qListRemoveI64(xs: List Int64, k: Int64): List Int64 =
+    listFilter(xs, (x) -> x != k)
+
+def qListAppendI64(xs: List Int64, k: Int64): List Int64 =
+    listRev(Cons(k, listRev(xs)))
+
+// ---------------------------------------------------------------------------
+// Per-PID Actor state (strictly confined to its own serial actor thread)
+// ---------------------------------------------------------------------------
+
+pub data AppExecState {
+    AppExecState {
+        pid: Int,
+        axApp: ForeignPtr,
+        elements: Cell (List (Int64, ForeignPtr)),
+    }
+}
+
+def gNextWindowKey: AtomicInt = atomicNew(1)
+
+def allocWindowKey(): Int64 = intToI64(atomicAdd(gNextWindowKey, 1))
+
+def lookupElement(st: AppExecState, key: Int64): Option ForeignPtr =
+    match listFindBy(cellGet(st.elements), (p) -> { let (k, _) = p; k == key }) {
+        Some((_, fp)) -> Some(fp),
+        None -> None,
+    }
+
+def findOrInsertElement(st: AppExecState, el: ForeignPtr): Int64 = {
+    let cur = cellGet(st.elements);
+    let found = listFindBy(cur, (p) -> { let (_, fp) = p; cfEqual(fp, el) });
+    match found {
+        Some((k, _)) -> k,
+        None -> {
+            let k = allocWindowKey();
+            cellSet(st.elements, Cons((k, el), cur));
+            k
+        },
+    }
+}
+
+def forgetElementInActor(st: AppExecState, key: Int64): Void =
+    cellSet(st.elements, listFilter(cellGet(st.elements), (p) -> { let (k, _) = p; k != key }))
+
+def applyGoalInActor(st: AppExecState, backend: ApplyBackend, goal: WindowGoal, current: Option Rect): Int =
+    match backend {
+        ApplyTestChannel(ch) -> {
+            let reply: MVar Int = mvarNew(0);
+            let _ = mvarTake(reply); // make empty
+            let _ = chanSend(ch, TestApplyMsg { goal: goal, current: current, reply: reply });
+            mvarTake(reply)
+        },
+        ApplyRealAX -> withAutoreleasePool(() ->
+            match lookupElement(st, goal.key) {
+                None -> kAXErrorInvalidUIElement(),
+                Some(el) ->
+                    if (goal.resizable) axSetFrame(el, goal.target, current, goal.parking)
+                    else axSetPosition(el, goal.target.x, goal.target.y),
+            }
+        ),
+    }
+
+def drainActorQueue(
+    st: AppExecState,
+    qVar: MVar AppQueueState,
+    backend: ApplyBackend,
+    useMainQueue: Bool,
+    eventChan: Chan ExecEvent
+): Void = {
+    let runningLoop = cellNew(true);
+    while (cellGet(runningLoop)) {
+        let qs = mvarTake(qVar);
+        match qs.order {
+            Nil -> {
+                mvarPut(qVar, AppQueueState {
+                    targets: qs.targets,
+                    order: Nil,
+                    frames: qs.frames,
+                    forgottenDuringWrite: qs.forgottenDuringWrite,
+                    pumping: false,
+                    running: None,
+                });
+                let idleEv = ExecWorkerIdle { pid: st.pid };
+                if (useMainQueue) postMainExecEvent(idleEv) else { let _ = chanSend(eventChan, idleEv); () };
+                cellSet(runningLoop, false)
+            },
+            Cons(key, restOrder) -> {
+                match qMapGet(qs.targets, key) {
+                    None -> {
+                        mvarPut(qVar, AppQueueState {
+                            targets: qs.targets,
+                            order: restOrder,
+                            frames: qs.frames,
+                            forgottenDuringWrite: qs.forgottenDuringWrite,
+                            pumping: true,
+                            running: None,
+                        })
+                    },
+                    Some(req) -> {
+                        let current = qMapGet(qs.frames, key);
+                        mvarPut(qVar, AppQueueState {
+                            targets: qMapRemove(qs.targets, key),
+                            order: restOrder,
+                            frames: qs.frames,
+                            forgottenDuringWrite: qs.forgottenDuringWrite,
+                            pumping: true,
+                            running: Some(key),
+                        });
+                        let err = applyGoalInActor(st, backend, req.goal, current);
+                        let qs2 = mvarTake(qVar);
+                        let wasForgotten = listContainsBy(qs2.forgottenDuringWrite, key, eqI64);
+                        let nextForgotten = qListRemoveI64(qs2.forgottenDuringWrite, key);
+                        let nextFrames =
+                            if (wasForgotten || err != kAXErrorSuccess()) qMapRemove(qs2.frames, key)
+                            else qMapSet(qs2.frames, key, req.goal.target);
+                        mvarPut(qVar, AppQueueState {
+                            targets: qs2.targets,
+                            order: qs2.order,
+                            frames: nextFrames,
+                            forgottenDuringWrite: nextForgotten,
+                            pumping: qs2.pumping,
+                            running: None,
+                        });
+                        // Enqueue completion before this worker can report itself idle.
+                        let compEv = ExecCompleted {
+                            pid: st.pid,
+                            sequence: req.sequence,
+                            key: key,
+                            axError: err,
+                        };
+                        if (useMainQueue) postMainExecEvent(compEv) else { let _ = chanSend(eventChan, compEv); () }
+                    },
+                }
+            },
+        }
+    }
+}
+
+/// Discover windows for this PID strictly inside its serial Actor thread.
+pub def discoverAppInActorPub(
+    st: AppExecState,
+    bundleId: Option String,
+    appVisible: List VisibleWindowCandidate,
+    doEnumerate: Bool
+): AppDiscoveryOutcome = discoverAppInActor(st, bundleId, appVisible, doEnumerate)
+
+def discoverAppInActor(
+    st: AppExecState,
+    bundleId: Option String,
+    appVisible: List VisibleWindowCandidate,
+    doEnumerate: Bool
+): AppDiscoveryOutcome = withAutoreleasePool(() -> {
+    let pid = st.pid;
+    let seenKeys: Cell (List Int64) = cellNew(Nil);
+    let outWins: Cell (List DiscoveredAppWindow) = cellNew(Nil);
+    let isBusy = cellNew(false);
+    let isStale = cellNew(false);
+
+    if (doEnumerate) {
+        let sWindows = nsString("AXWindows");
+        let enumRes: (Int, Option ForeignPtr) = withForeignPtr(st.axApp, (ap) ->
+            withId(sWindows, (wp) ->
+                withAlloca(8, (outBuf) -> {
+                    scopedPtrWriteI64Le(outBuf, intToI64(0), intToI64(0));
+                    let err = c_AXUIElementCopyAttributeValue(ap, wp, outBuf);
+                    (err, cfAdoptOpt(readPtrAt(outBuf, 0)))
+                })
+            )
+        );
+        let (err, arrOpt) = enumRes;
+        let hasVis = listLen(appVisible) > 0;
+        if (err == kAXErrorAPIDisabled() && hasVis) cellSet(isStale, true) else ();
+        if (err != kAXErrorSuccess() && err != kAXErrorAPIDisabled() && hasVis) cellSet(isBusy, true) else ();
+
+        if (err == kAXErrorSuccess()) {
+            match arrOpt {
+                None -> (),
+                Some(arrFp) -> {
+                    // Extract retained ForeignPtr elements from CFArray
+                    let rawEls: List ForeignPtr = withForeignPtr(arrFp, (ap) -> {
+                        let cnt = i64ToInt(c_CFArrayGetCount(ap));
+                        let rev: Cell (List ForeignPtr) = cellNew(Nil);
+                        let i = cellNew(0);
+                        while (cellGet(i) < cnt) {
+                            let idx = cellGet(i);
+                            let raw = c_CFArrayGetValueAtIndex(ap, intToI64(idx));
+                            if (!ptrIsNull(raw)) cellSet(rev, Cons(cfRetain(raw), cellGet(rev))) else ();
+                            cellSet(i, idx + 1)
+                        };
+                        listRev(cellGet(rev))
+                    });
+                    let sRole = nsString("AXRole");
+                    let sPos = nsString("AXPosition");
+                    let sSize = nsString("AXSize");
+                    let curEl = cellNew(rawEls);
+                    while (match cellGet(curEl) { Nil -> false, _ -> true }) {
+                        match cellGet(curEl) {
+                            Cons(el, restEl) -> {
+                                let _ = withForeignPtr(el, (ep) -> c_AXUIElementSetMessagingTimeout(ep, floatToF32(0.1)));
+                                let roleRes: (Int, Option ForeignPtr) = withForeignPtr(el, (ep) ->
+                                    withId(sRole, (rp) ->
+                                        withAlloca(8, (outBuf) -> {
+                                            scopedPtrWriteI64Le(outBuf, intToI64(0), intToI64(0));
+                                            let rErr = c_AXUIElementCopyAttributeValue(ep, rp, outBuf);
+                                            (rErr, cfAdoptOpt(readPtrAt(outBuf, 0)))
+                                        })
+                                    )
+                                );
+                                let (roleErr, roleValOpt) = roleRes;
+                                if (roleErr == kAXErrorCannotComplete()) {
+                                    cellSet(isBusy, true)
+                                } else {
+                                    let roleOk = match roleValOpt {
+                                        Some(rfp) -> match cfValueAsString(rfp) {
+                                            Some(rs) -> rs == "AXWindow",
+                                            None -> true,
+                                        },
+                                        None -> true,
+                                    };
+                                    let minimized = match axCopyBool(el, "AXMinimized") {
+                                        Some(true) -> true,
+                                        _ -> false,
+                                    };
+                                    if (roleOk && !minimized) {
+                                        let widOpt: Option Int = withForeignPtr(el, (ep) ->
+                                            withAlloca(4, (widBuf) -> {
+                                                scopedPtrWriteI32Le(widBuf, 0, 0);
+                                                let wErr = c_AXUIElementGetWindow(ep, widBuf);
+                                                let wv = scopedPtrReadI32Le(widBuf, 0);
+                                                if (wErr == kAXErrorSuccess() && wv != 0) Some(wv) else None
+                                            })
+                                        );
+                                        match axGetFrame(el) {
+                                            None -> cellSet(isBusy, true),
+                                            Some(rect) -> {
+                                                if (rect.w > 100.0 && rect.h > 80.0
+                                                    && matchesVisibleWindow(pid, widOpt, rect, appVisible)) {
+                                                    let subroleOk = match axCopyString(el, "AXSubrole") {
+                                                        Some(sr) -> sr == "AXStandardWindow",
+                                                        None -> true,
+                                                    };
+                                                    let isModal = match axCopyBool(el, "AXModal") {
+                                                        Some(true) -> true,
+                                                        _ -> false,
+                                                    };
+                                                    if (subroleOk && !isModal) {
+                                                        let canMove = withForeignPtr(el, (ep) ->
+                                                            withId(sPos, (pp) ->
+                                                                withAlloca(4, (bBuf) -> {
+                                                                    scopedPtrWriteI32Le(bBuf, 0, 0);
+                                                                    let mErr = c_AXUIElementIsAttributeSettable(ep, pp, bBuf);
+                                                                    mErr == kAXErrorSuccess() && scopedPtrByteAt(bBuf, 0) != 0
+                                                                })
+                                                            )
+                                                        );
+                                                        if (canMove) {
+                                                            let resizable = withForeignPtr(el, (ep) ->
+                                                                withId(sSize, (sp) ->
+                                                                    withAlloca(4, (bBuf) -> {
+                                                                        scopedPtrWriteI32Le(bBuf, 0, 0);
+                                                                        let sErr = c_AXUIElementIsAttributeSettable(ep, sp, bBuf);
+                                                                        sErr == kAXErrorSuccess() && scopedPtrByteAt(bBuf, 0) != 0
+                                                                    })
+                                                                )
+                                                            );
+                                                            let title = match axCopyString(el, "AXTitle") {
+                                                                Some(t) -> t,
+                                                                None -> "",
+                                                            };
+                                                            let key = findOrInsertElement(st, el);
+                                                            cellSet(seenKeys, Cons(key, cellGet(seenKeys)));
+                                                            cellSet(outWins, Cons(DiscoveredAppWindow {
+                                                                key: key,
+                                                                pid: pid,
+                                                                bundleId: bundleId,
+                                                                windowId: widOpt,
+                                                                title: title,
+                                                                frame: rect,
+                                                                isResizable: resizable,
+                                                            }, cellGet(outWins)))
+                                                        } else ()
+                                                    } else ()
+                                                } else ()
+                                            },
+                                        }
+                                    } else ()
+                                };
+                                cellSet(curEl, restEl)
+                            },
+                            Nil -> (),
+                        }
+                    }
+                },
+            }
+        } else ()
+    } else ();
+
+    // Check known elements not seen in this pass for invalidUIElement (destroyed windows)
+    let deadRev: Cell (List Int64) = cellNew(Nil);
+    if (doEnumerate) {
+        let seen = cellGet(seenKeys);
+        let sRole = nsString("AXRole");
+        let keptRev: Cell (List (Int64, ForeignPtr)) = cellNew(Nil);
+        let ck = cellNew(cellGet(st.elements));
+        while (match cellGet(ck) { Nil -> false, _ -> true }) {
+            match cellGet(ck) {
+                Cons((k, fp), rk) -> {
+                    if (listContainsBy(seen, k, eqI64)) {
+                        cellSet(keptRev, Cons((k, fp), cellGet(keptRev)))
+                    } else {
+                        let rErr = withForeignPtr(fp, (ep) ->
+                            withId(sRole, (rp) ->
+                                withAlloca(8, (outBuf) -> {
+                                    scopedPtrWriteI64Le(outBuf, intToI64(0), intToI64(0));
+                                    let e = c_AXUIElementCopyAttributeValue(ep, rp, outBuf);
+                                    let _ = cfAdoptOpt(readPtrAt(outBuf, 0));
+                                    e
+                                })
+                            )
+                        );
+                        if (rErr == kAXErrorInvalidUIElement()) {
+                            cellSet(deadRev, Cons(k, cellGet(deadRev)))
+                        } else {
+                            cellSet(keptRev, Cons((k, fp), cellGet(keptRev)))
+                        }
+                    };
+                    cellSet(ck, rk)
+                },
+                Nil -> (),
+            }
+        };
+        cellSet(st.elements, listRev(cellGet(keptRev)))
+    } else ();
+
+    AppDiscoveryOutcome {
+        pid: pid,
+        windows: listRev(cellGet(outWins)),
+        busy: cellGet(isBusy),
+        staleApiDisabled: cellGet(isStale),
+        deadHandles: listRev(cellGet(deadRev)),
+    }
+})
+
+def focusWindowInActor(st: AppExecState, key: Int64, legacy: Bool, useMainQueue: Bool): Bool =
+    withAutoreleasePool(() ->
+        match lookupElement(st, key) {
+            None -> false,
+            Some(el) ->
+                requestWindowFocus(el, st.axApp, st.pid, legacy, (p) ->
+                    if (useMainQueue) postMainExecEvent(ExecLegacyActivate { pid: p })
+                    else activateRunningAppPid(p)
+                ),
+        }
+    )
+
+def focusedWindowKeyInActor(st: AppExecState): Option Int64 =
+    withAutoreleasePool(() -> {
+        let winOpt = match axValue(st.axApp, "AXFocusedWindow") {
+            Some(w) -> Some(w),
+            None -> axValue(st.axApp, "AXMainWindow"),
+        };
+        match winOpt {
+            None -> None,
+            Some(wfp) -> match listFindBy(cellGet(st.elements), (p) -> { let (_, fp) = p; cfEqual(fp, wfp) }) {
+                Some((k, _)) -> Some(k),
+                None -> None,
+            },
+        }
+    })
+
+def liveFrameInActor(st: AppExecState, key: Int64): Option Rect =
+    withAutoreleasePool(() ->
+        match lookupElement(st, key) {
+            None -> None,
+            Some(el) -> axGetFrame(el),
+        }
+    )
+
+// ---------------------------------------------------------------------------
+// Per-PID AppWorker handle (main-thread side)
+// ---------------------------------------------------------------------------
+
+pub data AppWorker {
+    AppWorker {
+        pid: Int,
+        actor: Actor AppExecState,
+        queue: MVar AppQueueState,
+    }
+}
+
+def spawnAppWorker(pid: Int): AppWorker = {
+    let act: Actor AppExecState = actorSpawn(() -> AppExecState {
+        pid: pid,
+        axApp: axCreateApplication(pid),
+        elements: cellNew(Nil),
+    });
+    AppWorker {
+        pid: pid,
+        actor: act,
+        queue: mvarNew(emptyQueueState()),
+    }
+}
+
+def workerBusy(w: AppWorker): Bool = {
+    let qs = mvarTake(w.queue);
+    let b = qs.pumping;
+    mvarPut(w.queue, qs);
+    b
+}
+
+def workerContains(w: AppWorker, key: Int64): Bool = {
+    let qs = mvarTake(w.queue);
+    let isRun = match qs.running { Some(rk) -> rk == key, None -> false };
+    let isQueued = match qMapGet(qs.targets, key) { Some(_) -> true, None -> false };
+    mvarPut(w.queue, qs);
+    isRun || isQueued
+}
+
+def workerObserve(w: AppWorker, key: Int64, frame: Rect): Void = {
+    let qs = mvarTake(w.queue);
+    let isRun = match qs.running { Some(rk) -> rk == key, None -> false };
+    let isQueued = match qMapGet(qs.targets, key) { Some(_) -> true, None -> false };
+    let nextFrames = if (!isRun && !isQueued) qMapSet(qs.frames, key, frame) else qs.frames;
+    mvarPut(w.queue, AppQueueState {
+        targets: qs.targets,
+        order: qs.order,
+        frames: nextFrames,
+        forgottenDuringWrite: qs.forgottenDuringWrite,
+        pumping: qs.pumping,
+        running: qs.running,
+    })
+}
+
+def workerEnqueue(
+    w: AppWorker,
+    req: ExecRequest,
+    backend: ApplyBackend,
+    useMainQueue: Bool,
+    eventChan: Chan ExecEvent
+): Void = {
+    let qs = mvarTake(w.queue);
+    let key = req.goal.key;
+    let alreadyQueued = match qMapGet(qs.targets, key) { Some(_) -> true, None -> false };
+    let nextOrder = if (alreadyQueued) qs.order else qListAppendI64(qs.order, key);
+    let nextTargets = qMapSet(qs.targets, key, req);
+    let startPump = !qs.pumping;
+    mvarPut(w.queue, AppQueueState {
+        targets: nextTargets,
+        order: nextOrder,
+        frames: qs.frames,
+        forgottenDuringWrite: qs.forgottenDuringWrite,
+        pumping: true,
+        running: qs.running,
+    });
+    if (startPump) {
+        let qVar = w.queue;
+        actorSend(w.actor, (st) -> drainActorQueue(st, qVar, backend, useMainQueue, eventChan))
+    } else ()
+}
+
+def workerCancelKey(w: AppWorker, key: Int64): Void = {
+    let qs = mvarTake(w.queue);
+    let isRun = match qs.running { Some(rk) -> rk == key, None -> false };
+    let nextForgotten = if (isRun && !listContainsBy(qs.forgottenDuringWrite, key, eqI64)) {
+        Cons(key, qs.forgottenDuringWrite)
+    } else qs.forgottenDuringWrite;
+    mvarPut(w.queue, AppQueueState {
+        targets: qMapRemove(qs.targets, key),
+        order: qListRemoveI64(qs.order, key),
+        frames: qMapRemove(qs.frames, key),
+        forgottenDuringWrite: nextForgotten,
+        pumping: qs.pumping,
+        running: qs.running,
+    });
+    actorSend(w.actor, (st) -> forgetElementInActor(st, key))
+}
+
+def workerCancelQueued(w: AppWorker): Void = {
+    let qs = mvarTake(w.queue);
+    mvarPut(w.queue, AppQueueState {
+        targets: Nil,
+        order: Nil,
+        frames: qs.frames,
+        forgottenDuringWrite: qs.forgottenDuringWrite,
+        pumping: qs.pumping,
+        running: qs.running,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// WindowExecutor (main-thread confined coordinator over per-PID Actors)
+// ---------------------------------------------------------------------------
+
+pub data WindowExecutor {
+    WindowExecutor {
+        backend: ApplyBackend,
+        useMainQueue: Bool,
+        localEvents: Chan ExecEvent,
+        workers: Cell (List (Int, AppWorker)),
+        pending: Cell (List (Int64, ExecRequest)),
+        sequence: Cell Int64,
+        needsSettlement: Cell Bool,
+        submittedCount: Cell Int64,
+        appliedCount: Cell Int64,
+        focusAction: Cell (Option (() -> Void)),
+        focusRevision: Cell Int64,
+        focusKey: Cell (Option Int64),
+        focusPid: Cell (Option Int),
+        onResult: Cell (Option ((Int64, Int) -> Void)),
+        onSettled: Cell (Option (() -> Void)),
+    }
+}
+
+pub def windowExecutorNew(backend: ApplyBackend, useMainQueue: Bool): WindowExecutor =
+    WindowExecutor {
+        backend: backend,
+        useMainQueue: useMainQueue,
+        localEvents: chanUnbounded(),
+        workers: cellNew(Nil),
+        pending: cellNew(Nil),
+        sequence: cellNew(intToI64(0)),
+        needsSettlement: cellNew(false),
+        submittedCount: cellNew(intToI64(0)),
+        appliedCount: cellNew(intToI64(0)),
+        focusAction: cellNew(None),
+        focusRevision: cellNew(intToI64(0)),
+        focusKey: cellNew(None),
+        focusPid: cellNew(None),
+        onResult: cellNew(None),
+        onSettled: cellNew(None),
+    }
+
+pub def executorSetOnResult(ex: WindowExecutor, cb: (Int64, Int) -> Void): Void =
+    cellSet(ex.onResult, Some(cb))
+
+pub def executorSetOnSettled(ex: WindowExecutor, cb: () -> Void): Void =
+    cellSet(ex.onSettled, Some(cb))
+
+pub def executorSubmittedCount(ex: WindowExecutor): Int64 = cellGet(ex.submittedCount)
+pub def executorAppliedCount(ex: WindowExecutor): Int64 = cellGet(ex.appliedCount)
+pub def executorFocusKey(ex: WindowExecutor): Option Int64 = cellGet(ex.focusKey)
+pub def executorFocusPid(ex: WindowExecutor): Option Int = cellGet(ex.focusPid)
+
+pub def executorHasPendingGeometry(ex: WindowExecutor): Bool =
+    listLen(cellGet(ex.pending)) > 0
+        || listAny(cellGet(ex.workers), (p) -> { let (_, w) = p; workerBusy(w) })
+
+pub def executorHasPendingFocus(ex: WindowExecutor): Bool =
+    match cellGet(ex.focusAction) { Some(_) -> true, None -> false }
+
+pub def executorIsPending(ex: WindowExecutor, key: Int64): Bool =
+    (match qMapGet(cellGet(ex.pending), key) { Some(_) -> true, None -> false })
+        || listAny(cellGet(ex.workers), (p) -> { let (_, w) = p; workerContains(w, key) })
+
+pub def executorWorker(ex: WindowExecutor, pid: Int): AppWorker =
+    match listFindBy(cellGet(ex.workers), (p) -> { let (wpid, _) = p; wpid == pid }) {
+        Some((_, w)) -> w,
+        None -> {
+            let w = spawnAppWorker(pid);
+            cellSet(ex.workers, Cons((pid, w), cellGet(ex.workers)));
+            w
+        },
+    }
+
+pub def executorObserve(ex: WindowExecutor, key: Int64, pid: Int, frame: Rect): Void =
+    workerObserve(executorWorker(ex, pid), key, frame)
+
+pub def executorCancelFocus(ex: WindowExecutor): Void = {
+    cellSet(ex.focusRevision, cellGet(ex.focusRevision) + intToI64(1));
+    cellSet(ex.focusAction, None);
+    cellSet(ex.focusKey, None);
+    cellSet(ex.focusPid, None)
+}
+
+pub def executorSettleIfIdle(ex: WindowExecutor): Void =
+    if (cellGet(ex.needsSettlement) && !executorHasPendingGeometry(ex)) {
+        cellSet(ex.needsSettlement, false);
+        let actionOpt = cellGet(ex.focusAction);
+        let rev = cellGet(ex.focusRevision);
+        match actionOpt {
+            Some(act) -> act(),
+            None -> (),
+        };
+        if (cellGet(ex.focusRevision) == rev) executorCancelFocus(ex) else ();
+        if (!cellGet(ex.needsSettlement)) {
+            match cellGet(ex.onSettled) {
+                Some(cb) -> cb(),
+                None -> (),
+            }
+        } else ()
+    } else ()
+
+pub def executorHandleEvent(ex: WindowExecutor, ev: ExecEvent): Bool = match ev {
+    ExecCompleted { pid: _, sequence: seq, key: key, axError: err } -> {
+        cellSet(ex.appliedCount, cellGet(ex.appliedCount) + intToI64(1));
+        match qMapGet(cellGet(ex.pending), key) {
+            Some(curReq) if (curReq.sequence == seq) -> {
+                cellSet(ex.pending, qMapRemove(cellGet(ex.pending), key));
+                match cellGet(ex.onResult) {
+                    Some(cb) -> cb(key, err),
+                    None -> (),
+                };
+                executorSettleIfIdle(ex)
+            },
+            _ -> (),
+        };
+        true
+    },
+    ExecWorkerIdle { pid: _ } -> {
+        executorSettleIfIdle(ex);
+        true
+    },
+    ExecSettleCheck -> {
+        executorSettleIfIdle(ex);
+        true
+    },
+    ExecLegacyActivate { pid: pid } -> {
+        activateRunningAppPid(pid);
+        true
+    },
+    ExecCustomSignal { tag: _ } -> false,
+}
+
+/// Drain local test events when `useMainQueue == false`.
+pub def executorPumpLocalEvents(ex: WindowExecutor): Void = {
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match chanTryRecv(ex.localEvents) {
+            Some(ev) -> { let _ = executorHandleEvent(ex, ev); () },
+            None -> cellSet(running, false),
+        }
+    }
+}
+
+pub def executorSubmit(
+    ex: WindowExecutor,
+    goals: List WindowGoal,
+    focusKey: Option Int64,
+    focusPid: Option Int,
+    focusAction: Option (() -> Void)
+): Void = {
+    let hasGoals = listLen(goals) > 0;
+    let hasFocus = match focusAction { Some(_) -> true, None -> false };
+    if (hasGoals || hasFocus) {
+        cellSet(ex.needsSettlement, true);
+        match focusAction {
+            Some(act) -> {
+                cellSet(ex.focusRevision, cellGet(ex.focusRevision) + intToI64(1));
+                cellSet(ex.focusAction, Some(act));
+                cellSet(ex.focusKey, focusKey);
+                cellSet(ex.focusPid, focusPid)
+            },
+            None -> (),
+        };
+        let cg = cellNew(goals);
+        while (match cellGet(cg) { Nil -> false, _ -> true }) {
+            match cellGet(cg) {
+                Cons(g, rg) -> {
+                    cellSet(ex.submittedCount, cellGet(ex.submittedCount) + intToI64(1));
+                    let nextSeq = cellGet(ex.sequence) + intToI64(1);
+                    cellSet(ex.sequence, nextSeq);
+                    let req = ExecRequest { sequence: nextSeq, goal: g };
+                    cellSet(ex.pending, qMapSet(cellGet(ex.pending), g.key, req));
+                    let w = executorWorker(ex, g.pid);
+                    workerEnqueue(w, req, ex.backend, ex.useMainQueue, ex.localEvents);
+                    cellSet(cg, rg)
+                },
+                Nil -> (),
+            }
+        };
+        if (ex.useMainQueue) postMainExecEvent(ExecSettleCheck)
+        else { let _ = chanSend(ex.localEvents, ExecSettleCheck); () }
+    } else ()
+}
+
+pub def executorCancelQueued(ex: WindowExecutor): Void = {
+    executorCancelFocus(ex);
+    let cw = cellNew(cellGet(ex.workers));
+    while (match cellGet(cw) { Nil -> false, _ -> true }) {
+        match cellGet(cw) {
+            Cons((_, w), rw) -> { workerCancelQueued(w); cellSet(cw, rw) },
+            Nil -> (),
+        }
+    };
+    cellSet(ex.pending, Nil)
+}
+
+pub def executorForget(ex: WindowExecutor, key: Int64): Void = {
+    cellSet(ex.pending, qMapRemove(cellGet(ex.pending), key));
+    let cw = cellNew(cellGet(ex.workers));
+    while (match cellGet(cw) { Nil -> false, _ -> true }) {
+        match cellGet(cw) {
+            Cons((_, w), rw) -> { workerCancelKey(w, key); cellSet(cw, rw) },
+            Nil -> (),
+        }
+    };
+    match cellGet(ex.focusKey) {
+        Some(fk) if (fk == key) -> executorCancelFocus(ex),
+        _ -> (),
+    }
+}
+
+pub def executorRetainApplications(ex: WindowExecutor, livePids: List Int): Void = {
+    let keptRev: Cell (List (Int, AppWorker)) = cellNew(Nil);
+    let cw = cellNew(cellGet(ex.workers));
+    while (match cellGet(cw) { Nil -> false, _ -> true }) {
+        match cellGet(cw) {
+            Cons((pid, w), rw) -> {
+                if (listContainsBy(livePids, pid, eqInt)) {
+                    cellSet(keptRev, Cons((pid, w), cellGet(keptRev)))
+                } else {
+                    workerCancelQueued(w);
+                    actorStop(w.actor)
+                };
+                cellSet(cw, rw)
+            },
+            Nil -> (),
+        }
+    };
+    cellSet(ex.workers, listRev(cellGet(keptRev)));
+    cellSet(ex.pending, listFilter(cellGet(ex.pending), (p: (Int64, ExecRequest)) -> {
+        let (_, req) = p;
+        listContainsBy(livePids, req.goal.pid, eqInt)
+    }));
+    match cellGet(ex.focusPid) {
+        Some(fp) if (!listContainsBy(livePids, fp, eqInt)) -> executorCancelFocus(ex),
+        _ -> (),
+    }
+}
+
+/// Drain every active application Actor synchronously before exit or relaunch.
+/// Workers never block waiting on the main thread, so draining cannot deadlock.
+pub def executorFinishSynchronously(ex: WindowExecutor): Void = {
+    executorCancelFocus(ex);
+    let cw = cellNew(cellGet(ex.workers));
+    while (match cellGet(cw) { Nil -> false, _ -> true }) {
+        match cellGet(cw) {
+            Cons((_, w), rw) -> {
+                let _ = actorAsk(w.actor, (_) -> ());
+                cellSet(cw, rw)
+            },
+            Nil -> (),
+        }
+    };
+    cellSet(ex.pending, Nil);
+    cellSet(ex.needsSettlement, false)
+}
+
+// ---------------------------------------------------------------------------
+// Per-PID Actor operations exposed to WindowDiscovery & Manager
+// ---------------------------------------------------------------------------
+
+pub def executorDiscoverAppAsync(
+    ex: WindowExecutor,
+    pid: Int,
+    bundleId: Option String,
+    appVisible: List VisibleWindowCandidate,
+    doEnumerate: Bool
+): Task AppDiscoveryOutcome = {
+    let w = executorWorker(ex, pid);
+    actorCall(w.actor, (st) -> discoverAppInActor(st, bundleId, appVisible, doEnumerate))
+}
+
+pub def executorRequestFocus(ex: WindowExecutor, pid: Int, key: Int64, legacy: Bool): Void = {
+    let w = executorWorker(ex, pid);
+    let useMain = ex.useMainQueue;
+    actorSend(w.actor, (st) -> {
+        let _ = focusWindowInActor(st, key, legacy, useMain);
+        ()
+    })
+}
+
+pub def executorFocusedKeyForPid(ex: WindowExecutor, pid: Int): Option Int64 =
+    match listFindBy(cellGet(ex.workers), (p) -> { let (wp, _) = p; wp == pid }) {
+        None -> None,
+        Some((_, w)) -> actorAsk(w.actor, (st) -> focusedWindowKeyInActor(st)),
+    }
+
+pub def executorLiveFrameForWindow(ex: WindowExecutor, pid: Int, key: Int64): Option Rect =
+    match listFindBy(cellGet(ex.workers), (p) -> { let (wp, _) = p; wp == pid }) {
+        None -> None,
+        Some((_, w)) -> actorAsk(w.actor, (st) -> liveFrameInActor(st, key)),
+    }

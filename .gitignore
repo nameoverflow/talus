@@ -1,3 +1,4 @@
 build/
 Core/target/
 .DS_Store
+geisha.local.toml

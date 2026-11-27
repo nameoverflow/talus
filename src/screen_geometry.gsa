@@ -1,0 +1,108 @@
+/// Screen coordinate conversion, 1px corner parking, visible-window matching,
+/// and GUI session lock detection.
+
+use std.option.{Option, Some, None}
+use std.list.{listFilter, listAny}
+use std.math.{abs}
+use layout.{Rect, rectMinX, rectMinY, rectMaxX, rectMaxY, rectIntersects}
+use util.{maxFloat}
+
+/// Convert Cocoa's bottom-left global coordinates into Accessibility's
+/// top-left coordinates. The primary screen's top edge is the AX origin.
+pub def accessibilityFrame(visible: Rect, primaryTop: Float): Rect =
+    Rect {
+        x: rectMinX(visible),
+        y: primaryTop - rectMaxY(visible),
+        w: visible.w,
+        h: visible.h,
+    }
+
+/// Computes an off-screen corner origin in Accessibility coordinates that leaves
+/// 1 pixel of the window inside `screen` without spilling onto adjacent displays.
+pub def parkedWindowOrigin(
+    windowW: Float,
+    windowH: Float,
+    screen: Rect,
+    allScreens: List Rect
+): (Float, Float) = {
+    let w = maxFloat(windowW, 1.0);
+    let h = maxFloat(windowH, 1.0);
+    let others = listFilter(allScreens, (s) -> s != screen);
+
+    let c0Origin = (rectMaxX(screen) - 1.0, rectMaxY(screen) - 1.0);
+    let c0Spill = Rect { x: rectMaxX(screen), y: rectMaxY(screen) - 40.0, w: w, h: h + 40.0 };
+
+    let c1Origin = (rectMinX(screen) - w + 1.0, rectMaxY(screen) - 1.0);
+    let c1Spill = Rect { x: rectMinX(screen) - w, y: rectMaxY(screen) - 40.0, w: w, h: h + 40.0 };
+
+    let c2Origin = (rectMaxX(screen) - 1.0, rectMinY(screen) + 36.0);
+    let c2Spill = Rect { x: rectMaxX(screen), y: rectMinY(screen), w: w, h: h + 36.0 };
+
+    let c3Origin = (rectMinX(screen) - w + 1.0, rectMinY(screen) + 36.0);
+    let c3Spill = Rect { x: rectMinX(screen) - w, y: rectMinY(screen), w: w, h: h + 36.0 };
+
+    if (!listAny(others, (o) -> rectIntersects(o, c0Spill))) c0Origin
+    else if (!listAny(others, (o) -> rectIntersects(o, c1Spill))) c1Origin
+    else if (!listAny(others, (o) -> rectIntersects(o, c2Spill))) c2Origin
+    else if (!listAny(others, (o) -> rectIntersects(o, c3Spill))) c3Origin
+    else c0Origin
+}
+
+/// Returns true when `frame` is parked at the 1px horizontal outer edge of `screen`.
+pub def isParkedWindowFrame(frame: Rect, screen: Rect): Bool =
+    if (!rectIntersects(screen, frame)) false
+    else rectMinX(frame) >= rectMaxX(screen) - 3.0 || rectMaxX(frame) <= rectMinX(screen) + 3.0
+
+pub data VisibleWindowCandidate {
+    pid: Int,
+    windowId: Option Int,
+    bounds: Rect,
+}
+
+/// Matches an Accessibility window against CoreGraphics on-screen layer-0 windows.
+pub def matchesVisibleWindow(
+    pid: Int,
+    axWindowId: Option Int,
+    axFrame: Rect,
+    candidates: List VisibleWindowCandidate
+): Bool = {
+    let validWid = match axWindowId {
+        Some(id) if (id != 0) -> Some(id),
+        _ -> None,
+    };
+    listAny(candidates, (c: VisibleWindowCandidate) ->
+        if (c.pid != pid) false
+        else {
+            let widMatch = match (validWid, c.windowId) {
+                (Some(w1), Some(w2)) -> w1 == w2,
+                _ -> false,
+            };
+            if (widMatch) true
+            else abs(rectMinX(c.bounds) - rectMinX(axFrame)) < 3.0
+                && abs(rectMinY(c.bounds) - rectMinY(axFrame)) < 3.0
+                && abs(c.bounds.w - axFrame.w) < 3.0
+                && abs(c.bounds.h - axFrame.h) < 3.0
+        }
+    )
+}
+
+/// Detects whether the current GUI login session is locked or switched off-console.
+pub def isSessionLocked(
+    screenIsLocked: Option Bool,
+    onConsole: Option Bool,
+    frontmostBundleId: Option String
+): Bool = {
+    let loginFront = match frontmostBundleId {
+        Some(b) -> b == "com.apple.loginwindow",
+        None -> false,
+    };
+    let lockedFlag = match screenIsLocked {
+        Some(true) -> true,
+        _ -> false,
+    };
+    let offConsole = match onConsole {
+        Some(false) -> true,
+        _ -> false,
+    };
+    loginFront || lockedFlag || offConsole
+}

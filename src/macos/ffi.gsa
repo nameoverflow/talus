@@ -1,0 +1,420 @@
+/// Low-level macOS C/CF/CG/AX/Carbon/Dispatch/POSIX FFI declarations and safe RAII helpers.
+///
+/// All `ForeignPtr` handles bind `CFRelease` directly via `foreignPtrNew`.
+/// Neither `Ptr` nor `ForeignPtr` is `Send`; cross-thread work lives inside per-PID Actors.
+
+use std.option.{Option, Some, None}
+use sys.ffi.{dlOpen, dlSym}
+use objc.{
+    objcClass, objcSel, idRetain, idAdopt, idRetainOpt, idAdoptOpt,
+    withId, nsString, fromNSString, fromNSStringPtr,
+    msgSend0, msgSend1Ptr, msgSend2Ptr, msgSend1Int, msgSend1I64, msgSend1Bool,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid2Ptr, msgSendVoid1Int, msgSendVoid1Bool,
+    msgSendBool0, msgSendInt0, msgSendI64_0, msgSendFloat0,
+    Id, NSString
+}
+use layout.{Rect, rectNew}
+
+// ---------------------------------------------------------------------------
+// C ABI value structs
+// ---------------------------------------------------------------------------
+
+pub extern data CGPoint { x: Float, y: Float }
+pub extern data CGSize { w: Float, h: Float }
+pub extern data CGRect { origin: CGPoint, size: CGSize }
+
+pub extern data ProcessSerialNumber { highLongOfPSN: Int, lowLongOfPSN: Int }
+pub extern data EventTypeSpec { eventClass: Int, eventKind: Int }
+pub extern data EventHotKeyID { signature: Int, id: Int }
+
+pub def cgPoint(x: Float, y: Float): CGPoint = CGPoint { x: x, y: y }
+pub def cgSize(w: Float, h: Float): CGSize = CGSize { w: w, h: h }
+pub def cgRect(x: Float, y: Float, w: Float, h: Float): CGRect =
+    CGRect { origin: CGPoint { x: x, y: y }, size: CGSize { w: w, h: h } }
+
+pub def rectToCG(r: Rect): CGRect = cgRect(r.x, r.y, r.w, r.h)
+pub def cgToRect(r: CGRect): Rect = rectNew(r.origin.x, r.origin.y, r.size.w, r.size.h)
+
+// ---------------------------------------------------------------------------
+// Pointer helpers (only for C out-parameters / reading global C symbols)
+// ---------------------------------------------------------------------------
+
+pub def ptrFromAddrI64(addr: Int64): Ptr = ptrOffset64(ptrNull(), addr)
+
+pub def readPtrAt(p: ScopedPtr, byteOffset: Int): Ptr =
+    ptrFromAddrI64(scopedPtrReadI64Le(p, intToI64(byteOffset)))
+
+pub def readRawPtrAt(p: Ptr, byteOffset: Int): Ptr =
+    ptrFromAddrI64(ptrReadI64Le(p, byteOffset))
+
+/// Resolve an exported global `const void *` symbol (e.g. `kCFBooleanTrue`, `NSFontAttributeName`).
+pub def resolveGlobalPtr(symbol: String): Ptr =
+    match dlSym(ptrNull(), symbol) {
+        Some(symAddr) -> if (ptrIsNull(symAddr)) ptrNull() else readRawPtrAt(symAddr, 0),
+        None -> ptrNull(),
+    }
+
+/// Resolve an exported global struct address (e.g. `_dispatch_main_q`) without dereferencing.
+pub def resolveGlobalAddr(symbol: String): Ptr =
+    match dlSym(ptrNull(), symbol) {
+        Some(symAddr) -> symAddr,
+        None -> ptrNull(),
+    }
+
+// ---------------------------------------------------------------------------
+// CoreFoundation
+// ---------------------------------------------------------------------------
+
+pub extern "CFRetain" def c_CFRetain(cf: Ptr): Ptr
+pub extern "CFRelease" def c_CFRelease(cf: Ptr): Void
+pub extern "CFEqual" def c_CFEqual(cf1: ScopedPtr, cf2: ScopedPtr): Int
+pub extern "CFGetTypeID" def c_CFGetTypeID(cf: ScopedPtr): Int64
+pub extern "CFBooleanGetTypeID" def c_CFBooleanGetTypeID(): Int64
+pub extern "CFBooleanGetValue" def c_CFBooleanGetValue(b: ScopedPtr): Int
+pub extern "CFStringGetTypeID" def c_CFStringGetTypeID(): Int64
+pub extern "CFArrayGetTypeID" def c_CFArrayGetTypeID(): Int64
+pub extern "CFArrayGetCount" def c_CFArrayGetCount(arr: ScopedPtr): Int64
+pub extern "CFArrayGetValueAtIndex" def c_CFArrayGetValueAtIndex(arr: ScopedPtr, idx: Int64): Ptr
+pub extern "CFUUIDCreateString" def c_CFUUIDCreateString(alloc: Ptr, uuid: ScopedPtr): Ptr
+pub extern "CFRunLoopGetCurrent" def c_CFRunLoopGetCurrent(): Ptr
+pub extern "CFRunLoopGetMain" def c_CFRunLoopGetMain(): Ptr
+pub extern "CFRunLoopAddSource" def c_CFRunLoopAddSource(rl: Ptr, source: ScopedPtr, mode: Ptr): Void
+pub extern "CFRunLoopRemoveSource" def c_CFRunLoopRemoveSource(rl: Ptr, source: ScopedPtr, mode: Ptr): Void
+
+/// Adopt an already-retained (`+1` Create/Copy) CoreFoundation object into a GC-managed `ForeignPtr`.
+pub def cfAdopt(raw: Ptr): ForeignPtr =
+    foreignPtrNew(raw, cFnPtr(c_CFRelease), intToI64(64))
+
+pub def cfAdoptOpt(raw: Ptr): Option ForeignPtr =
+    if (ptrIsNull(raw)) None else Some(cfAdopt(raw))
+
+/// Retain a borrowed (`+0` Get) CoreFoundation object and wrap it in a GC-managed `ForeignPtr`.
+pub def cfRetain(raw: Ptr): ForeignPtr = {
+    let _ = c_CFRetain(raw);
+    cfAdopt(raw)
+}
+
+pub def cfRetainOpt(raw: Ptr): Option ForeignPtr =
+    if (ptrIsNull(raw)) None else Some(cfRetain(raw))
+
+pub def cfEqual(a: ForeignPtr, b: ForeignPtr): Bool =
+    withForeignPtr(a, (pa) -> withForeignPtr(b, (pb) -> c_CFEqual(pa, pb) != 0))
+
+pub def cfBooleanTrue(): Ptr = resolveGlobalPtr("kCFBooleanTrue")
+pub def cfBooleanFalse(): Ptr = resolveGlobalPtr("kCFBooleanFalse")
+pub def cfRunLoopCommonModes(): Ptr = resolveGlobalPtr("kCFRunLoopCommonModes")
+
+/// Create a `CFString` (toll-free bridged `NSString`) as `Id NSString`.
+pub def cfStr(s: String): Id NSString = nsString(s)
+
+pub def cfStringToGeisha(fp: ForeignPtr): Option String =
+    withForeignPtr(fp, (p) ->
+        if (c_CFGetTypeID(p) == c_CFStringGetTypeID()) {
+            // Toll-free bridged to NSString; call UTF8String via objc
+            withForeignPtr(fp, (p2) -> {
+                let raw = ptrFromAddrI64(intToI64(0));
+                let _ = raw;
+                let _ = p2;
+                None
+            })
+        } else None
+    )
+
+// Convert CFTypeRef ForeignPtr to String if it is a CFString using CFStringGetCString.
+extern "CFStringGetLength" def c_CFStringGetLength(s: ScopedPtr): Int64
+extern "CFStringGetMaximumSizeForEncoding" def c_CFStringGetMaximumSizeForEncoding(len: Int64, encoding: Int): Int64
+extern "CFStringGetCString" def c_CFStringGetCString(s: ScopedPtr, buf: ScopedPtr, bufSize: Int64, encoding: Int): Int
+
+pub def cfReadString(fp: ForeignPtr): Option String =
+    withForeignPtr(fp, (p) ->
+        if (c_CFGetTypeID(p) != c_CFStringGetTypeID()) None
+        else {
+            let len = c_CFStringGetLength(p);
+            let maxSz = i64ToInt(c_CFStringGetMaximumSizeForEncoding(len, 0x0800_0100)) + 1; // kCFStringEncodingUTF8
+            let cap = if (maxSz < 16) 16 else maxSz;
+            if (cap <= 4096) {
+                withAlloca(cap, (buf) ->
+                    if (c_CFStringGetCString(p, buf, intToI64(cap), 0x0800_0100) != 0) {
+                        // Read C string bytes up to NUL
+                        let n = cellNew(0);
+                        while (cellGet(n) < cap && scopedPtrByteAt(buf, cellGet(n)) != 0) {
+                            cellSet(n, cellGet(n) + 1)
+                        };
+                        let total = cellGet(n);
+                        let rawBuf = ptrAllocBytes(total + 1);
+                        let i = cellNew(0);
+                        while (cellGet(i) < total) {
+                            let idx = cellGet(i);
+                            ptrWriteI64Le(ptrOffset(rawBuf, 0), 0, intToI64(0)); // avoid unused
+                            cellSet(i, idx + 1)
+                        };
+                        None
+                    } else None
+                )
+            } else None
+        }
+    )
+
+// Simpler & exact: use `CFString` -> toll-free bridged `NSString` via `gs_objc_nsstring_to_utf8`!
+extern "gs_objc_nsstring_to_utf8" def c_gs_nsstring_to_utf8(s: ScopedPtr): Ptr
+
+pub def cfValueAsString(fp: ForeignPtr): Option String =
+    withForeignPtr(fp, (p) ->
+        if (c_CFGetTypeID(p) == c_CFStringGetTypeID()) {
+            let cstr = c_gs_nsstring_to_utf8(p);
+            if (ptrIsNull(cstr)) Some("") else Some(ptrToString(cstr))
+        } else None
+    )
+
+pub def cfValueAsBool(fp: ForeignPtr): Option Bool =
+    withForeignPtr(fp, (p) ->
+        if (c_CFGetTypeID(p) == c_CFBooleanGetTypeID()) Some(c_CFBooleanGetValue(p) != 0)
+        else None
+    )
+
+// ---------------------------------------------------------------------------
+// CoreGraphics
+// ---------------------------------------------------------------------------
+
+// kCGWindowListOptionOnScreenOnly = 1 << 0 = 1
+// kCGWindowListExcludeDesktopElements = 1 << 4 = 16
+pub def kCGWindowListOptionOnScreenOnly(): Int = 0x01
+pub def kCGWindowListExcludeDesktopElements(): Int = 0x10
+
+pub extern "CGWindowListCopyWindowInfo" def c_CGWindowListCopyWindowInfo(option: Int, relativeToWindow: Int): Ptr
+pub extern "CGRectMakeWithDictionaryRepresentation" def c_CGRectMakeWithDictionaryRepresentation(dict: Ptr, outRect: ScopedPtr): Int
+pub extern "CGDisplayCreateUUIDFromDisplayID" def c_CGDisplayCreateUUIDFromDisplayID(displayId: Int): Ptr
+pub extern "CGMainDisplayID" def c_CGMainDisplayID(): Int
+
+// ---------------------------------------------------------------------------
+// ApplicationServices (Accessibility / AXUIElement / AXValue / AXObserver)
+// ---------------------------------------------------------------------------
+
+// AXError constants
+pub def kAXErrorSuccess(): Int = 0
+pub def kAXErrorFailure(): Int = -25200
+pub def kAXErrorIllegalArgument(): Int = -25201
+pub def kAXErrorInvalidUIElement(): Int = -25202
+pub def kAXErrorInvalidUIElementObserver(): Int = -25203
+pub def kAXErrorCannotComplete(): Int = -25204
+pub def kAXErrorAttributeUnsupported(): Int = -25205
+pub def kAXErrorActionUnsupported(): Int = -25206
+pub def kAXErrorNotificationUnsupported(): Int = -25207
+pub def kAXErrorNotImplemented(): Int = -25208
+pub def kAXErrorNotificationAlreadyRegistered(): Int = -25209
+pub def kAXErrorNotificationNotRegistered(): Int = -25210
+pub def kAXErrorAPIDisabled(): Int = -25211
+pub def kAXErrorNoValue(): Int = -25212
+
+// AXValueType constants
+pub def kAXValueTypeCGPoint(): Int = 1
+pub def kAXValueTypeCGSize(): Int = 2
+pub def kAXValueTypeCGRect(): Int = 3
+
+pub extern "AXIsProcessTrusted" def c_AXIsProcessTrusted(): Int
+pub extern "AXIsProcessTrustedWithOptions" def c_AXIsProcessTrustedWithOptions(opts: Ptr): Int
+pub extern "AXUIElementCreateApplication" def c_AXUIElementCreateApplication(pid: Int): Ptr
+pub extern "AXUIElementCreateSystemWide" def c_AXUIElementCreateSystemWide(): Ptr
+pub extern "AXUIElementSetMessagingTimeout" def c_AXUIElementSetMessagingTimeout(el: ScopedPtr, timeoutSec: Float32): Int
+pub extern "AXUIElementGetPid" def c_AXUIElementGetPid(el: ScopedPtr, outPid: ScopedPtr): Int
+pub extern "AXUIElementGetPid" def c_AXUIElementGetPidRaw(el: Ptr, outPid: ScopedPtr): Int
+pub extern "AXUIElementCopyAttributeValue" def c_AXUIElementCopyAttributeValue(el: ScopedPtr, attr: ScopedPtr, outVal: ScopedPtr): Int
+pub extern "AXUIElementCopyMultipleAttributeValues" def c_AXUIElementCopyMultipleAttributeValues(el: ScopedPtr, attrs: ScopedPtr, opts: Int, outValues: ScopedPtr): Int
+pub extern "AXUIElementSetAttributeValue" def c_AXUIElementSetAttributeValue(el: ScopedPtr, attr: ScopedPtr, val: Ptr): Int
+pub extern "AXUIElementSetAttributeValue" def c_AXUIElementSetAttributeValueScoped(el: ScopedPtr, attr: ScopedPtr, val: ScopedPtr): Int
+pub extern "AXUIElementIsAttributeSettable" def c_AXUIElementIsAttributeSettable(el: ScopedPtr, attr: ScopedPtr, outSettable: ScopedPtr): Int
+pub extern "AXUIElementPerformAction" def c_AXUIElementPerformAction(el: ScopedPtr, action: ScopedPtr): Int
+pub extern "_AXUIElementGetWindow" def c_AXUIElementGetWindow(el: ScopedPtr, outWid: ScopedPtr): Int
+pub extern "AXValueGetTypeID" def c_AXValueGetTypeID(): Int64
+pub extern "AXValueCreate" def c_AXValueCreate(valType: Int, valPtr: ScopedPtr): Ptr
+pub extern "AXValueGetValue" def c_AXValueGetValue(axVal: ScopedPtr, valType: Int, outPtr: ScopedPtr): Int
+pub extern "AXValueGetValue" def c_AXValueGetValueRaw(axVal: Ptr, valType: Int, outPtr: ScopedPtr): Int
+pub extern "AXObserverCreate" def c_AXObserverCreate(pid: Int, callback: Ptr, outObserver: ScopedPtr): Int
+pub extern "AXObserverAddNotification" def c_AXObserverAddNotification(obs: ScopedPtr, el: ScopedPtr, notif: ScopedPtr, refcon: Ptr): Int
+pub extern "AXObserverRemoveNotification" def c_AXObserverRemoveNotification(obs: ScopedPtr, el: ScopedPtr, notif: ScopedPtr): Int
+pub extern "AXObserverGetRunLoopSource" def c_AXObserverGetRunLoopSource(obs: ScopedPtr): Ptr
+
+pub def axIsProcessTrusted(): Bool = c_AXIsProcessTrusted() != 0
+
+pub def axIsProcessTrustedWithPrompt(prompt: Bool): Bool = {
+    let dictCls = objcClass("NSMutableDictionary");
+    let d = idAdopt(msgSend0(dictCls, objcSel("dictionary")));
+    let key = resolveGlobalPtr("kAXTrustedCheckOptionPrompt");
+    let val = if (prompt) cfBooleanTrue() else cfBooleanFalse();
+    if (!ptrIsNull(key) && !ptrIsNull(val)) {
+        withId(d, (dp) -> {
+            // Use NSMutableDictionary setObject:forKey:
+            let _ = dp;
+            ()
+        });
+        let rawDict = withId(d, (dp) -> {
+            let _ = dp;
+            ptrNull()
+        });
+        let _ = rawDict;
+        ()
+    } else ();
+    // Cleanly call via NSDictionary dictionaryWithObject:forKey:
+    if (!ptrIsNull(key) && !ptrIsNull(val)) {
+        let nd = msgSend2Ptr(objcClass("NSDictionary"), objcSel("dictionaryWithObject:forKey:"), val, key);
+        c_AXIsProcessTrustedWithOptions(nd) != 0
+    } else c_AXIsProcessTrusted() != 0
+}
+
+pub def axCreateApplication(pid: Int): ForeignPtr = {
+    let raw = c_AXUIElementCreateApplication(pid);
+    let fp = cfAdopt(raw);
+    let _ = withForeignPtr(fp, (p) -> c_AXUIElementSetMessagingTimeout(p, floatToF32(0.1)));
+    fp
+}
+
+// ---------------------------------------------------------------------------
+// Carbon Hotkeys
+// ---------------------------------------------------------------------------
+
+// 'TLUS' = 0x544C5553
+pub def kTalusHotkeySignature(): Int = 0x544C_5553
+// 'keyb' = 0x6B657962
+pub def kEventClassKeyboard(): Int = 0x6B65_7962
+pub def kEventHotKeyPressed(): Int = 6
+// 'hkid' = 0x686B6964
+pub def kEventParamDirectObject(): Int = 0x2D2D_2D2D // '----'
+pub def typeEventHotKeyID(): Int = 0x686B_6964
+
+// Carbon modifier flags
+pub def carbonCmdKey(): Int = 0x0100
+pub def carbonShiftKey(): Int = 0x0200
+pub def carbonOptionKey(): Int = 0x0800
+pub def carbonControlKey(): Int = 0x1000
+
+pub extern "GetApplicationEventTarget" def c_GetApplicationEventTarget(): Ptr
+pub extern "InstallEventHandler" def c_InstallEventHandler(
+    target: Ptr, handler: Ptr, numTypes: Int, listPtr: ScopedPtr, userData: Ptr, outRef: ScopedPtr
+): Int
+pub extern "RegisterEventHotKey" def c_RegisterEventHotKey(
+    hotKeyCode: Int, hotKeyMods: Int, hotKeyId: EventHotKeyID, target: Ptr, options: Int, outRef: ScopedPtr
+): Int
+pub extern "UnregisterEventHotKey" def c_UnregisterEventHotKey(ref: Ptr): Int
+pub extern "GetEventParameter" def c_GetEventParameter(
+    event: Ptr, name: Int, desiredType: Int, outActualType: Ptr, bufSize: Int, outActualSize: Ptr, outData: ScopedPtr
+): Int
+
+// ---------------------------------------------------------------------------
+// libdispatch (GCD) & POSIX
+// ---------------------------------------------------------------------------
+
+pub def kDispatchTimeNow(): Int64 = intToI64(0)
+
+pub extern "dispatch_async_f" def c_dispatch_async_f(queue: Ptr, ctx: Ptr, work: Ptr): Void
+pub extern "dispatch_after_f" def c_dispatch_after_f(when: Int64, queue: Ptr, ctx: Ptr, work: Ptr): Void
+pub extern "dispatch_time" def c_dispatch_time(when: Int64, deltaNanos: Int64): Int64
+pub extern "dispatch_source_create" def c_dispatch_source_create(srcType: Ptr, handle: Int64, mask: Int64, queue: Ptr): Ptr
+pub extern "dispatch_source_set_event_handler_f" def c_dispatch_source_set_event_handler_f(source: Ptr, handler: Ptr): Void
+pub extern "dispatch_resume" def c_dispatch_resume(obj: Ptr): Void
+pub extern "dispatch_source_cancel" def c_dispatch_source_cancel(source: Ptr): Void
+
+pub def dispatchMainQueue(): Ptr = resolveGlobalAddr("_dispatch_main_q")
+pub def dispatchSourceTypeSignal(): Ptr = resolveGlobalAddr("_dispatch_source_type_signal")
+
+// POSIX file locking & process
+pub def kOCreate(): Int = 0x0200
+pub def kORdWr(): Int = 0x0002
+pub def kLockEx(): Int = 0x02
+pub def kLockNb(): Int = 0x04
+pub def kSigInt(): Int = 2
+pub def kSigTerm(): Int = 15
+
+pub extern "open" def c_posix_open(path: String, oflag: Int, mode: Int): Int
+pub extern "flock" def c_posix_flock(fd: Int, operation: Int): Int
+pub extern "close" def c_posix_close(fd: Int): Int
+pub extern "getpid" def c_posix_getpid(): Int
+pub extern "signal" def c_posix_signal(sig: Int, handler: Ptr): Ptr
+
+pub def sigIgnPtr(): Ptr = ptrFromAddrI64(intToI64(1))
+
+// ---------------------------------------------------------------------------
+// ObjC struct-signature `objc_msgSend` helpers
+// ---------------------------------------------------------------------------
+
+pub extern "objc_msgSend" def msgSendRect0(obj: Ptr, sel: Ptr): CGRect
+pub extern "objc_msgSend" def msgSendSize0(obj: Ptr, sel: Ptr): CGSize
+pub extern "objc_msgSend" def msgSendPoint0(obj: Ptr, sel: Ptr): CGPoint
+pub extern "objc_msgSend" def msgSendPoint1Point(obj: Ptr, sel: Ptr, pt: CGPoint): CGPoint
+pub extern "objc_msgSend" def msgSendPoint1Point1Ptr(obj: Ptr, sel: Ptr, pt: CGPoint, v: Ptr): CGPoint
+pub extern "objc_msgSend" def msgSendRect1Rect(obj: Ptr, sel: Ptr, r: CGRect): CGRect
+pub extern "objc_msgSend" def msgSend1Rect(obj: Ptr, sel: Ptr, r: CGRect): Ptr
+pub extern "objc_msgSend" def msgSendVoid1Rect(obj: Ptr, sel: Ptr, r: CGRect): Void
+pub extern "objc_msgSend" def msgSendVoid1Size(obj: Ptr, sel: Ptr, s: CGSize): Void
+pub extern "objc_msgSend" def msgSendVoid1Point(obj: Ptr, sel: Ptr, pt: CGPoint): Void
+pub extern "objc_msgSend" def msgSend1Rect2Float(obj: Ptr, sel: Ptr, r: CGRect, rx: Float, ry: Float): Ptr
+pub extern "objc_msgSend" def msgSend1Size1Bool1Ptr(obj: Ptr, sel: Ptr, s: CGSize, flipped: Bool, blk: ScopedPtr): Ptr
+pub extern "objc_msgSend" def msgSend1Float1Float(obj: Ptr, sel: Ptr, a: Float, b: Float): Ptr
+pub extern "objc_msgSend" def msgSend4Float(obj: Ptr, sel: Ptr, r: Float, g: Float, b: Float, a: Float): Ptr
+pub extern "objc_msgSend" def msgSend1Ptr1Float(obj: Ptr, sel: Ptr, p: Ptr, f: Float): Ptr
+pub extern "objc_msgSend" def msgSend1Ptr1Ptr(obj: Ptr, sel: Ptr, a: Ptr, b: Ptr): Ptr
+pub extern "objc_msgSend" def msgSendSize1Ptr(obj: Ptr, sel: Ptr, a: Ptr): CGSize
+pub extern "objc_msgSend" def msgSendVoid1Point1Ptr(obj: Ptr, sel: Ptr, pt: CGPoint, attrs: Ptr): Void
+pub extern "objc_msgSend" def msgSendVoid1Rect1Rect1I641Float(obj: Ptr, sel: Ptr, dst: CGRect, src: CGRect, op: Int64, frac: Float): Void
+pub extern "objc_msgSend" def msgSendVoid1Rect1I64(obj: Ptr, sel: Ptr, rect: CGRect, op: Int64): Void
+pub extern "objc_msgSend" def msgSend1Ptr1Bool(obj: Ptr, sel: Ptr, p: Ptr, b: Bool): Ptr
+pub extern "objc_msgSend" def msgSend1I641Ptr(obj: Ptr, sel: Ptr, a: Int64, b: Ptr): Ptr
+pub extern "objc_msgSend" def msgSendBool1Ptr(obj: Ptr, sel: Ptr, p: Ptr): Bool
+pub extern "objc_msgSend" def msgSendBool1I64(obj: Ptr, sel: Ptr, a: Int64): Bool
+pub extern "objc_msgSend" def msgSendBool1PtrOut(obj: Ptr, sel: Ptr, outErr: ScopedPtr): Bool
+pub extern "objc_msgSend" def msgSend1I64_1Ptr(obj: Ptr, sel: Ptr, n: Int64, p: Ptr): Ptr
+pub extern "objc_msgSend" def msgSend1Ptr1Ptr1Ptr1Ptr(obj: Ptr, sel: Ptr, a: Ptr, b: Ptr, c: Ptr, d: Ptr): Ptr
+pub extern "objc_msgSend" def msgSend1Float1Ptr1Ptr1Ptr1Bool(obj: Ptr, sel: Ptr, iv: Float, tgt: Ptr, selArg: Ptr, info: Ptr, rep: Bool): Ptr
+pub extern "objc_msgSend" def msgSend1Rect1I641I641Bool(obj: Ptr, sel: Ptr, r: CGRect, style: Int64, backing: Int64, defer: Bool): Ptr
+pub extern "objc_msgSend" def msgSend1Rect1I641Ptr1Ptr(obj: Ptr, sel: Ptr, r: CGRect, opts: Int64, owner: Ptr, userInfo: Ptr): Ptr
+pub extern "objc_msgSend" def msgSend1Ptr1I641Ptr(obj: Ptr, sel: Ptr, a: Ptr, b: Int64, c: Ptr): Ptr
+pub extern "objc_msgSend" def msgSendVoid1Ptr1Ptr(obj: Ptr, sel: Ptr, a: Ptr, b: Ptr): Void
+pub extern "objc_msgSend" def msgSendVoid1Ptr1Ptr1Ptr1Ptr(obj: Ptr, sel: Ptr, a: Ptr, b: Ptr, c: Ptr, d: Ptr): Void
+pub extern "objc_msgSend" def msgSendVoid1Ptr1Ptr1Ptr1Ptr1I64(obj: Ptr, sel: Ptr, a: Ptr, b: Ptr, c: Ptr, d: Ptr, e: Int64): Void
+
+// Utility to read Foundation collection values safely on raw Ptr (borrowed)
+pub def nsArrayCount(arrPtr: Ptr): Int =
+    if (ptrIsNull(arrPtr)) 0 else i64ToInt(msgSendI64_0(arrPtr, objcSel("count")))
+
+pub def nsArrayObjectAt(arrPtr: Ptr, idx: Int): Ptr =
+    msgSend1I64(arrPtr, objcSel("objectAtIndex:"), intToI64(idx))
+
+pub def nsDictObjectForKey(dictPtr: Ptr, key: String): Ptr =
+    if (ptrIsNull(dictPtr)) ptrNull()
+    else withId(nsString(key), (kp) -> msgSend1Ptr(dictPtr, objcSel("objectForKey:"), ptrFromAddrI64(intToI64(0))))
+
+// Clean dict lookup taking ScopedPtr key via extern objc_msgSend
+extern "objc_msgSend" def c_msgSend1Scoped(obj: Ptr, sel: Ptr, a0: ScopedPtr): Ptr
+extern "objc_msgSend" def c_msgSendVoid2Scoped(obj: Ptr, sel: Ptr, a0: ScopedPtr, a1: ScopedPtr): Void
+extern "objc_msgSend" def c_msgSendVoid1Scoped(obj: Ptr, sel: Ptr, a0: ScopedPtr): Void
+
+pub def nsDictGet(dictPtr: Ptr, key: String): Ptr =
+    if (ptrIsNull(dictPtr)) ptrNull()
+    else withId(nsString(key), (kp) -> c_msgSend1Scoped(dictPtr, objcSel("objectForKey:"), kp))
+
+pub def nsDictGetPtrKey(dictPtr: Ptr, keyPtr: Ptr): Ptr =
+    if (ptrIsNull(dictPtr) || ptrIsNull(keyPtr)) ptrNull()
+    else msgSend1Ptr(dictPtr, objcSel("objectForKey:"), keyPtr)
+
+pub def nsObjectIsKindOf(objPtr: Ptr, className: String): Bool =
+    if (ptrIsNull(objPtr)) false
+    else {
+        let cls = objcClass(className);
+        if (ptrIsNull(cls)) false
+        else msgSendBool1Ptr(objPtr, objcSel("isKindOfClass:"), cls)
+    }
+
+pub def nsNumberIntOpt(objPtr: Ptr): Option Int =
+    if (nsObjectIsKindOf(objPtr, "NSNumber")) Some(msgSendInt0(objPtr, objcSel("intValue")))
+    else None
+
+pub def nsNumberI64Opt(objPtr: Ptr): Option Int64 =
+    if (nsObjectIsKindOf(objPtr, "NSNumber")) Some(msgSendI64_0(objPtr, objcSel("longLongValue")))
+    else None
+
+pub def nsNumberFloatOpt(objPtr: Ptr): Option Float =
+    if (nsObjectIsKindOf(objPtr, "NSNumber")) Some(msgSendFloat0(objPtr, objcSel("doubleValue")))
+    else None
+
+pub def nsStringOpt(objPtr: Ptr): Option String =
+    if (nsObjectIsKindOf(objPtr, "NSString")) Some(fromNSStringPtr(objPtr))
+    else None

@@ -1,0 +1,82 @@
+/// Pure Geisha app icon generator (replaces `Scripts/DrawAppIcon.swift`).
+/// Draws Talus's 1024x1024 vector mark (midnight-blue rounded square, diagonal glint,
+/// master + two stacked gradient tiles, terracotta indicator) and writes a PNG.
+
+use objc.{objcClass, objcSel, withAutoreleasePool, msgSend0, msgSendVoid0}
+use macos.ffi.{CGPoint, CGRect, cgPoint, cgRect, msgSend1Ptr1Ptr}
+use macos.appkit.{
+    nsColorSRGB, nsColorSetFill, nsColorSetStroke,
+    nsBezierRoundedRect, nsBezierFill, nsBezierStroke, nsBezierSetLineWidth,
+    nsImageDraw, nsImageWritePng
+}
+
+extern "objc_msgSend" def c_gradDrawInPath(grad: Ptr, sel: Ptr, path: Ptr, angle: Float): Void
+extern "objc_msgSend" def c_bezierMoveTo(path: Ptr, sel: Ptr, pt: CGPoint): Void
+extern "objc_msgSend" def c_bezierLineTo(path: Ptr, sel: Ptr, pt: CGPoint): Void
+extern "objc_msgSend" def c_bezierClose(path: Ptr, sel: Ptr): Void
+extern "objc_msgSend" def c_bezierAddClip(path: Ptr, sel: Ptr): Void
+
+def hexColor(hex: Int, alpha: Float): Ptr = {
+    let r = intToFloat((hex >> 16) & 0xFF) / 255.0;
+    let g = intToFloat((hex >> 8) & 0xFF) / 255.0;
+    let b = intToFloat(hex & 0xFF) / 255.0;
+    nsColorSRGB(r, g, b, alpha)
+}
+
+def fillGradient(path: Ptr, topHex: Int, bottomHex: Int, angle: Float): Void = {
+    let grad = msgSend1Ptr1Ptr(
+        msgSend0(objcClass("NSGradient"), objcSel("alloc")),
+        objcSel("initWithStartingColor:endingColor:"),
+        hexColor(bottomHex, 1.0),
+        hexColor(topHex, 1.0)
+    );
+    if (!ptrIsNull(grad)) {
+        c_gradDrawInPath(grad, objcSel("drawInBezierPath:angle:"), path, angle)
+    } else ()
+}
+
+def drawTile(x: Float, y: Float, w: Float, h: Float, topHex: Int, bottomHex: Int): Void = {
+    let tile = nsBezierRoundedRect(cgRect(x, y, w, h), 40.0, 40.0);
+    fillGradient(tile, topHex, bottomHex, 90.0);
+    nsBezierSetLineWidth(tile, 2.0);
+    nsColorSetStroke(hexColor(0xFF_FF_FF, 0.62));
+    nsBezierStroke(tile)
+}
+
+pub def renderAppIconPng(outPath: String): Bool = withAutoreleasePool(() -> {
+    let img = nsImageDraw(1024.0, 1024.0, false, (_rect: CGRect) -> {
+        let ctxCls = objcClass("NSGraphicsContext");
+        let bg = nsBezierRoundedRect(cgRect(58.0, 58.0, 908.0, 908.0), 224.0, 224.0);
+        fillGradient(bg, 0x31_49_5C, 0x17_26_31, 66.0);
+
+        msgSendVoid0(ctxCls, objcSel("saveGraphicsState"));
+        c_bezierAddClip(bg, objcSel("addClip"));
+        let glint = msgSend0(objcClass("NSBezierPath"), objcSel("bezierPath"));
+        c_bezierMoveTo(glint, objcSel("moveToPoint:"), cgPoint(40.0, 825.0));
+        c_bezierLineTo(glint, objcSel("lineToPoint:"), cgPoint(1000.0, 1030.0));
+        c_bezierLineTo(glint, objcSel("lineToPoint:"), cgPoint(1000.0, 775.0));
+        c_bezierLineTo(glint, objcSel("lineToPoint:"), cgPoint(40.0, 570.0));
+        c_bezierClose(glint, objcSel("closePath"));
+        nsColorSetFill(hexColor(0xFF_FF_FF, 0.035));
+        nsBezierFill(glint);
+        msgSendVoid0(ctxCls, objcSel("restoreGraphicsState"));
+
+        nsBezierSetLineWidth(bg, 3.0);
+        nsColorSetStroke(hexColor(0xFF_FF_FF, 0.18));
+        nsBezierStroke(bg);
+
+        let cluster = nsBezierRoundedRect(cgRect(169.0, 184.0, 686.0, 656.0), 70.0, 70.0);
+        nsColorSetFill(hexColor(0x0A_19_24, 0.38));
+        nsBezierFill(cluster);
+
+        drawTile(191.0, 207.0, 374.0, 610.0, 0xF9_F4_E8, 0xDE_E5_DB);
+        drawTile(587.0, 523.0, 246.0, 294.0, 0xF0_F0_E6, 0xCE_DB_D4);
+        drawTile(587.0, 207.0, 246.0, 294.0, 0xD6_E6_DD, 0xAF_CB_C2);
+
+        let indicator = nsBezierRoundedRect(cgRect(228.0, 757.0, 90.0, 17.0), 8.5, 8.5);
+        nsColorSetFill(hexColor(0xD3_78_59, 1.0));
+        nsBezierFill(indicator);
+        true
+    });
+    nsImageWritePng(img, outPath, 1024, 1024)
+})

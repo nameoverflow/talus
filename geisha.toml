@@ -1,0 +1,35 @@
+name = "talus"
+version = "0.2.0"
+entry = "src/main.gsa"
+src_dir = "src"
+
+[deps]
+objc = { path = "../objc.gsa" }
+
+[target.native]
+link_flags = [
+    "-lobjc",
+    "-framework", "Cocoa",
+    "-framework", "Carbon",
+    "-framework", "ApplicationServices",
+    "-framework", "ServiceManagement",
+    "-framework", "CoreGraphics",
+    "-framework", "QuartzCore",
+]
+
+[target.macos]
+bundle_id    = "local.talus.windowmanager"
+bundle_name  = "Talus"
+min_os       = "15.0"
+lsui_element = true
+info_plist   = "Resources/Info.plist"
+icon         = "build/Talus.icns"
+frameworks   = [
+    "Cocoa",
+    "Carbon",
+    "ApplicationServices",
+    "ServiceManagement",
+    "CoreGraphics",
+    "QuartzCore",
+]
+codesign     = "-"

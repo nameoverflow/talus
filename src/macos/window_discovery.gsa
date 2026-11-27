@@ -1,0 +1,257 @@
+/// Window discovery combining:
+/// 1. Main-thread `NSWorkspace.shared.runningApplications` snapshot (pure `Send` `RunningAppInfo`)
+/// 2. `CGWindowListCopyWindowInfo` on-screen & all-window scans
+/// 3. Parallel per-PID `actorCall` AX enumeration inside each app's serial `Actor AppExecState`
+
+use std.option.{Option, Some, None}
+use std.list.{listLen, listRev, listFilter, listAppend}
+use std.task.{Task, await}
+use objc.{objcClass, objcSel, msgSend0, msgSendInt0, msgSendI64_0, msgSendBool0, fromNSStringPtr}
+use util.{eqInt, eqStr, listContainsBy}
+use layout.{Rect, rectNew}
+use screen_geometry.{VisibleWindowCandidate}
+use macos.ffi.{
+    c_CGWindowListCopyWindowInfo, c_CGRectMakeWithDictionaryRepresentation,
+    c_CFArrayGetCount, c_CFArrayGetValueAtIndex,
+    kCGWindowListOptionOnScreenOnly, kCGWindowListExcludeDesktopElements,
+    cfAdoptOpt, resolveGlobalPtr,
+    nsArrayCount, nsArrayObjectAt, nsDictGetPtrKey,
+    nsNumberIntOpt, nsNumberFloatOpt
+}
+use macos.executor.{
+    WindowExecutor, DiscoveredAppWindow, AppDiscoveryOutcome,
+    executorDiscoverAppAsync
+}
+
+pub data RunningAppInfo {
+    RunningAppInfo {
+        pid: Int,
+        bundleId: Option String,
+    }
+}
+
+pub data WindowDiscoveryResult {
+    WindowDiscoveryResult {
+        windows: List DiscoveredAppWindow,
+        busyPids: List Int,
+        visibleWindowIds: List Int,
+        existingWindowIds: List Int,
+        deadHandles: List Int64,
+        livePids: List Int,
+        eligibleVisibleWindowExists: Bool,
+        staleApiDisabled: Bool,
+    }
+}
+
+/// Collect regular, unhidden running applications from `NSWorkspace.shared` (call on main thread).
+pub def collectRunningApps(ownPid: Int, ignoredApps: List String, selectedPids: Option (List Int)): List RunningAppInfo = {
+    let wsCls = objcClass("NSWorkspace");
+    if (ptrIsNull(wsCls)) Nil
+    else {
+        let ws = msgSend0(wsCls, objcSel("sharedWorkspace"));
+        let apps = msgSend0(ws, objcSel("runningApplications"));
+        let n = nsArrayCount(apps);
+        let rev: Cell (List RunningAppInfo) = cellNew(Nil);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let idx = cellGet(i);
+            let app = nsArrayObjectAt(apps, idx);
+            // NSApplicationActivationPolicyRegular == 0
+            let policy = i64ToInt(msgSendI64_0(app, objcSel("activationPolicy")));
+            let hidden = msgSendBool0(app, objcSel("isHidden"));
+            if (policy == 0 && !hidden) {
+                let pid = msgSendInt0(app, objcSel("processIdentifier"));
+                let selectedOk = match selectedPids {
+                    Some(sel) -> listContainsBy(sel, pid, eqInt),
+                    None -> true,
+                };
+                if (pid != ownPid && selectedOk) {
+                    let bPtr = msgSend0(app, objcSel("bundleIdentifier"));
+                    let bundleOpt = if (ptrIsNull(bPtr)) None else {
+                        let bs = fromNSStringPtr(bPtr);
+                        if (strLen(bs) > 0) Some(bs) else None
+                    };
+                    let ignored = match bundleOpt {
+                        Some(b) -> listContainsBy(ignoredApps, b, eqStr),
+                        None -> false,
+                    };
+                    if (!ignored) {
+                        cellSet(rev, Cons(RunningAppInfo { pid: pid, bundleId: bundleOpt }, cellGet(rev)))
+                    } else ()
+                } else ()
+            } else ();
+            cellSet(i, idx + 1)
+        };
+        listRev(cellGet(rev))
+    }
+}
+
+pub def readCGVisibleCandidatesPub(): (List VisibleWindowCandidate, List Int) = readCGVisibleCandidates()
+pub def readCGExistingWindowIdsPub(): List Int = readCGExistingWindowIds()
+
+def readCGVisibleCandidates(): (List VisibleWindowCandidate, List Int) = {
+    let kLayer = resolveGlobalPtr("kCGWindowLayer");
+    let kAlpha = resolveGlobalPtr("kCGWindowAlpha");
+    let kOwnerPid = resolveGlobalPtr("kCGWindowOwnerPID");
+    let kBounds = resolveGlobalPtr("kCGWindowBounds");
+    let kNumber = resolveGlobalPtr("kCGWindowNumber");
+
+    let opts = kCGWindowListOptionOnScreenOnly() | kCGWindowListExcludeDesktopElements();
+    match cfAdoptOpt(c_CGWindowListCopyWindowInfo(opts, 0)) {
+        None -> (Nil, Nil),
+        Some(arrFp) -> withForeignPtr(arrFp, (ap) -> {
+            let n = i64ToInt(c_CFArrayGetCount(ap));
+            let candRev: Cell (List VisibleWindowCandidate) = cellNew(Nil);
+            let widRev: Cell (List Int) = cellNew(Nil);
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let idx = cellGet(i);
+                let row = c_CFArrayGetValueAtIndex(ap, intToI64(idx));
+                let layerOk = match nsNumberIntOpt(nsDictGetPtrKey(row, kLayer)) {
+                    Some(0) -> true,
+                    _ -> false,
+                };
+                let alphaOk = match nsNumberFloatOpt(nsDictGetPtrKey(row, kAlpha)) {
+                    Some(a) -> a > 0.0,
+                    None -> true,
+                };
+                if (layerOk && alphaOk) {
+                    match nsNumberIntOpt(nsDictGetPtrKey(row, kOwnerPid)) {
+                        Some(pid) -> {
+                            let boundsDict = nsDictGetPtrKey(row, kBounds);
+                            if (!ptrIsNull(boundsDict)) {
+                                let rectOpt: Option Rect = withAlloca(32, (rectBuf) -> {
+                                    if (c_CGRectMakeWithDictionaryRepresentation(boundsDict, rectBuf) != 0) {
+                                        let x = scopedPtrReadF64Le(rectBuf, 0);
+                                        let y = scopedPtrReadF64Le(rectBuf, 8);
+                                        let w = scopedPtrReadF64Le(rectBuf, 16);
+                                        let h = scopedPtrReadF64Le(rectBuf, 24);
+                                        if (w > 100.0 && h > 80.0) Some(rectNew(x, y, w, h)) else None
+                                    } else None
+                                });
+                                match rectOpt {
+                                    Some(rect) -> {
+                                        let widOpt = nsNumberIntOpt(nsDictGetPtrKey(row, kNumber));
+                                        match widOpt {
+                                            Some(wid) -> cellSet(widRev, Cons(wid, cellGet(widRev))),
+                                            None -> (),
+                                        };
+                                        cellSet(candRev, Cons(VisibleWindowCandidate {
+                                            pid: pid,
+                                            windowId: widOpt,
+                                            bounds: rect,
+                                        }, cellGet(candRev)))
+                                    },
+                                    None -> (),
+                                }
+                            } else ()
+                        },
+                        None -> (),
+                    }
+                } else ();
+                cellSet(i, idx + 1)
+            };
+            (listRev(cellGet(candRev)), listRev(cellGet(widRev)))
+        }),
+    }
+}
+
+def readCGExistingWindowIds(): List Int = {
+    let kNumber = resolveGlobalPtr("kCGWindowNumber");
+    match cfAdoptOpt(c_CGWindowListCopyWindowInfo(kCGWindowListExcludeDesktopElements(), 0)) {
+        None -> Nil,
+        Some(arrFp) -> withForeignPtr(arrFp, (ap) -> {
+            let n = i64ToInt(c_CFArrayGetCount(ap));
+            let widRev: Cell (List Int) = cellNew(Nil);
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let idx = cellGet(i);
+                let row = c_CFArrayGetValueAtIndex(ap, intToI64(idx));
+                match nsNumberIntOpt(nsDictGetPtrKey(row, kNumber)) {
+                    Some(wid) -> cellSet(widRev, Cons(wid, cellGet(widRev))),
+                    None -> (),
+                };
+                cellSet(i, idx + 1)
+            };
+            listRev(cellGet(widRev))
+        }),
+    }
+}
+
+/// Discover windows across all eligible running applications in parallel across per-PID Actors.
+pub def discoverWindows(
+    executor: WindowExecutor,
+    apps: List RunningAppInfo,
+    onlyPids: Option (List Int)
+): WindowDiscoveryResult = {
+    let (visible, visibleIds) = readCGVisibleCandidates();
+    let existingIds = readCGExistingWindowIds();
+
+    let livePidsRev: Cell (List Int) = cellNew(Nil);
+    let eligVis = cellNew(false);
+    let tasksRev: Cell (List (Task AppDiscoveryOutcome)) = cellNew(Nil);
+
+    let ca = cellNew(apps);
+    while (match cellGet(ca) { Nil -> false, _ -> true }) {
+        match cellGet(ca) {
+            Cons(app, ra) -> {
+                cellSet(livePidsRev, Cons(app.pid, cellGet(livePidsRev)));
+                let appVis = listFilter(visible, (c: VisibleWindowCandidate) -> c.pid == app.pid);
+                if (listLen(appVis) > 0) cellSet(eligVis, true) else ();
+                let doEnum = match onlyPids {
+                    Some(only) -> listContainsBy(only, app.pid, eqInt),
+                    None -> true,
+                };
+                if (doEnum) {
+                    let t = executorDiscoverAppAsync(executor, app.pid, app.bundleId, appVis, true);
+                    cellSet(tasksRev, Cons(t, cellGet(tasksRev)))
+                } else ();
+                cellSet(ca, ra)
+            },
+            Nil -> (),
+        }
+    };
+
+    let allWinsRev: Cell (List DiscoveredAppWindow) = cellNew(Nil);
+    let busyRev: Cell (List Int) = cellNew(Nil);
+    let deadRev: Cell (List Int64) = cellNew(Nil);
+    let staleFlag = cellNew(false);
+
+    let ct = cellNew(listRev(cellGet(tasksRev)));
+    while (match cellGet(ct) { Nil -> false, _ -> true }) {
+        match cellGet(ct) {
+            Cons(t, rt) -> {
+                let out = await(t);
+                if (out.busy) cellSet(busyRev, Cons(out.pid, cellGet(busyRev))) else ();
+                if (out.staleApiDisabled) cellSet(staleFlag, true) else ();
+                let cw = cellNew(out.windows);
+                while (match cellGet(cw) { Nil -> false, _ -> true }) {
+                    match cellGet(cw) {
+                        Cons(w, rw) -> { cellSet(allWinsRev, Cons(w, cellGet(allWinsRev))); cellSet(cw, rw) },
+                        Nil -> (),
+                    }
+                };
+                let cd = cellNew(out.deadHandles);
+                while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                    match cellGet(cd) {
+                        Cons(d, rd) -> { cellSet(deadRev, Cons(d, cellGet(deadRev))); cellSet(cd, rd) },
+                        Nil -> (),
+                    }
+                };
+                cellSet(ct, rt)
+            },
+            Nil -> (),
+        }
+    };
+
+    WindowDiscoveryResult {
+        windows: listRev(cellGet(allWinsRev)),
+        busyPids: listRev(cellGet(busyRev)),
+        visibleWindowIds: visibleIds,
+        existingWindowIds: existingIds,
+        deadHandles: listRev(cellGet(deadRev)),
+        livePids: listRev(cellGet(livePidsRev)),
+        eligibleVisibleWindowExists: cellGet(eligVis),
+        staleApiDisabled: cellGet(staleFlag),
+    }
+}

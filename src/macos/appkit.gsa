@@ -1,0 +1,866 @@
+/// Internal AppKit Objective-C wrapper layer for Talus (graphics, screens, status bar, menus,
+/// notifications, windows, and form controls). Kept strictly inside Talus per package boundary rules.
+
+use std.option.{Option, Some, None}
+use std.list.{listRev}
+use objc.{
+    Id, NSObject, NSString,
+    objcClass, objcSel, idRetain, idAdopt, idRetainOpt, idAdoptOpt,
+    withId, withAutoreleasePool, nsString, fromNSString, fromNSStringPtr,
+    objcAllocateClass, objcAddMethod, objcRegisterClass,
+    objcSetAssocHandle, objcGetAssocHandle,
+    objcBlock0, objcBlock1Ptr, objcBlockCustom, objcBlockHandle,
+    msgSend0, msgSend1Ptr, msgSend2Ptr, msgSend3Ptr,
+    msgSend1Int, msgSend1I64, msgSend1Float, msgSend1Bool,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid2Ptr, msgSendVoid1Int, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+    msgSendBool0, msgSendInt0, msgSendI64_0, msgSendFloat0
+}
+use layout.{Rect, rectNew}
+use manager.{ScreenSpec}
+use macos.ffi.{
+    CGPoint, CGSize, CGRect, cgPoint, cgSize, cgRect, rectToCG, cgToRect,
+    resolveGlobalPtr,
+    msgSendRect0, msgSendSize0, msgSendPoint0, msgSendPoint1Point, msgSendPoint1Point1Ptr,
+    msgSendRect1Rect, msgSend1Rect, msgSendVoid1Rect, msgSendVoid1Size, msgSendVoid1Point,
+    msgSend1Rect2Float, msgSend1Size1Bool1Ptr, msgSend1Float1Float, msgSend4Float,
+    msgSend1Ptr1Float, msgSend1Ptr1Ptr, msgSendSize1Ptr, msgSendVoid1Point1Ptr,
+    msgSendVoid1Rect1Rect1I641Float, msgSendVoid1Rect1I64,
+    msgSend1Ptr1Bool, msgSend1I641Ptr, msgSendBool1Ptr,
+    msgSend1Ptr1Ptr1Ptr1Ptr, msgSend1Float1Ptr1Ptr1Ptr1Bool,
+    msgSend1Rect1I641I641Bool, msgSend1Rect1I641Ptr1Ptr, msgSend1Ptr1I641Ptr,
+    msgSendVoid1Ptr1Ptr, msgSendVoid1Ptr1Ptr1Ptr1Ptr, msgSendVoid1Ptr1Ptr1Ptr1Ptr1I64,
+    nsArrayCount, nsArrayObjectAt, nsDictGet, nsNumberIntOpt
+}
+
+// Hoisted ScopedPtr-typed objc_msgSend helpers
+extern "objc_msgSend" def c_fontName(cls: Ptr, sel: Ptr, n: ScopedPtr, s: Float): Ptr
+extern "objc_msgSend" def c_setT(o: ScopedPtr, s: Ptr, b: Bool): Void
+extern "objc_msgSend" def c_setD(o: ScopedPtr, s: Ptr, d: ScopedPtr): Void
+extern "objc_msgSend" def c_sz(o: ScopedPtr, s: Ptr): CGSize
+extern "objc_msgSend" def c_sym(cls: Ptr, sel: Ptr, n: ScopedPtr, d: Ptr): Ptr
+extern "objc_msgSend" def c_wsc(o: ScopedPtr, s: Ptr, c: Ptr): Ptr
+extern "objc_msgSend" def c_draw(o: ScopedPtr, s: Ptr, d: CGRect, src: CGRect, opA: Int64, fr: Float): Void
+extern "objc_msgSend" def c_szAttr(o: ScopedPtr, s: Ptr, a: Ptr): CGSize
+extern "objc_msgSend" def c_drawAt(o: ScopedPtr, s: Ptr, pt: CGPoint, a: Ptr): Void
+extern "objc_msgSend" def c_initRep(
+ obj: Ptr, sel: Ptr, planes: Ptr, pw: Int64, ph: Int64, bps: Int64, spp: Int64, hasAlpha: Bool, isPlanar: Bool, cs: ScopedPtr, bpr: Int64, bpp: Int64 ): Ptr
+extern "objc_msgSend" def c_setSz(o: ScopedPtr, s: Ptr, sz: CGSize): Void
+extern "objc_msgSend" def c_cache(v: Ptr, s: Ptr, r: CGRect, repP: ScopedPtr): Void
+extern "objc_msgSend" def c_repUsing(o: ScopedPtr, s: Ptr, ftype: Int64, props: Ptr): Ptr
+extern "objc_msgSend" def c_writeToFile(d: Ptr, s: Ptr, p: ScopedPtr, atom: Bool): Bool
+extern "objc_msgSend" def c_initRep2(
+ obj: Ptr, sel: Ptr, planes: Ptr, pw: Int64, ph: Int64, bps: Int64, spp: Int64, hasAlpha: Bool, isPlanar: Bool, cs: ScopedPtr, bpr: Int64, bpp: Int64 ): Ptr
+extern "objc_msgSend" def c_ctxFromRep(c: Ptr, s: Ptr, r: ScopedPtr): Ptr
+extern "objc_msgSend" def c_repUsing2(o: ScopedPtr, s: Ptr, ftype: Int64, props: Ptr): Ptr
+extern "objc_msgSend" def c_writeToFile2(d: Ptr, s: Ptr, p: ScopedPtr, atom: Bool): Bool
+extern "objc_msgSend" def c_lbl(cls: Ptr, sel: Ptr, s: ScopedPtr): Ptr
+extern "objc_msgSend" def c_sv(o: Ptr, s: Ptr, v: ScopedPtr): Void
+extern "objc_msgSend" def c_sp(o: Ptr, s: Ptr, p: ScopedPtr): Void
+extern "objc_msgSend" def c_sv2(o: Ptr, s: Ptr, v: ScopedPtr): Void
+extern "objc_msgSend" def c_btn(cls: Ptr, sel: Ptr, t: ScopedPtr, tg: ScopedPtr, a: Ptr): Ptr
+extern "objc_msgSend" def c_chk(cls: Ptr, sel: Ptr, t: ScopedPtr, tg: ScopedPtr, a: Ptr): Ptr
+extern "objc_msgSend" def c_setTgt(o: Ptr, s: Ptr, tg: ScopedPtr): Void
+extern "objc_msgSend" def c_addIt(o: Ptr, s: Ptr, t: ScopedPtr): Void
+extern "objc_msgSend" def c_setTgt2(o: Ptr, s: Ptr, tg: ScopedPtr): Void
+extern "objc_msgSend" def c_arrAdd(a: Ptr, s: Ptr, x: ScopedPtr): Void
+extern "objc_msgSend" def c_seg(cls: Ptr, sel: Ptr, lbs: Ptr, mode: Int64, tg: ScopedPtr, act: Ptr): Ptr
+extern "objc_msgSend" def c_sld(cls: Ptr, sel: Ptr, v: Float, lo: Float, hi: Float, tg: ScopedPtr, act: Ptr): Ptr
+extern "objc_msgSend" def c_setImg(o: Ptr, s: Ptr, i: ScopedPtr): Void
+extern "objc_msgSend" def c_setImg2(o: Ptr, s: Ptr, i: ScopedPtr): Void
+extern "objc_msgSend" def c_mi(o: Ptr, s: Ptr, t: ScopedPtr, a: Ptr, k: ScopedPtr): Ptr
+extern "objc_msgSend" def c_setTgt3(o: Ptr, s: Ptr, t: ScopedPtr): Void
+extern "objc_msgSend" def c_mi2(o: Ptr, s: Ptr, t: ScopedPtr, a: Ptr, k: ScopedPtr): Ptr
+extern "objc_msgSend" def c_addMI(m: Ptr, s: Ptr, it: ScopedPtr): Void
+
+// ---------------------------------------------------------------------------
+// NSColor
+// ---------------------------------------------------------------------------
+
+pub def nsColorBlack(): Ptr = msgSend0(objcClass("NSColor"), objcSel("blackColor"))
+pub def nsColorWhite(): Ptr = msgSend0(objcClass("NSColor"), objcSel("whiteColor"))
+pub def nsColorClear(): Ptr = msgSend0(objcClass("NSColor"), objcSel("clearColor"))
+pub def nsColorLabel(): Ptr = msgSend0(objcClass("NSColor"), objcSel("labelColor"))
+pub def nsColorSecondaryLabel(): Ptr = msgSend0(objcClass("NSColor"), objcSel("secondaryLabelColor"))
+pub def nsColorTertiaryLabel(): Ptr = msgSend0(objcClass("NSColor"), objcSel("tertiaryLabelColor"))
+pub def nsColorControlAccent(): Ptr = msgSend0(objcClass("NSColor"), objcSel("controlAccentColor"))
+pub def nsColorWindowBackground(): Ptr = msgSend0(objcClass("NSColor"), objcSel("windowBackgroundColor"))
+pub def nsColorControlBackground(): Ptr = msgSend0(objcClass("NSColor"), objcSel("controlBackgroundColor"))
+pub def nsColorSeparator(): Ptr = msgSend0(objcClass("NSColor"), objcSel("separatorColor"))
+pub def nsColorSystemRed(): Ptr = msgSend0(objcClass("NSColor"), objcSel("systemRedColor"))
+pub def nsColorSystemOrange(): Ptr = msgSend0(objcClass("NSColor"), objcSel("systemOrangeColor"))
+pub def nsColorSystemGreen(): Ptr = msgSend0(objcClass("NSColor"), objcSel("systemGreenColor"))
+pub def nsColorSystemBlue(): Ptr = msgSend0(objcClass("NSColor"), objcSel("systemBlueColor"))
+
+pub def nsColorSRGB(r: Float, g: Float, b: Float, a: Float): Ptr =
+    msgSend4Float(objcClass("NSColor"), objcSel("colorWithSRGBRed:green:blue:alpha:"), r, g, b, a)
+
+pub def nsColorCalibratedWhite(white: Float, alpha: Float): Ptr =
+    msgSend1Float1Float(objcClass("NSColor"), objcSel("colorWithCalibratedWhite:alpha:"), white, alpha)
+
+pub def nsColorWithAlpha(color: Ptr, alpha: Float): Ptr =
+    msgSend1Float(color, objcSel("colorWithAlphaComponent:"), alpha)
+
+pub def nsColorAlpha(color: Ptr): Float =
+    msgSendFloat0(color, objcSel("alphaComponent"))
+
+pub def nsColorSetFill(color: Ptr): Void = msgSendVoid0(color, objcSel("setFill"))
+pub def nsColorSetStroke(color: Ptr): Void = msgSendVoid0(color, objcSel("setStroke"))
+
+pub def nsColorCGColor(color: Ptr): Ptr = msgSend0(color, objcSel("CGColor"))
+
+// ---------------------------------------------------------------------------
+// NSFont (weights: regular=0.0, medium=0.23, semibold=0.30, bold=0.40)
+// ---------------------------------------------------------------------------
+
+pub def kFontWeightRegular(): Float = 0.0
+pub def kFontWeightMedium(): Float = 0.23
+pub def kFontWeightSemibold(): Float = 0.30
+pub def kFontWeightBold(): Float = 0.40
+
+pub def nsFontSystem(size: Float, weight: Float): Ptr =
+    msgSend1Float1Float(objcClass("NSFont"), objcSel("systemFontOfSize:weight:"), size, weight)
+
+pub def nsFontMonospacedDigit(size: Float, weight: Float): Ptr =
+    msgSend1Float1Float(objcClass("NSFont"), objcSel("monospacedDigitSystemFontOfSize:weight:"), size, weight)
+
+pub def nsFontMonospaced(size: Float, weight: Float): Ptr =
+    msgSend1Float1Float(objcClass("NSFont"), objcSel("monospacedSystemFontOfSize:weight:"), size, weight)
+
+pub def nsFontByName(name: String, size: Float): Option Ptr = {
+    let ns = nsString(name);
+    let f = withId(ns, (np) -> {
+        c_fontName(objcClass("NSFont"), objcSel("fontWithName:size:"), np, size)
+    });
+    if (ptrIsNull(f)) None else Some(f)
+}
+
+pub def nsFontCapHeight(font: Ptr): Float = msgSendFloat0(font, objcSel("capHeight"))
+pub def nsFontDescender(font: Ptr): Float = msgSendFloat0(font, objcSel("descender"))
+
+// ---------------------------------------------------------------------------
+// NSBezierPath & NSRectFillUsingOperation
+// ---------------------------------------------------------------------------
+
+// NSCompositingOperation constants
+pub def kNSCompositingOperationSourceOver(): Int64 = intToI64(2)
+pub def kNSCompositingOperationSourceAtop(): Int64 = intToI64(5)
+
+pub extern "NSRectFillUsingOperation" def c_NSRectFillUsingOperation(rect: CGRect, op: Int64): Void
+
+pub def nsBezierRoundedRect(r: CGRect, rx: Float, ry: Float): Ptr =
+    msgSend1Rect2Float(objcClass("NSBezierPath"), objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"), r, rx, ry)
+
+pub def nsBezierFill(path: Ptr): Void = msgSendVoid0(path, objcSel("fill"))
+pub def nsBezierStroke(path: Ptr): Void = msgSendVoid0(path, objcSel("stroke"))
+pub def nsBezierSetLineWidth(path: Ptr, lw: Float): Void = msgSendVoid1Float(path, objcSel("setLineWidth:"), lw)
+
+pub def nsDrawRoundedRectFill(x: Float, y: Float, w: Float, h: Float, r: Float): Void =
+    nsBezierFill(nsBezierRoundedRect(cgRect(x, y, w, h), r, r))
+
+pub def nsDrawRoundedRectStroke(x: Float, y: Float, w: Float, h: Float, r: Float, lw: Float): Void = {
+    let p = nsBezierRoundedRect(cgRect(x, y, w, h), r, r);
+    nsBezierSetLineWidth(p, lw);
+    nsBezierStroke(p)
+}
+
+// ---------------------------------------------------------------------------
+// NSImage (vector drawing handler, SF Symbols, PNG export)
+// ---------------------------------------------------------------------------
+
+def imageDrawBlockInvoke(blk: Ptr, dstRect: CGRect): Bool = {
+    let f: CGRect -> Bool = gcHandleGet(objcBlockHandle(blk));
+    f(dstRect)
+}
+
+/// Create a vector `NSImage` using `+[NSImage imageWithSize:flipped:drawingHandler:]`.
+pub def nsImageDraw(w: Float, h: Float, flipped: Bool, drawFn: CGRect -> Bool): Id NSObject = {
+    let blk = objcBlockCustom(cFnPtr(imageDrawBlockInvoke), gcHandleNew(drawFn));
+    let raw = withForeignPtr(blk, (bp) ->
+        msgSend1Size1Bool1Ptr(objcClass("NSImage"), objcSel("imageWithSize:flipped:drawingHandler:"), cgSize(w, h), flipped, bp)
+    );
+    idRetain(raw)
+}
+
+pub def nsImageSetTemplate(img: Id NSObject, isTemplate: Bool): Void =
+    withId(img, (p) -> {
+        c_setT(p, objcSel("setTemplate:"), isTemplate)
+    })
+
+pub def nsImageSetAccessibilityDescription(img: Id NSObject, desc: String): Void = {
+    let ns = nsString(desc);
+    withId(img, (p) -> withId(ns, (dp) -> {
+        c_setD(p, objcSel("setAccessibilityDescription:"), dp)
+    }))
+}
+
+pub def nsImageSize(img: Id NSObject): CGSize =
+    withId(img, (p) -> {
+        c_sz(p, objcSel("size"))
+    })
+
+pub def nsImageSystemSymbol(name: String): Option (Id NSObject) = {
+    let ns = nsString(name);
+    let raw = withId(ns, (np) -> {
+        c_sym(objcClass("NSImage"), objcSel("imageWithSystemSymbolName:accessibilityDescription:"), np, ptrNull())
+    });
+    idRetainOpt(raw)
+}
+
+pub def nsImageWithSymbolConfig(img: Id NSObject, pointSize: Float, weight: Float): Option (Id NSObject) = {
+    let cfgCls = objcClass("NSImageSymbolConfiguration");
+    if (ptrIsNull(cfgCls)) None
+    else {
+        let cfg = msgSend1Float1Float(cfgCls, objcSel("configurationWithPointSize:weight:"), pointSize, weight);
+        if (ptrIsNull(cfg)) None
+        else {
+            let raw = withId(img, (ip) -> {
+                c_wsc(ip, objcSel("imageWithSymbolConfiguration:"), cfg)
+            });
+            idRetainOpt(raw)
+        }
+    }
+}
+
+pub def nsImageDrawInRect(img: Id NSObject, dst: CGRect, op: Int64, fraction: Float): Void =
+    withId(img, (ip) -> {
+        c_draw(ip, objcSel("drawInRect:fromRect:operation:fraction:"), dst, cgRect(0.0, 0.0, 0.0, 0.0), op, fraction)
+    })
+
+// ---------------------------------------------------------------------------
+// Text measurement & drawing (`NSString sizeWithAttributes:` / `drawAtPoint:withAttributes:`)
+// ---------------------------------------------------------------------------
+
+def makeFontAttrsDict(font: Ptr, colorOpt: Option Ptr): Ptr = {
+    let d = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+    let kFont = resolveGlobalPtr("NSFontAttributeName");
+    if (!ptrIsNull(kFont) && !ptrIsNull(font)) {
+        msgSendVoid2Ptr(d, objcSel("setObject:forKey:"), font, kFont)
+    } else ();
+    match colorOpt {
+        Some(c) -> {
+            let kFg = resolveGlobalPtr("NSForegroundColorAttributeName");
+            if (!ptrIsNull(kFg) && !ptrIsNull(c)) {
+                msgSendVoid2Ptr(d, objcSel("setObject:forKey:"), c, kFg)
+            } else ()
+        },
+        None -> (),
+    };
+    d
+}
+
+pub def nsTextMeasureSize(text: String, font: Ptr): CGSize = {
+    let ns = nsString(text);
+    let attrs = makeFontAttrsDict(font, None);
+    withId(ns, (np) -> {
+        c_szAttr(np, objcSel("sizeWithAttributes:"), attrs)
+    })
+}
+
+pub def nsTextDrawAt(text: String, x: Float, y: Float, font: Ptr, color: Ptr): Void = {
+    let ns = nsString(text);
+    let attrs = makeFontAttrsDict(font, Some(color));
+    withId(ns, (np) -> {
+        c_drawAt(np, objcSel("drawAtPoint:withAttributes:"), cgPoint(x, y), attrs)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// NSScreen helpers (AppKit bottom-left -> AX top-left coordinates)
+// ---------------------------------------------------------------------------
+
+/// Return `(screens, primaryTopY)` matching `Manager.screenSnapshots()`.
+pub def collectScreenDescriptors(): (List ScreenSpec, Float) = {
+    let cls = objcClass("NSScreen");
+    let screens = msgSend0(cls, objcSel("screens"));
+    let n = nsArrayCount(screens);
+    if (n == 0) (Nil, 0.0)
+    else {
+        let first = nsArrayObjectAt(screens, 0);
+        let firstFrame = msgSendRect0(first, objcSel("frame"));
+        let primaryTop = firstFrame.origin.y + firstFrame.size.h;
+        let rev: Cell (List ScreenSpec) = cellNew(Nil);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let idx = cellGet(i);
+            let scr = nsArrayObjectAt(screens, idx);
+            let full = msgSendRect0(scr, objcSel("frame"));
+            let vis = msgSendRect0(scr, objcSel("visibleFrame"));
+            let desc = msgSend0(scr, objcSel("deviceDescription"));
+            let sid = match nsNumberIntOpt(nsDictGet(desc, "NSScreenNumber")) {
+                Some(v) -> v,
+                None -> idx,
+            };
+            // Convert AppKit bottom-left origin to AX top-left origin
+            let fullAX = rectNew(full.origin.x, primaryTop - (full.origin.y + full.size.h), full.size.w, full.size.h);
+            let visAX = rectNew(vis.origin.x, primaryTop - (vis.origin.y + vis.size.h), vis.size.w, vis.size.h);
+            cellSet(rev, Cons(ScreenSpec {
+                id: sid,
+                fullFrame: fullAX,
+                visibleFrame: visAX,
+            }, cellGet(rev)));
+            cellSet(i, idx + 1)
+        };
+        (listRev(cellGet(rev)), primaryTop)
+    }
+}
+
+pub def nsScreenForId(screenId: Int): Ptr = {
+    let screens = msgSend0(objcClass("NSScreen"), objcSel("screens"));
+    let n = nsArrayCount(screens);
+    let found = cellNew(ptrNull());
+    let i = cellNew(0);
+    while (cellGet(i) < n && ptrIsNull(cellGet(found))) {
+        let idx = cellGet(i);
+        let scr = nsArrayObjectAt(screens, idx);
+        let desc = msgSend0(scr, objcSel("deviceDescription"));
+        match nsNumberIntOpt(nsDictGet(desc, "NSScreenNumber")) {
+            Some(v) if (v == screenId) -> cellSet(found, scr),
+            _ -> (),
+        };
+        cellSet(i, idx + 1)
+    };
+    if (!ptrIsNull(cellGet(found))) cellGet(found)
+    else msgSend0(objcClass("NSScreen"), objcSel("mainScreen"))
+}
+
+// ---------------------------------------------------------------------------
+// NSApplication, NSEvent, Appearance, PNG Export
+// ---------------------------------------------------------------------------
+
+pub def nsAppShared(): Ptr = msgSend0(objcClass("NSApplication"), objcSel("sharedApplication"))
+
+pub def nsEventMouseLocation(): CGPoint =
+    msgSendPoint0(objcClass("NSEvent"), objcSel("mouseLocation"))
+
+pub def nsAppearanceIsDark(viewOrApp: Ptr): Bool = {
+    if (ptrIsNull(viewOrApp)) false
+    else {
+        let eff = msgSend0(viewOrApp, objcSel("effectiveAppearance"));
+        if (ptrIsNull(eff)) false
+        else {
+            let namePtr = msgSend0(eff, objcSel("name"));
+            let name = fromNSStringPtr(namePtr);
+            name == "NSAppearanceNameDarkAqua"
+                || name == "NSAppearanceNameVibrantDark"
+                || name == "NSAppearanceNameAccessibilityHighContrastDarkAqua"
+                || name == "NSAppearanceNameAccessibilityHighContrastVibrantDark"
+        }
+    }
+}
+
+/// Render an `NSView` to a high-DPI PNG file at `path` (used by `--render-previews`).
+pub def nsViewWritePng(viewPtr: Ptr, path: String, scale: Float): Bool = {
+    let bounds = msgSendRect0(viewPtr, objcSel("bounds"));
+    let bw = bounds.size.w;
+    let bh = bounds.size.h;
+    let pw = floatToInt(bw * scale);
+    let ph = floatToInt(bh * scale);
+    if (pw <= 0 || ph <= 0) false
+    else {
+        // Allocate NSBitmapImageRep at Retina pixel dimensions
+        let repCls = objcClass("NSBitmapImageRep");
+        let repAlloc = msgSend0(repCls, objcSel("alloc"));
+        let csName = nsString("NSCalibratedRGBColorSpace");
+        let rep = withId(csName, (csp) ->
+            c_initRep(
+                repAlloc,
+                objcSel("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"),
+                ptrNull(), intToI64(pw), intToI64(ph), intToI64(8), intToI64(4),
+                true, false, csp, intToI64(0), intToI64(0)
+            )
+        );
+        if (ptrIsNull(rep)) false
+        else {
+            let repId = idAdopt(rep);
+            // Set logical point size so cacheDisplayInRect renders at `scale`x Retina!
+            withId(repId, (rp) -> {
+                c_setSz(rp, objcSel("setSize:"), cgSize(bw, bh));
+                c_cache(viewPtr, objcSel("cacheDisplayInRect:toBitmapImageRep:"), bounds, rp)
+            });
+            // representationUsingType:NSBitmapImageFileTypePNG(4) properties:@{}
+            let emptyDict = msgSend0(objcClass("NSDictionary"), objcSel("dictionary"));
+            let pngData = withId(repId, (rp) -> {
+                c_repUsing(rp, objcSel("representationUsingType:properties:"), intToI64(4), emptyDict)
+            });
+            if (ptrIsNull(pngData)) false
+            else {
+                let nsPath = nsString(path);
+                withId(nsPath, (pp) -> {
+                    c_writeToFile(pngData, objcSel("writeToFile:atomically:"), pp, true)
+                })
+            }
+        }
+    }
+}
+
+/// Write an `NSImage` to a PNG file at `path` (e.g. for app icon generation or status preview export).
+pub def nsImageWritePng(img: Id NSObject, path: String, pixelW: Int, pixelH: Int): Bool = {
+    let repAlloc = msgSend0(objcClass("NSBitmapImageRep"), objcSel("alloc"));
+    let csName = nsString("NSCalibratedRGBColorSpace");
+    let rep = withId(csName, (csp) ->
+        c_initRep2(
+            repAlloc,
+            objcSel("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"),
+            ptrNull(), intToI64(pixelW), intToI64(pixelH), intToI64(8), intToI64(4),
+            true, false, csp, intToI64(0), intToI64(0)
+        )
+    );
+    if (ptrIsNull(rep)) false
+    else {
+        let repId = idAdopt(rep);
+        let ctxCls = objcClass("NSGraphicsContext");
+        msgSendVoid0(ctxCls, objcSel("saveGraphicsState"));
+        let ctx = withId(repId, (rp) -> {
+            c_ctxFromRep(ctxCls, objcSel("graphicsContextWithBitmapImageRep:"), rp)
+        });
+        msgSendVoid1Ptr(ctxCls, objcSel("setCurrentContext:"), ctx);
+        nsImageDrawInRect(img, cgRect(0.0, 0.0, intToFloat(pixelW), intToFloat(pixelH)), kNSCompositingOperationSourceOver(), 1.0);
+        msgSendVoid0(ctxCls, objcSel("restoreGraphicsState"));
+        let emptyDict = msgSend0(objcClass("NSDictionary"), objcSel("dictionary"));
+        let pngData = withId(repId, (rp) -> {
+            c_repUsing2(rp, objcSel("representationUsingType:properties:"), intToI64(4), emptyDict)
+        });
+        if (ptrIsNull(pngData)) false
+        else {
+            let nsPath = nsString(path);
+            withId(nsPath, (pp) -> {
+                c_writeToFile2(pngData, objcSel("writeToFile:atomically:"), pp, true)
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Target-action trampoline helper for AppKit controls & menus
+// ---------------------------------------------------------------------------
+
+def gActionAssocKey: Ptr = ptrAllocBytes(8)
+
+def actionTargetInvoke(self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let _ = _cmd;
+    let h = objcGetAssocHandle(self, gActionAssocKey);
+    if (h != intToI64(0)) {
+        let cb: Ptr -> Void = gcHandleGet(h);
+        cb(sender)
+    } else ()
+}
+
+extern init def registerTalusActionTarget(): Void = {
+    let cls = objcAllocateClass("NSObject", "TalusActionTarget");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "invoke:", cFnPtr(actionTargetInvoke), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}
+
+/// Create a GC-managed Objective-C target object whose `invoke:` selector runs `cb(sender)`.
+pub def makeActionTarget(cb: Ptr -> Void): Id NSObject = {
+    let cls = objcClass("TalusActionTarget");
+    let raw = msgSend0(msgSend0(cls, objcSel("alloc")), objcSel("init"));
+    objcSetAssocHandle(raw, gActionAssocKey, gcHandleNew(cb));
+    idAdopt(raw)
+}
+
+pub def actionTargetSel(): Ptr = objcSel("invoke:")
+
+// ---------------------------------------------------------------------------
+// TextField delegate helper (controlTextDidChange:)
+// ---------------------------------------------------------------------------
+
+def gTextDelegateAssocKey: Ptr = ptrAllocBytes(8)
+
+def textDelegateDidChange(self: Ptr, _cmd: Ptr, notif: Ptr): Void = {
+    let _ = _cmd;
+    let h = objcGetAssocHandle(self, gTextDelegateAssocKey);
+    if (h != intToI64(0)) {
+        let cb: Ptr -> Void = gcHandleGet(h);
+        let obj = msgSend0(notif, objcSel("object"));
+        cb(obj)
+    } else ()
+}
+
+extern init def registerTalusTextDelegate(): Void = {
+    let cls = objcAllocateClass("NSObject", "TalusTextFieldDelegate");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "controlTextDidChange:", cFnPtr(textDelegateDidChange), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}
+
+pub def makeTextChangeDelegate(cb: Ptr -> Void): Id NSObject = {
+    let cls = objcClass("TalusTextFieldDelegate");
+    let raw = msgSend0(msgSend0(cls, objcSel("alloc")), objcSel("init"));
+    objcSetAssocHandle(raw, gTextDelegateAssocKey, gcHandleNew(cb));
+    idAdopt(raw)
+}
+
+// ---------------------------------------------------------------------------
+// Window delegate helper (windowWillClose:)
+// ---------------------------------------------------------------------------
+
+def gWinDelegateAssocKey: Ptr = ptrAllocBytes(8)
+
+def winDelegateWillClose(self: Ptr, _cmd: Ptr, notif: Ptr): Void = {
+    let _ = _cmd;
+    let _ = notif;
+    let h = objcGetAssocHandle(self, gWinDelegateAssocKey);
+    if (h != intToI64(0)) {
+        let cb: () -> Void = gcHandleGet(h);
+        cb()
+    } else ()
+}
+
+extern init def registerTalusWindowDelegate(): Void = {
+    let cls = objcAllocateClass("NSObject", "TalusWindowDelegate");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "windowWillClose:", cFnPtr(winDelegateWillClose), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}
+
+pub def makeWindowCloseDelegate(cb: () -> Void): Id NSObject = {
+    let cls = objcClass("TalusWindowDelegate");
+    let raw = msgSend0(msgSend0(cls, objcSel("alloc")), objcSel("init"));
+    objcSetAssocHandle(raw, gWinDelegateAssocKey, gcHandleNew(cb));
+    idAdopt(raw)
+}
+
+// ---------------------------------------------------------------------------
+// Flipped NSView & Custom Drawing NSView
+// ---------------------------------------------------------------------------
+
+def gCustomDrawAssocKey: Ptr = ptrAllocBytes(8)
+
+def flippedViewIsFlipped(_self: Ptr, _cmd: Ptr): Bool = {
+    let _ = _self;
+    let _ = _cmd;
+    true
+}
+
+def customDrawViewDrawRect(self: Ptr, _cmd: Ptr, dirtyRect: CGRect): Void = {
+    let _ = _cmd;
+    let h = objcGetAssocHandle(self, gCustomDrawAssocKey);
+    if (h != intToI64(0)) {
+        let cb: (Ptr, CGRect) -> Void = gcHandleGet(h);
+        cb(self, dirtyRect)
+    } else ()
+}
+
+extern init def registerTalusViews(): Void = {
+    let fCls = objcAllocateClass("NSView", "TalusFlippedView");
+    if (!ptrIsNull(fCls)) {
+        let _ = objcAddMethod(fCls, "isFlipped", cFnPtr(flippedViewIsFlipped), "B@:");
+        objcRegisterClass(fCls)
+    } else ();
+    let dCls = objcAllocateClass("NSView", "TalusCustomDrawView");
+    if (!ptrIsNull(dCls)) {
+        let _ = objcAddMethod(dCls, "drawRect:", cFnPtr(customDrawViewDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        objcRegisterClass(dCls)
+    } else ()
+}
+
+pub def makeFlippedView(frame: CGRect): Id NSObject = {
+    let cls = objcClass("TalusFlippedView");
+    let raw = msgSend1Rect(msgSend0(cls, objcSel("alloc")), objcSel("initWithFrame:"), frame);
+    idAdopt(raw)
+}
+
+pub def makeCustomDrawView(frame: CGRect, drawFn: (Ptr, CGRect) -> Void): Id NSObject = {
+    let cls = objcClass("TalusCustomDrawView");
+    let raw = msgSend1Rect(msgSend0(cls, objcSel("alloc")), objcSel("initWithFrame:"), frame);
+    objcSetAssocHandle(raw, gCustomDrawAssocKey, gcHandleNew(drawFn));
+    idAdopt(raw)
+}
+
+// ---------------------------------------------------------------------------
+// Hover tracking delegate (mouseMoved:/mouseExited:)
+// ---------------------------------------------------------------------------
+
+def gHoverAssocKey: Ptr = ptrAllocBytes(8)
+
+def hoverMouseMoved(self: Ptr, _cmd: Ptr, _ev: Ptr): Void = {
+    let _ = _cmd;
+    let _ = _ev;
+    let h = objcGetAssocHandle(self, gHoverAssocKey);
+    if (h != intToI64(0)) {
+        let pair: (() -> Void, () -> Void) = gcHandleGet(h);
+        let (onMove, _) = pair;
+        onMove()
+    } else ()
+}
+
+def hoverMouseExited(self: Ptr, _cmd: Ptr, _ev: Ptr): Void = {
+    let _ = _cmd;
+    let _ = _ev;
+    let h = objcGetAssocHandle(self, gHoverAssocKey);
+    if (h != intToI64(0)) {
+        let pair: (() -> Void, () -> Void) = gcHandleGet(h);
+        let (_, onExit) = pair;
+        onExit()
+    } else ()
+}
+
+extern init def registerTalusHoverTracker(): Void = {
+    let cls = objcAllocateClass("NSObject", "TalusHoverTracker");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "mouseMoved:", cFnPtr(hoverMouseMoved), "v@:@");
+        let _ = objcAddMethod(cls, "mouseExited:", cFnPtr(hoverMouseExited), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}
+
+pub def makeHoverTracker(onMove: () -> Void, onExit: () -> Void): Id NSObject = {
+    let cls = objcClass("TalusHoverTracker");
+    let raw = msgSend0(msgSend0(cls, objcSel("alloc")), objcSel("init"));
+    objcSetAssocHandle(raw, gHoverAssocKey, gcHandleNew((onMove, onExit)));
+    idAdopt(raw)
+}
+
+// ---------------------------------------------------------------------------
+// Menu delegate (menuWillOpen:)
+// ---------------------------------------------------------------------------
+
+def gMenuDelegateAssocKey: Ptr = ptrAllocBytes(8)
+
+def menuDelegateWillOpen(self: Ptr, _cmd: Ptr, _menu: Ptr): Void = {
+    let _ = _cmd;
+    let _ = _menu;
+    let h = objcGetAssocHandle(self, gMenuDelegateAssocKey);
+    if (h != intToI64(0)) {
+        let cb: () -> Void = gcHandleGet(h);
+        cb()
+    } else ()
+}
+
+extern init def registerTalusMenuDelegate(): Void = {
+    let cls = objcAllocateClass("NSObject", "TalusMenuDelegate");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "menuWillOpen:", cFnPtr(menuDelegateWillOpen), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}
+
+pub def makeMenuWillOpenDelegate(cb: () -> Void): Id NSObject = {
+    let cls = objcClass("TalusMenuDelegate");
+    let raw = msgSend0(msgSend0(cls, objcSel("alloc")), objcSel("init"));
+    objcSetAssocHandle(raw, gMenuDelegateAssocKey, gcHandleNew(cb));
+    idAdopt(raw)
+}
+
+// ---------------------------------------------------------------------------
+// Common AppKit view/control helpers
+// ---------------------------------------------------------------------------
+
+pub def nsViewAddSubview(parent: Ptr, child: Ptr): Void =
+    msgSendVoid1Ptr(parent, objcSel("addSubview:"), child)
+
+pub def nsViewSetWantsLayer(view: Ptr, wants: Bool): Void =
+    msgSendVoid1Bool(view, objcSel("setWantsLayer:"), wants)
+
+pub def nsViewSetLayerStyle(view: Ptr, bgOpt: Option Ptr, borderOpt: Option Ptr, borderWidth: Float, cornerRadius: Float): Void = {
+    nsViewSetWantsLayer(view, true);
+    let layer = msgSend0(view, objcSel("layer"));
+    if (!ptrIsNull(layer)) {
+        match bgOpt {
+            Some(c) -> msgSendVoid1Ptr(layer, objcSel("setBackgroundColor:"), nsColorCGColor(c)),
+            None -> (),
+        };
+        match borderOpt {
+            Some(c) -> {
+                msgSendVoid1Ptr(layer, objcSel("setBorderColor:"), nsColorCGColor(c));
+                msgSendVoid1Float(layer, objcSel("setBorderWidth:"), borderWidth)
+            },
+            None -> (),
+        };
+        if (cornerRadius > 0.0) {
+            msgSendVoid1Float(layer, objcSel("setCornerRadius:"), cornerRadius);
+            msgSendVoid1Bool(layer, objcSel("setMasksToBounds:"), true)
+        } else ()
+    } else ()
+}
+
+pub def makeLabel(text: String, frame: CGRect, font: Ptr, color: Ptr): Id NSObject = {
+    let ns = nsString(text);
+    let raw = withId(ns, (np) -> {
+        c_lbl(objcClass("NSTextField"), objcSel("labelWithString:"), np)
+    });
+    let id = idRetain(raw);
+    msgSendVoid1Rect(raw, objcSel("setFrame:"), frame);
+    msgSendVoid1Ptr(raw, objcSel("setFont:"), font);
+    msgSendVoid1Ptr(raw, objcSel("setTextColor:"), color);
+    msgSendVoid1I64(raw, objcSel("setLineBreakMode:"), intToI64(0)); // NSLineBreakByWordWrapping
+    id
+}
+
+pub def makeTextField(value: String, placeholder: String, frame: CGRect, font: Ptr): Id NSObject = {
+    let raw = msgSend1Rect(msgSend0(objcClass("NSTextField"), objcSel("alloc")), objcSel("initWithFrame:"), frame);
+    let id = idAdopt(raw);
+    let vNs = nsString(value);
+    let pNs = nsString(placeholder);
+    withId(vNs, (vp) -> {
+        c_sv(raw, objcSel("setStringValue:"), vp)
+    });
+    withId(pNs, (pp) -> {
+        c_sp(raw, objcSel("setPlaceholderString:"), pp)
+    });
+    msgSendVoid1Ptr(raw, objcSel("setFont:"), font);
+    msgSendVoid1Bool(raw, objcSel("setBezeled:"), true);
+    msgSendVoid1I64(raw, objcSel("setBezelStyle:"), intToI64(1)); // NSTextFieldRoundedBezel
+    id
+}
+
+pub def textFieldStringValue(tf: Ptr): String =
+    fromNSStringPtr(msgSend0(tf, objcSel("stringValue")))
+
+pub def textFieldSetStringValue(tf: Ptr, value: String): Void = {
+    let ns = nsString(value);
+    withId(ns, (vp) -> {
+        c_sv2(tf, objcSel("setStringValue:"), vp)
+    })
+}
+
+pub def makePushButton(title: String, frame: CGRect, target: Id NSObject): Id NSObject = {
+    let ns = nsString(title);
+    let raw = withId(ns, (tp) -> withId(target, (tgp) -> {
+        c_btn(objcClass("NSButton"), objcSel("buttonWithTitle:target:action:"), tp, tgp, actionTargetSel())
+    }));
+    let id = idRetain(raw);
+    msgSendVoid1Rect(raw, objcSel("setFrame:"), frame);
+    id
+}
+
+pub def makeCheckbox(title: String, checked: Bool, frame: CGRect, target: Id NSObject): Id NSObject = {
+    let ns = nsString(title);
+    let raw = withId(ns, (tp) -> withId(target, (tgp) -> {
+        c_chk(objcClass("NSButton"), objcSel("checkboxWithTitle:target:action:"), tp, tgp, actionTargetSel())
+    }));
+    let id = idRetain(raw);
+    msgSendVoid1Rect(raw, objcSel("setFrame:"), frame);
+    msgSendVoid1I64(raw, objcSel("setState:"), if (checked) intToI64(1) else intToI64(0));
+    id
+}
+
+pub def makeSwitch(checked: Bool, frame: CGRect, target: Id NSObject): Id NSObject = {
+    let raw = msgSend1Rect(msgSend0(objcClass("NSSwitch"), objcSel("alloc")), objcSel("initWithFrame:"), frame);
+    let id = idAdopt(raw);
+    msgSendVoid1I64(raw, objcSel("setState:"), if (checked) intToI64(1) else intToI64(0));
+    withId(target, (tgp) -> {
+        c_setTgt(raw, objcSel("setTarget:"), tgp)
+    });
+    msgSendVoid1Ptr(raw, objcSel("setAction:"), actionTargetSel());
+    id
+}
+
+pub def controlStateOn(ctrl: Ptr): Bool =
+    i64ToInt(msgSendI64_0(ctrl, objcSel("state"))) != 0
+
+pub def makePopUpButton(items: List String, selectedIndex: Int, frame: CGRect, target: Id NSObject): Id NSObject = {
+    let raw = msgSend1Rect(msgSend0(objcClass("NSPopUpButton"), objcSel("alloc")), objcSel("initWithFrame:"), frame);
+    let id = idAdopt(raw);
+    let cur = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(it, rest) -> {
+                let ns = nsString(it);
+                withId(ns, (ip) -> {
+                    c_addIt(raw, objcSel("addItemWithTitle:"), ip)
+                });
+                cellSet(cur, rest)
+            },
+            Nil -> (),
+        }
+    };
+    if (selectedIndex >= 0) msgSendVoid1I64(raw, objcSel("selectItemAtIndex:"), intToI64(selectedIndex)) else ();
+    withId(target, (tgp) -> {
+        c_setTgt2(raw, objcSel("setTarget:"), tgp)
+    });
+    msgSendVoid1Ptr(raw, objcSel("setAction:"), actionTargetSel());
+    id
+}
+
+pub def makeSegmentedControl(labels: List String, selectedIndex: Int, frame: CGRect, target: Id NSObject): Id NSObject = {
+    let arr = msgSend0(objcClass("NSMutableArray"), objcSel("array"));
+    let cur = cellNew(labels);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(lbl, rest) -> {
+                let ns = nsString(lbl);
+                withId(ns, (lp) -> {
+                    c_arrAdd(arr, objcSel("addObject:"), lp)
+                });
+                cellSet(cur, rest)
+            },
+            Nil -> (),
+        }
+    };
+    let raw = withId(target, (tgp) -> {
+        c_seg(objcClass("NSSegmentedControl"), objcSel("segmentedControlWithLabels:trackingMode:target:action:"), arr, intToI64(0), tgp, actionTargetSel())
+    });
+    let id = idRetain(raw);
+    msgSendVoid1Rect(raw, objcSel("setFrame:"), frame);
+    msgSendVoid1I64(raw, objcSel("setSelectedSegment:"), intToI64(selectedIndex));
+    id
+}
+
+pub def makeSlider(minVal: Float, maxVal: Float, val: Float, frame: CGRect, target: Id NSObject): Id NSObject = {
+    let raw = withId(target, (tgp) -> {
+        c_sld(objcClass("NSSlider"), objcSel("sliderWithValue:minValue:maxValue:target:action:"), val, minVal, maxVal, tgp, actionTargetSel())
+    });
+    let id = idRetain(raw);
+    msgSendVoid1Rect(raw, objcSel("setFrame:"), frame);
+    msgSendVoid1Bool(raw, objcSel("setContinuous:"), true);
+    id
+}
+
+pub def makeImageView(frame: CGRect, imgOpt: Option (Id NSObject)): Id NSObject = {
+    let raw = msgSend1Rect(msgSend0(objcClass("NSImageView"), objcSel("alloc")), objcSel("initWithFrame:"), frame);
+    let id = idAdopt(raw);
+    match imgOpt {
+        Some(img) -> withId(img, (ip) -> {
+            c_setImg(raw, objcSel("setImage:"), ip)
+        }),
+        None -> (),
+    };
+    id
+}
+
+pub def imageViewSetImage(iv: Ptr, img: Id NSObject): Void =
+    withId(img, (ip) -> {
+        c_setImg2(iv, objcSel("setImage:"), ip)
+    })
+
+pub def makeMenuItem(title: String, keyEquiv: String, targetOpt: Option (Id NSObject)): Id NSObject = {
+    let tNs = nsString(title);
+    let kNs = nsString(keyEquiv);
+    let alloc = msgSend0(objcClass("NSMenuItem"), objcSel("alloc"));
+    let act = match targetOpt { Some(_) -> actionTargetSel(), None -> ptrNull() };
+    let raw = withId(tNs, (tp) -> withId(kNs, (kp) -> {
+        c_mi(alloc, objcSel("initWithTitle:action:keyEquivalent:"), tp, act, kp)
+    }));
+    let id = idAdopt(raw);
+    match targetOpt {
+        Some(tg) -> withId(tg, (tgp) -> {
+            c_setTgt3(raw, objcSel("setTarget:"), tgp)
+        }),
+        None -> (),
+    };
+    id
+}
+
+pub def makeMenuItemWithSelector(title: String, keyEquiv: String, selName: String): Id NSObject = {
+    let tNs = nsString(title);
+    let kNs = nsString(keyEquiv);
+    let alloc = msgSend0(objcClass("NSMenuItem"), objcSel("alloc"));
+    let raw = withId(tNs, (tp) -> withId(kNs, (kp) -> {
+        c_mi2(alloc, objcSel("initWithTitle:action:keyEquivalent:"), tp, objcSel(selName), kp)
+    }));
+    idAdopt(raw)
+}
+
+pub def nsMenuAddItem(menu: Ptr, item: Id NSObject): Void =
+    withId(item, (ip) -> {
+        c_addMI(menu, objcSel("addItem:"), ip)
+    })
+
+pub def nsMenuAddSeparator(menu: Ptr): Void =
+    msgSendVoid1Ptr(menu, objcSel("addItem:"), msgSend0(objcClass("NSMenuItem"), objcSel("separatorItem")))

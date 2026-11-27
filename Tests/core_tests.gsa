@@ -1,0 +1,458 @@
+/// Comprehensive unit test suite for all pure Geisha Talus core modules.
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listLen, listAny, listMap}
+use std.str.{intToStr, strJoin}
+use std.math.{abs}
+use std.sync.{AtomicInt, atomicNew, atomicLoad, atomicAdd, Chan, chanUnbounded, chanTryRecv}
+use std.task.{sleepMs}
+use sys.io.{eprintLn}
+use sys.fs.{mkdirAll, writeFile, removeFile}
+use sys.proc.{exit}
+use sys.time.{monotonicMs}
+
+use util.{strContains, listNthOpt, listEqualsBy, optEqBy}
+use layout.{
+    Rect, rectNew, rectMinX, rectMinY, rectMaxX, rectMaxY, rectIntersects,
+    insetArea, tallLayout, tallLayoutWithGaps, mirrorTallLayout, mirrorTallLayoutWithGaps
+}
+use screen_geometry.{
+    VisibleWindowCandidate, accessibilityFrame, parkedWindowOrigin,
+    isParkedWindowFrame, matchesVisibleWindow, isSessionLocked
+}
+use window_stack.{
+    stackNew, stackInsert, stackRemove, stackFocusNext, stackSwapNext, stackSwapMaster
+}
+use window_history.{mergeHistory, orderUsingHistory}
+use config.{
+    Configuration, WorkspaceTarget, WsIndex, WsLabel, FloatWindowRule, StatusCommand,
+    defaultConfig, validateConfig, decodeToml, decodeJson, toTomlPreservingComments,
+    floatRuleMatches, resolveWorkspaceTarget, lookupAppWorkspace, resolvePathsWith
+}
+use virtual_workspaces.{
+    PersistedWorkspaceSession, emptyPersistedSession, loadPersistedSessionFromPath,
+    vwNew, vwSeedFromCurrentDesktop, vwActiveWindows, vwActiveFocused,
+    vwMoveWindow, vwWindowCount, vwSwitchTo, vwReconcile
+}
+use session_writer.{
+    sessionWriterNew, sessionWriterSubmit, sessionWriterFlush, sessionWriterFailed, sessionWriterStop
+}
+use status_markup.{
+    SpaceEntry, StatusValues, StatusExport, StatusPart, StatusWorkspaceHitRegion,
+    renderStatus, templateStatusParts, statusExportToJson, statusWorkspaceIndex
+}
+use status_commands.{
+    statusCommandsNew, statusCommandsValue, statusCommandsIsRunning, statusCommandsStopAll
+}
+use manager.{
+    ScreenSpec, CandidateWindow, WindowEffect, EffSetFrame, EffSetPosition, EffFocus,
+    kvkSpace, kvkAnsiT, kvkAnsiP,
+    managerCoreNew, managerCoreRefresh, managerCoreMoveWindowToWorkspace,
+    managerCoreSwitchWorkspace, managerCoreBeginFocusDelivery, managerCoreCancelFocusDelivery,
+    managerCoreHandleAxFocus, managerCoreHandleAppActivated, managerCoreSetLayoutMode,
+    managerCoreApplyConfig, managerCoreTile, managerCoreHandleKey
+}
+
+def assertTrue(label: String, ok: Bool): Result Void String =
+    if (ok) Ok(()) else Err("ASSERT FAILED: " + label)
+
+def eqInt(a: Int, b: Int): Bool = a == b
+def eqI64(a: Int64, b: Int64): Bool = a == b
+def eqBool(a: Bool, b: Bool): Bool = a == b
+def eqWsT(a: WorkspaceTarget, b: WorkspaceTarget): Bool = a == b
+def eqSess(a: PersistedWorkspaceSession, b: PersistedWorkspaceSession): Bool = a == b
+def eqStr(a: String, b: String): Bool = a == b
+
+def testLayout(): Result Void String = {
+    let area = rectNew(-100.0, 20.0, 1000.0, 801.0);
+    let one = tallLayout(area, 1, 1, 0.5);
+    assertTrue("tall 1 len", listLen(one) == 1)?;
+    match listNthOpt(one, 0) {
+        Some(r) -> assertTrue("tall 1 frame", r.w == 1000.0 && r.x == -100.0)?,
+        None -> assertTrue("tall 1 missing", false)?,
+    };
+
+    let three = tallLayout(area, 3, 1, 0.5);
+    assertTrue("tall 3 len", listLen(three) == 3)?;
+    match (listNthOpt(three, 0), listNthOpt(three, 1), listNthOpt(three, 2)) {
+        (Some(r0), Some(r1), Some(r2)) ->
+            assertTrue("tall 3 split", r0.w == 500.0 && r1.h == 400.0 && r2.h == 401.0 && r2.y == 420.0)?,
+        _ -> assertTrue("tall 3 missing", false)?,
+    };
+
+    let mirror = mirrorTallLayout(area, 3, 1, 0.5);
+    match (listNthOpt(mirror, 0), listNthOpt(mirror, 1), listNthOpt(mirror, 2)) {
+        (Some(m0), Some(m1), Some(m2)) ->
+            assertTrue("mirror 3", m0.h == 400.0 && m0.w == 1000.0 && m1.x == -100.0 && m2.x == 400.0 && m2.y == 420.0)?,
+        _ -> assertTrue("mirror 3 missing", false)?,
+    };
+
+    assertTrue("tall 0 empty", listLen(tallLayout(area, 0, 1, 0.5)) == 0)?;
+
+    let gapped = tallLayoutWithGaps(rectNew(0.0, 0.0, 1000.0, 800.0), 3, 1, 0.5, 10.0, 8.0);
+    match (listNthOpt(gapped, 0), listNthOpt(gapped, 1), listNthOpt(gapped, 2)) {
+        (Some(g0), Some(g1), Some(g2)) -> {
+            assertTrue("gapped 0", g0 == rectNew(10.0, 10.0, 486.0, 780.0))?;
+            assertTrue("gapped 1", g1 == rectNew(504.0, 10.0, 486.0, 386.0))?;
+            assertTrue("gapped 2", g2 == rectNew(504.0, 404.0, 486.0, 386.0))?;
+            assertTrue("gapped non-overlap", !rectIntersects(g0, g1) && !rectIntersects(g1, g2))?
+        },
+        _ -> assertTrue("gapped missing", false)?,
+    };
+
+    // Area conservation property
+    let propArea = rectNew(0.0, 25.0, 1440.0, 875.0);
+    let cnt = cellNew(1);
+    while (cellGet(cnt) <= 8) {
+        let c = cellGet(cnt);
+        let rects = tallLayout(propArea, c, 2, 0.6);
+        assertTrue("prop count", listLen(rects) == c)?;
+        let sum = cellNew(0.0);
+        let cur = cellNew(rects);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(r, rest) -> {
+                    assertTrue("prop bounds", r.w > 0.0 && r.h > 0.0 && rectMinX(r) >= 0.0 && rectMaxX(r) <= 1440.0)?;
+                    cellSet(sum, cellGet(sum) + r.w * r.h);
+                    cellSet(cur, rest)
+                },
+                Nil -> (),
+            }
+        };
+        assertTrue("prop area conservation", abs(cellGet(sum) - 1440.0 * 875.0) < 0.000001)?;
+        cellSet(cnt, c + 1)
+    };
+    Ok(())
+}
+
+def testScreenGeometry(): Result Void String = {
+    let primary = accessibilityFrame(rectNew(0.0, 25.0, 1440.0, 852.0), 900.0);
+    assertTrue("ax primary", primary == rectNew(0.0, 23.0, 1440.0, 852.0))?;
+    let left = accessibilityFrame(rectNew(-1920.0, -100.0, 1920.0, 1050.0), 900.0);
+    assertTrue("ax left", left == rectNew(-1920.0, -50.0, 1920.0, 1050.0))?;
+
+    let mainScr = rectNew(0.0, 0.0, 1710.0, 1107.0);
+    let (sx, sy) = parkedWindowOrigin(900.0, 700.0, mainScr, [mainScr]);
+    assertTrue("park single", sx == 1709.0 && sy == 1106.0)?;
+    assertTrue("isParked true", isParkedWindowFrame(rectNew(1709.0, 1075.0, 900.0, 700.0), mainScr))?;
+    assertTrue("isParked false", !isParkedWindowFrame(rectNew(0.0, 34.0, 855.0, 1073.0), mainScr))?;
+
+    let rightScr = rectNew(1710.0, 0.0, 1920.0, 1080.0);
+    let (dx, dy) = parkedWindowOrigin(900.0, 700.0, mainScr, [mainScr, rightScr]);
+    assertTrue("park dual avoids right screen", dx == -899.0 && dy == 1106.0)?;
+
+    let cands = [
+        VisibleWindowCandidate { pid: 29852, windowId: Some(82740), bounds: rectNew(0.0, 34.0, 1710.0, 1073.0) },
+        VisibleWindowCandidate { pid: 52812, windowId: Some(83178), bounds: rectNew(0.0, 34.0, 855.0, 1073.0) },
+    ];
+    assertTrue("match wid", matchesVisibleWindow(29852, Some(82740), rectNew(8.0, 42.0, 1694.0, 1057.0), cands))?;
+    assertTrue("match bounds", matchesVisibleWindow(52812, None, rectNew(1.0, 35.0, 855.0, 1073.0), cands))?;
+    assertTrue("match miss", !matchesVisibleWindow(29852, Some(99999), rectNew(100.0, 100.0, 800.0, 600.0), cands))?;
+
+    assertTrue("unlocked", !isSessionLocked(None, Some(true), Some("com.mitchellh.ghostty")))?;
+    assertTrue("locked flag", isSessionLocked(Some(true), Some(true), Some("com.mitchellh.ghostty")))?;
+    assertTrue("off console", isSessionLocked(None, Some(false), None))?;
+    assertTrue("loginwindow", isSessionLocked(None, None, Some("com.apple.loginwindow")))?;
+    Ok(())
+}
+
+def testStackAndHistory(): Result Void String = {
+    let s0 = stackNew();
+    let s1 = stackInsert(s0, 1, eqInt);
+    let s2 = stackInsert(s1, 2, eqInt);
+    let s3 = stackInsert(s2, 3, eqInt);
+    assertTrue("stack insert", listEqualsBy(s3.items, [3, 2, 1], eqInt) && optEqBy(s3.focused, Some(3), eqInt))?;
+    let s4 = stackFocusNext(s3, 1, eqInt);
+    assertTrue("stack focusNext", optEqBy(s4.focused, Some(2), eqInt))?;
+    let s5 = stackSwapMaster(s4, eqInt);
+    assertTrue("stack swapMaster", listEqualsBy(s5.items, [2, 3, 1], eqInt) && optEqBy(s5.focused, Some(2), eqInt))?;
+    let s6 = stackSwapNext(s5, -1, eqInt);
+    assertTrue("stack swapNext -1", listEqualsBy(s6.items, [3, 1, 2], eqInt) && optEqBy(s6.focused, Some(2), eqInt))?;
+    let s7 = stackSwapNext(s6, 1, eqInt);
+    assertTrue("stack swapNext +1", listEqualsBy(s7.items, [2, 3, 1], eqInt) && optEqBy(s7.focused, Some(2), eqInt))?;
+    let s8 = stackRemove(s7, 2, eqInt);
+    assertTrue("stack remove", listEqualsBy(s8.items, [3, 1], eqInt) && optEqBy(s8.focused, Some(3), eqInt))?;
+
+    let h = mergeHistory([1, 2, 3], [2, 1], eqInt);
+    assertTrue("history merge", listEqualsBy(h, [2, 1, 3], eqInt))?;
+    assertTrue("history order 1", listEqualsBy(orderUsingHistory([1, 2], h, eqInt), [2, 1], eqInt))?;
+    assertTrue("history order 2", listEqualsBy(orderUsingHistory([3, 1, 4], h, eqInt), [1, 3, 4], eqInt))?;
+    Ok(())
+}
+
+def testConfigAndTomlPatch(): Result Void String = {
+    let oldJson = decodeJson("{}")?;
+    assertTrue("old json default gaps", oldJson.outerGap == 0.0 && oldJson.innerGap == 0.0)?;
+
+    let src = "# My layout\n[layout]\n# Leave room around the screen\nouter_gap = 12 # screen edge\ninner_gap = 8 # between windows\n";
+    let cfg0 = decodeToml(src)?;
+    assertTrue("decode gaps", cfg0.outerGap == 12.0 && cfg0.innerGap == 8.0)?;
+    let cfg1 = Configuration {
+        modifiers: cfg0.modifiers, workspaceMode: cfg0.workspaceMode, workspaceCount: cfg0.workspaceCount,
+        masterRatio: cfg0.masterRatio, ratioStep: cfg0.ratioStep, masterCount: cfg0.masterCount,
+        outerGap: 24.0, innerGap: 0.0,
+        ignoreApps: cfg0.ignoreApps, appWorkspaces: cfg0.appWorkspaces, floatWindows: cfg0.floatWindows,
+        statusFormat: cfg0.statusFormat, statusTemplate: cfg0.statusTemplate, statusShowIcon: cfg0.statusShowIcon,
+        workspaceCurrent: cfg0.workspaceCurrent, workspaceOther: cfg0.workspaceOther,
+        statusFonts: cfg0.statusFonts, statusFontSize: cfg0.statusFontSize, statusCommands: cfg0.statusCommands,
+        spaceLabels: cfg0.spaceLabels, workspaceIcons: cfg0.workspaceIcons,
+        statusTextFile: cfg0.statusTextFile, statusStateFile: cfg0.statusStateFile,
+    };
+    let saved = toTomlPreservingComments(cfg1, Some(src));
+    assertTrue("keep header comment", strContains(saved, "# My layout"))?;
+    assertTrue("keep section comment", strContains(saved, "# Leave room around the screen"))?;
+    assertTrue("keep inline outer comment", strContains(saved, "outer_gap = 24 # screen edge"))?;
+    assertTrue("keep inline inner comment", strContains(saved, "inner_gap = 0 # between windows"))?;
+    let reparsed = decodeToml(saved)?;
+    assertTrue("gap patch roundtrip", reparsed == cfg1)?;
+
+    // Reject invalid gaps / duplicates
+    let badCases = [
+        "outer_gap = -1",
+        "inner_gap = 65",
+        "outer_gap = '12'",
+        "inner_gap = true",
+        "outer_gap = 12\n[layout]\nmargin = 12",
+        "[layout]\ninner_gap = 8\ngap = 8",
+    ];
+    let cb = cellNew(badCases);
+    while (match cellGet(cb) { Nil -> false, _ -> true }) {
+        match cellGet(cb) {
+            Cons(bad, r) -> {
+                let res = match decodeToml(bad) {
+                    Err(_) -> false,
+                    Ok(c) -> match validateConfig(c) { Ok(_) -> true, Err(_) -> false },
+                };
+                assertTrue("reject bad: " + bad, !res)?;
+                cellSet(cb, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Full rich TOML with comments, float rules, app_workspaces, commands
+    let richToml = "# User's custom header comment\nmodifiers = [\"option\"]\n\n[workspaces]\n# Keep 6 virtual workspaces\nmode = \"virtual\"\ncount = 6\n\n[layout]\nmaster_ratio = 0.6\nratio_step = 0.05\nmaster_count = 2\n\n[rules]\nignore_apps = [\"com.apple.systempreferences\"]\n\n[rules.app_workspaces]\n\"com.apple.Safari\" = 2\n\"com.tencent.xinWeChat\" = \"聊天\"\n\n[[rules.float_windows]]\napp = \"com.tencent.xinWeChat\"\nexcept_titles = [\"微信\", \"微信 (*)\", \"WeChat\", \"WeChat (*)\"]\n\n[status]\nshow_icon = false\nspace_labels = [\"终端\", \"网页\", \"聊天\"]\nworkspace_icons = [\"terminal\", \"globe\", \"chevron.left.forwardslash.chevron.right\"]\ntemplate = \"%spaces%  <fc=#89CFC2>%layout%</fc>  %clock%\"\nworkspace_current = \"<fc=#10201E,#89CFC2> %label%%fullscreen% </fc>\"\nworkspace_other = \"%label%%fullscreen%\"\nfonts = [\"Menlo-Regular\"]\nfont_size = 12.0\n\n[[status.commands]]\nname = \"clock\"\nexecutable = \"/bin/date\"\narguments = [\"+%H:%M\"]\ninterval = 30.0\ntimeout = 2.0\nmarkup = false\non_change = true\n";
+    let rcfg = decodeToml(richToml)?;
+    validateConfig(rcfg)?;
+    assertTrue("rich modifiers", listEqualsBy(rcfg.modifiers, ["option"], eqStr))?;
+    assertTrue("rich ws mode/count", rcfg.workspaceMode == "virtual" && rcfg.workspaceCount == 6)?;
+    assertTrue("rich safari ws", optEqBy(lookupAppWorkspace(rcfg.appWorkspaces, "com.apple.Safari"), Some(WsIndex(2)), eqWsT))?;
+    assertTrue("rich wechat ws", optEqBy(lookupAppWorkspace(rcfg.appWorkspaces, "com.tencent.xinWeChat"), Some(WsLabel("聊天")), eqWsT))?;
+    match lookupAppWorkspace(rcfg.appWorkspaces, "com.tencent.xinWeChat") {
+        Some(t) -> assertTrue("resolve label", optEqBy(resolveWorkspaceTarget(t, 6, rcfg.spaceLabels), Some(2), eqInt))?,
+        None -> assertTrue("missing wechat target", false)?,
+    };
+    match listNthOpt(rcfg.floatWindows, 0) {
+        Some(rule) -> {
+            assertTrue("wechat main not floated", !floatRuleMatches(rule, Some("com.tencent.xinWeChat"), "微信 (3)"))?;
+            assertTrue("wechat viewer floated", floatRuleMatches(rule, Some("com.tencent.xinWeChat"), "图片和视频"))?
+        },
+        None -> assertTrue("missing float rule", false)?,
+    };
+
+    // Path resolution priority
+    let p0 = resolvePathsWith("/Users/u", None, (p) -> p == "/Users/u/Library/Application Support/Talus/config.json");
+    assertTrue("json migration path", p0.migratedFromJson && p0.savePath == "/Users/u/.talus.toml")?;
+    Ok(())
+}
+
+def testVirtualWorkspacesAndSessionWriter(): Result Void String = {
+    let eng = vwNew(5, 0.52, 1);
+    vwSeedFromCurrentDesktop(eng, ["A", "B", "C"], Some("B"), (_) -> None, (_) -> None, (_, _) -> None, eqStr);
+    assertTrue("vw seed active", listEqualsBy(vwActiveWindows(eng), ["A", "B", "C"], eqStr))?;
+    assertTrue("vw seed focus", optEqBy(vwActiveFocused(eng, eqStr), Some("B"), eqStr))?;
+
+    let (moved, next) = vwMoveWindow(eng, "B", 2, eqStr);
+    assertTrue("vw move", moved && optEqBy(next, Some("C"), eqStr) && listEqualsBy(vwActiveWindows(eng), ["A", "C"], eqStr) && vwWindowCount(eng, 2) == 1)?;
+    assertTrue("vw switch", vwSwitchTo(eng, 2, eqStr) && listEqualsBy(vwActiveWindows(eng), ["B"], eqStr))?;
+    let (changed, shifted) = vwReconcile(eng, ["C", "B", "A", "D"], Some("D"), (_) -> None, (_, _) -> true, eqStr);
+    assertTrue("vw reconcile", changed && listLen(shifted) == 0 && listEqualsBy(vwActiveWindows(eng), ["D", "B"], eqStr) && optEqBy(vwActiveFocused(eng, eqStr), Some("D"), eqStr))?;
+
+    // SessionWriter coalescing + retry + flush + stop
+    let tmpDir = "/tmp/talus-gsa-writer-" + intToStr(i64ToInt(monotonicMs() % intToI64(1000000)));
+    mkdirAll(tmpDir)?;
+    let blocker = tmpDir + "/blocked";
+    writeFile(blocker, "not a dir")?;
+    let sessPath = blocker + "/session.json";
+    let writer = sessionWriterNew(sessPath);
+    let snap0 = emptyPersistedSession();
+    let _ = sessionWriterSubmit(writer, snap0);
+    sessionWriterFlush(writer);
+    assertTrue("writer records failure", sessionWriterFailed(writer))?;
+    let _ = removeFile(blocker);
+    let snap2 = PersistedWorkspaceSession {
+        activeWorkspace: 3,
+        layouts: snap0.layouts,
+        workspaceWindowIds: snap0.workspaceWindowIds,
+        focusedWindowIdByWorkspace: snap0.focusedWindowIdByWorkspace,
+        floatingWindowIds: snap0.floatingWindowIds,
+        savedFramesByWindowId: snap0.savedFramesByWindowId,
+    };
+    let _ = sessionWriterSubmit(writer, snap2);
+    sessionWriterFlush(writer);
+    assertTrue("writer recovers", !sessionWriterFailed(writer))?;
+    assertTrue("writer persisted", optEqBy(loadPersistedSessionFromPath(sessPath), Some(snap2), eqSess))?;
+    sessionWriterStop(writer);
+    let _ = removeFile(sessPath);
+    Ok(())
+}
+
+def testStatusMarkupAndCommands(): Result Void String = {
+    let d = defaultConfig();
+    let cfg = Configuration {
+        modifiers: d.modifiers, workspaceMode: d.workspaceMode, workspaceCount: d.workspaceCount,
+        masterRatio: d.masterRatio, ratioStep: d.ratioStep, masterCount: d.masterCount,
+        outerGap: d.outerGap, innerGap: d.innerGap, ignoreApps: d.ignoreApps,
+        appWorkspaces: d.appWorkspaces, floatWindows: d.floatWindows, statusFormat: d.statusFormat,
+        statusTemplate: Some("%spaces% | <fc=#ABCDEF><fn=0>%layout%</fn></fc>"),
+        statusShowIcon: d.statusShowIcon,
+        workspaceCurrent: "<fc=#001122,#88CCBB> %label%%fullscreen% </fc>",
+        workspaceOther: "%index%:%label%",
+        statusFonts: ["Menlo-Regular"],
+        statusFontSize: d.statusFontSize,
+        statusCommands: d.statusCommands,
+        spaceLabels: ["term", "web"],
+        workspaceIcons: d.workspaceIcons,
+        statusTextFile: d.statusTextFile,
+        statusStateFile: d.statusStateFile,
+    };
+    let spaces = [
+        SpaceEntry { id: intToI64(1), isCurrent: false, isFullscreen: false, windowCount: Some(1) },
+        SpaceEntry { id: intToI64(2), isCurrent: true, isFullscreen: true, windowCount: Some(1) },
+    ];
+    let values = StatusValues {
+        spaces: Some(spaces), layout: "Tall", title: "Editor", count: 2, custom: "CPU",
+        paused: false, spaceLabels: cfg.spaceLabels, spaceIcons: Nil,
+    };
+    let parts = templateStatusParts(cfg, values, (_) -> "");
+    let joined = strJoin(listMap(parts, (p: StatusPart) -> p.text), "");
+    assertTrue("template joined: got '" + joined + "'", joined == "1:term  web•  | Tall")?;
+
+    let plain = renderStatus("{spaces}  {layout}", values);
+    assertTrue("plain render: got '" + plain + "'", plain == "term [web•]  Tall")?;
+
+    // Hit testing
+    let regions = [
+        StatusWorkspaceHitRegion { index: 0, rect: rectNew(23.0, 0.0, 20.0, 18.0) },
+        StatusWorkspaceHitRegion { index: 1, rect: rectNew(46.0, 0.0, 20.0, 18.0) },
+    ];
+    let btnBounds = rectNew(0.0, 0.0, 100.0, 22.0);
+    let imgRect = rectNew(4.0, 2.0, 92.0, 18.0);
+    assertTrue("hit ws 0", optEqBy(statusWorkspaceIndex(30.0, 10.0, btnBounds, imgRect, regions), Some(0), eqInt))?;
+    assertTrue("hit ws 1", optEqBy(statusWorkspaceIndex(55.0, 10.0, btnBounds, imgRect, regions), Some(1), eqInt))?;
+    assertTrue("hit miss icon", optEqBy(statusWorkspaceIndex(10.0, 10.0, btnBounds, imgRect, regions), None, eqInt))?;
+
+    // StatusCommandsEngine runs real /bin/echo & stops cleanly
+    let notifyCh: Chan Int = chanUnbounded();
+    let cmdEng = statusCommandsNew(None, Some(notifyCh));
+    let echoCmd = StatusCommand {
+        name: "hello", executable: "/bin/echo", arguments: Some(["hi-talus"]),
+        interval: Some(60.0), timeout: Some(2.0), markup: None, onChange: None,
+    };
+    let _ = statusCommandsValue(cmdEng, 0, echoCmd);
+    let tries = cellNew(0);
+    let gotNotify = cellNew(false);
+    while (cellGet(tries) < 40 && !cellGet(gotNotify)) {
+        match chanTryRecv(notifyCh) {
+            Some(_) -> cellSet(gotNotify, true),
+            None -> { sleepMs(25); cellSet(tries, cellGet(tries) + 1) },
+        }
+    };
+    let outVal = statusCommandsValue(cmdEng, 0, echoCmd);
+    statusCommandsStopAll(cmdEng);
+    assertTrue("status command output: got '" + outVal + "'", outVal == "hi-talus")?;
+    Ok(())
+}
+
+def sampleScreen(): ScreenSpec = ScreenSpec {
+    id: 1,
+    fullFrame: rectNew(0.0, 0.0, 1440.0, 900.0),
+    visibleFrame: rectNew(0.0, 25.0, 1440.0, 875.0),
+}
+
+def sampleCand(key: Int, wid: Int, pid: Int, bundle: String, title: String): CandidateWindow =
+    CandidateWindow {
+        key: intToI64(key), pid: pid, bundleId: Some(bundle), windowId: Some(wid),
+        title: title, frame: rectNew(100.0, 100.0, 600.0, 400.0), isResizable: true,
+    }
+
+def testManagerCore(): Result Void String = {
+    let d = defaultConfig();
+    let cfg = Configuration {
+        modifiers: d.modifiers, workspaceMode: "virtual", workspaceCount: 3,
+        masterRatio: d.masterRatio, ratioStep: d.ratioStep, masterCount: d.masterCount,
+        outerGap: d.outerGap, innerGap: d.innerGap, ignoreApps: d.ignoreApps,
+        appWorkspaces: d.appWorkspaces, floatWindows: d.floatWindows, statusFormat: d.statusFormat,
+        statusTemplate: d.statusTemplate, statusShowIcon: d.statusShowIcon,
+        workspaceCurrent: d.workspaceCurrent, workspaceOther: d.workspaceOther,
+        statusFonts: d.statusFonts, statusFontSize: d.statusFontSize, statusCommands: d.statusCommands,
+        spaceLabels: d.spaceLabels, workspaceIcons: d.workspaceIcons,
+        statusTextFile: d.statusTextFile, statusStateFile: d.statusStateFile,
+    };
+    let mgr = managerCoreNew(cfg, None);
+    let screens = [sampleScreen()];
+    let c1 = sampleCand(1, 101, 1001, "com.apple.Terminal", "term-1");
+    let c2 = sampleCand(2, 102, 1002, "com.apple.Safari", "web-1");
+
+    let out = managerCoreRefresh(mgr, false, 10.0, screens, [c1, c2], Nil, [101, 102], [101, 102], Nil, true, Some(intToI64(1)), false);
+    assertTrue("mgr refresh active", listEqualsBy(out.activeWindowKeys, [intToI64(1), intToI64(2)], eqI64))?;
+    assertTrue("mgr refresh effects", listLen(out.effects) == 2)?;
+
+    let moveOut = managerCoreMoveWindowToWorkspace(mgr, 1, 11.0, true, Some(intToI64(1)), Nil);
+    assertTrue("mgr move active", listEqualsBy(moveOut.activeWindowKeys, [intToI64(2)], eqI64))?;
+    assertTrue("mgr move parked 1", listAny(moveOut.effects, (e) -> match e {
+        EffSetPosition { key, x, y } -> key == intToI64(1) && abs(x - 1439.0) < 0.000001 && abs(y - 899.0) < 0.000001,
+        _ -> false,
+    }))?;
+    assertTrue("mgr move focus 2", listAny(moveOut.effects, (e) -> match e {
+        EffFocus { key, pid } -> key == intToI64(2) && pid == 1002,
+        _ -> false,
+    }))?;
+
+    let swOut = managerCoreSwitchWorkspace(mgr, 1, 12.0, true, Some(intToI64(2)), Nil);
+    assertTrue("mgr switch active", listEqualsBy(swOut.activeWindowKeys, [intToI64(1)], eqI64) && swOut.activeWorkspace == 1)?;
+
+    // Delayed focus delivery & cancellation
+    managerCoreBeginFocusDelivery(mgr, 13.0, Some(intToI64(1)));
+    let stale = managerCoreHandleAxFocus(mgr, 13.01, true, false, Some(intToI64(2)), Nil);
+    assertTrue("guard blocks stale", stale.activeWorkspace == 1 && !stale.statusChanged)?;
+    managerCoreCancelFocusDelivery(mgr);
+    let clicked = managerCoreHandleAxFocus(mgr, 13.02, true, false, Some(intToI64(2)), Nil);
+    assertTrue("cancel allows click", clicked.activeWorkspace == 0 && clicked.statusChanged)?;
+
+    // Keybindings: Space cycles Tall -> Mirror -> Full, T floats, P pauses
+    let km = managerCoreHandleKey(mgr, kvkSpace(), false, 14.0, true, Some(intToI64(2)), Nil);
+    assertTrue("space -> Mirror", km.layoutName == "Mirror")?;
+    let kf = managerCoreHandleKey(mgr, kvkSpace(), false, 15.0, true, Some(intToI64(2)), Nil);
+    assertTrue("space -> Full", kf.layoutName == "Full")?;
+    let kp = managerCoreHandleKey(mgr, kvkAnsiP(), false, 16.0, true, Some(intToI64(2)), Nil);
+    assertTrue("P pauses", kp.paused && optEqBy(kp.pausedToggled, Some(true), eqBool))?;
+    Ok(())
+}
+
+def runSuite(): Result Void String = {
+    testLayout()?;
+    printLn("  [PASS] layout & area conservation");
+    testScreenGeometry()?;
+    printLn("  [PASS] screen geometry & parking");
+    testStackAndHistory()?;
+    printLn("  [PASS] window stack & history");
+    testConfigAndTomlPatch()?;
+    printLn("  [PASS] config decode/validate & std.toml.patch comment preservation");
+    testVirtualWorkspacesAndSessionWriter()?;
+    printLn("  [PASS] virtual workspaces & async session writer");
+    testStatusMarkupAndCommands()?;
+    printLn("  [PASS] status markup, hit-testing & sys.proc status commands");
+    testManagerCore()?;
+    printLn("  [PASS] ManagerCore state machine, focus guards & keybindings");
+    Ok(())
+}
+
+def main(): Void = {
+    printLn("Running Talus pure-Geisha core test suite...");
+    match runSuite() {
+        Ok(_) -> printLn("All Talus core tests passed!"),
+        Err(e) -> { eprintLn("FAIL: " + e); exit(1) },
+    }
+}

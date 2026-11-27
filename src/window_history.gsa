@@ -1,0 +1,80 @@
+/// Keeps off-Space windows in the order last assigned while replacing the
+/// entries belonging to the current Space with their latest order.
+
+use std.option.{Some, None}
+use std.list.{listRev, listAppend}
+use util.{listContainsBy, listFindBy}
+
+pub def mergeHistory(history: List a, current: List a, eqFn: (a, a) -> Bool): List a = {
+    // Append any items from `current` not already in `history`
+    let extraRev: Cell (List a) = cellNew(Nil);
+    let cc = cellNew(current);
+    while (match cellGet(cc) { Nil -> false, _ -> true }) {
+        match cellGet(cc) {
+            Cons(item, rest) -> {
+                if (!listContainsBy(history, item, eqFn) && !listContainsBy(cellGet(extraRev), item, eqFn)) {
+                    cellSet(extraRev, Cons(item, cellGet(extraRev)))
+                } else ();
+                cellSet(cc, rest)
+            },
+            Nil -> (),
+        }
+    };
+    let combined = listAppend(history, listRev(cellGet(extraRev)));
+    // Replace slots belonging to `current` in-place with `current`'s order
+    let remCur = cellNew(current);
+    let outRev: Cell (List a) = cellNew(Nil);
+    let ck = cellNew(combined);
+    while (match cellGet(ck) { Nil -> false, _ -> true }) {
+        match cellGet(ck) {
+            Cons(elem, rest) -> {
+                if (listContainsBy(current, elem, eqFn)) {
+                    match cellGet(remCur) {
+                        Cons(nextItem, nextTail) -> {
+                            cellSet(outRev, Cons(nextItem, cellGet(outRev)));
+                            cellSet(remCur, nextTail)
+                        },
+                        Nil -> cellSet(outRev, Cons(elem, cellGet(outRev))),
+                    }
+                } else {
+                    cellSet(outRev, Cons(elem, cellGet(outRev)))
+                };
+                cellSet(ck, rest)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+pub def orderUsingHistory(current: List a, history: List a, eqFn: (a, a) -> Bool): List a = {
+    let knownRev: Cell (List a) = cellNew(Nil);
+    let ch = cellNew(history);
+    while (match cellGet(ch) { Nil -> false, _ -> true }) {
+        match cellGet(ch) {
+            Cons(old, rest) -> {
+                match listFindBy(current, (c) -> eqFn(c, old)) {
+                    Some(found) -> cellSet(knownRev, Cons(found, cellGet(knownRev))),
+                    None -> (),
+                };
+                cellSet(ch, rest)
+            },
+            Nil -> (),
+        }
+    };
+    let known = listRev(cellGet(knownRev));
+    let extraRev: Cell (List a) = cellNew(Nil);
+    let cc = cellNew(current);
+    while (match cellGet(cc) { Nil -> false, _ -> true }) {
+        match cellGet(cc) {
+            Cons(item, rest) -> {
+                if (!listContainsBy(known, item, eqFn) && !listContainsBy(cellGet(extraRev), item, eqFn)) {
+                    cellSet(extraRev, Cons(item, cellGet(extraRev)))
+                } else ();
+                cellSet(cc, rest)
+            },
+            Nil -> (),
+        }
+    };
+    listAppend(known, listRev(cellGet(extraRev)))
+}

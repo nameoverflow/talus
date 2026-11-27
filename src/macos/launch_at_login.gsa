@@ -1,0 +1,140 @@
+/// Launch-at-login via macOS `SMAppService.mainApp` (`ServiceManagement.framework`).
+///
+/// macOS owns this preference; it is never copied into the portable TOML config
+/// and never auto-registered on opening settings.
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use objc.{objcClass, objcSel, fromNSStringPtr, msgSend0, msgSendI64_0, msgSendVoid0}
+use macos.ffi.{msgSendBool1PtrOut, readPtrAt}
+
+/// Mirrors `SMAppServiceStatus` (`NSInteger`).
+pub data LoginStatus {
+    LoginNotRegistered,
+    LoginEnabled,
+    LoginRequiresApproval,
+    LoginNotFound,
+}
+
+pub def loginStatusEq(a: LoginStatus, b: LoginStatus): Bool = match (a, b) {
+    (LoginNotRegistered, LoginNotRegistered) -> true,
+    (LoginEnabled, LoginEnabled) -> true,
+    (LoginRequiresApproval, LoginRequiresApproval) -> true,
+    (LoginNotFound, LoginNotFound) -> true,
+    _ -> false,
+}
+
+def statusFromRaw(raw: Int): LoginStatus =
+    if (raw == 0) LoginNotRegistered
+    else if (raw == 1) LoginEnabled
+    else if (raw == 2) LoginRequiresApproval
+    else LoginNotFound
+
+pub data LaunchAtLoginService {
+    LaunchAtLoginService {
+        status: () -> LoginStatus,
+        register: () -> Result Void String,
+        unregister: () -> Result Void String,
+        openSystemSettings: () -> Void,
+    }
+}
+
+def nsErrorDescription(errPtr: Ptr): String =
+    if (ptrIsNull(errPtr)) "未知错误"
+    else {
+        let desc = msgSend0(errPtr, objcSel("localizedDescription"));
+        let s = fromNSStringPtr(desc);
+        if (strLen(s) > 0) s else "未知错误"
+    }
+
+/// Live `SMAppService.mainApp` implementation via `objc.gsa`.
+pub def systemLaunchAtLoginService(): LaunchAtLoginService = LaunchAtLoginService {
+    status: () -> {
+        let cls = objcClass("SMAppService");
+        if (ptrIsNull(cls)) LoginNotFound
+        else {
+            let mainApp = msgSend0(cls, objcSel("mainAppService"));
+            if (ptrIsNull(mainApp)) LoginNotFound
+            else statusFromRaw(i64ToInt(msgSendI64_0(mainApp, objcSel("status"))))
+        }
+    },
+    register: () -> {
+        let cls = objcClass("SMAppService");
+        if (ptrIsNull(cls)) Err("SMAppService 不可用")
+        else {
+            let mainApp = msgSend0(cls, objcSel("mainAppService"));
+            if (ptrIsNull(mainApp)) Err("SMAppService.mainAppService 不可用")
+            else withAlloca(8, (errBuf) -> {
+                scopedPtrWriteI64Le(errBuf, intToI64(0), intToI64(0));
+                let ok = msgSendBool1PtrOut(mainApp, objcSel("registerAndReturnError:"), errBuf);
+                if (ok) Ok(()) else Err(nsErrorDescription(readPtrAt(errBuf, 0)))
+            })
+        }
+    },
+    unregister: () -> {
+        let cls = objcClass("SMAppService");
+        if (ptrIsNull(cls)) Err("SMAppService 不可用")
+        else {
+            let mainApp = msgSend0(cls, objcSel("mainAppService"));
+            if (ptrIsNull(mainApp)) Err("SMAppService.mainAppService 不可用")
+            else withAlloca(8, (errBuf) -> {
+                scopedPtrWriteI64Le(errBuf, intToI64(0), intToI64(0));
+                let ok = msgSendBool1PtrOut(mainApp, objcSel("unregisterAndReturnError:"), errBuf);
+                if (ok) Ok(()) else Err(nsErrorDescription(readPtrAt(errBuf, 0)))
+            })
+        }
+    },
+    openSystemSettings: () -> {
+        let cls = objcClass("SMAppService");
+        if (!ptrIsNull(cls)) msgSendVoid0(cls, objcSel("openSystemSettingsLoginItems")) else ()
+    },
+}
+
+pub data LaunchAtLoginModel {
+    LaunchAtLoginModel {
+        statusCell: Cell LoginStatus,
+        errorCell: Cell (Option String),
+        service: LaunchAtLoginService,
+    }
+}
+
+pub def launchAtLoginNew(service: LaunchAtLoginService): LaunchAtLoginModel =
+    LaunchAtLoginModel {
+        statusCell: cellNew((service.status)()),
+        errorCell: cellNew(None),
+        service: service,
+    }
+
+pub def launchAtLoginStatus(m: LaunchAtLoginModel): LoginStatus = cellGet(m.statusCell)
+pub def launchAtLoginError(m: LaunchAtLoginModel): Option String = cellGet(m.errorCell)
+pub def launchAtLoginIsEnabled(m: LaunchAtLoginModel): Bool = loginStatusEq(cellGet(m.statusCell), LoginEnabled)
+pub def launchAtLoginNeedsApproval(m: LaunchAtLoginModel): Bool = loginStatusEq(cellGet(m.statusCell), LoginRequiresApproval)
+
+pub def launchAtLoginRefresh(m: LaunchAtLoginModel): Void = {
+    let current = (m.service.status)();
+    if (!loginStatusEq(cellGet(m.statusCell), current)) {
+        cellSet(m.statusCell, current);
+        cellSet(m.errorCell, None)
+    } else ()
+}
+
+pub def launchAtLoginOpenSettings(m: LaunchAtLoginModel): Void =
+    (m.service.openSystemSettings)()
+
+pub def launchAtLoginSetEnabled(m: LaunchAtLoginModel, enabled: Bool): Void = {
+    cellSet(m.errorCell, None);
+    launchAtLoginRefresh(m);
+    if (enabled && launchAtLoginNeedsApproval(m)) {
+        launchAtLoginOpenSettings(m)
+    } else if (enabled != launchAtLoginIsEnabled(m) || (!enabled && launchAtLoginNeedsApproval(m))) {
+        let res = if (enabled) (m.service.register)() else (m.service.unregister)();
+        match res {
+            Ok(_) -> (),
+            Err(msg) -> {
+                let verb = if (enabled) "开启" else "关闭";
+                cellSet(m.errorCell, Some("无法" + verb + "自动启动：" + msg))
+            },
+        };
+        launchAtLoginRefresh(m)
+    } else ()
+}

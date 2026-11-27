@@ -1,0 +1,116 @@
+/// Coalesces virtual-workspace session snapshots onto disk asynchronously
+/// with a 50ms fixed deadline so hot-path input never blocks on filesystem I/O.
+
+use std.option.{Option, Some, None}
+use std.result.{Ok, Err}
+use std.sync.{
+    Chan, chanUnbounded, chanSend, chanRecv, chanTryRecv, chanClose,
+    AtomicInt, atomicNew, atomicLoad, atomicStore
+}
+use std.task.{Task, spawn, await, sleepMs}
+use sys.io.{eprintLn}
+use sys.time.{monotonicMs}
+use virtual_workspaces.{PersistedWorkspaceSession, savePersistedSessionToPath}
+
+data WriterMsg {
+    MsgSave(PersistedWorkspaceSession),
+    MsgFlush(Chan Int),
+    MsgStop,
+}
+
+pub data SessionWriter {
+    tx: Chan WriterMsg,
+    failedFlag: AtomicInt,
+    worker: Task Void,
+}
+
+pub def sessionWriterNew(path: String): SessionWriter = {
+    let tx: Chan WriterMsg = chanUnbounded();
+    let failedFlag = atomicNew(0);
+    let worker = spawn(() -> {
+        let pending: Cell (Option PersistedWorkspaceSession) = cellNew(None);
+        let deadline: Cell (Option Int64) = cellNew(None);
+        let running = cellNew(true);
+
+        let doSave = () -> {
+            match cellGet(pending) {
+                Some(snap) -> {
+                    cellSet(pending, None);
+                    match savePersistedSessionToPath(snap, path) {
+                        Ok(_) -> atomicStore(failedFlag, 0),
+                        Err(err) -> {
+                            eprintLn("Talus session save failed: " + err);
+                            atomicStore(failedFlag, 1);
+                            cellSet(pending, Some(snap))
+                        },
+                    }
+                },
+                None -> (),
+            }
+        };
+
+        let handleMsg = (msg: WriterMsg) -> match msg {
+            MsgSave(snap) -> {
+                cellSet(pending, Some(snap));
+                match cellGet(deadline) {
+                    None -> cellSet(deadline, Some(monotonicMs() + intToI64(50))),
+                    Some(_) -> (),
+                }
+            },
+            MsgFlush(ack) -> {
+                doSave();
+                cellSet(deadline, None);
+                let _ = chanSend(ack, 1);
+                ()
+            },
+            MsgStop -> {
+                doSave();
+                cellSet(deadline, None);
+                cellSet(running, false)
+            },
+        };
+
+        while (cellGet(running)) {
+            match cellGet(deadline) {
+                None -> match chanRecv(tx) {
+                    Some(msg) -> handleMsg(msg),
+                    None -> { doSave(); cellSet(running, false) },
+                },
+                Some(atMs) -> {
+                    match chanTryRecv(tx) {
+                        Some(msg) -> handleMsg(msg),
+                        None -> {
+                            if (monotonicMs() >= atMs) {
+                                doSave();
+                                cellSet(deadline, None)
+                            } else {
+                                sleepMs(10)
+                            }
+                        },
+                    }
+                },
+            }
+        }
+    });
+    SessionWriter { tx: tx, failedFlag: failedFlag, worker: worker }
+}
+
+pub def sessionWriterFailed(w: SessionWriter): Bool =
+    atomicLoad(w.failedFlag) != 0
+
+pub def sessionWriterSubmit(w: SessionWriter, snap: PersistedWorkspaceSession): Bool =
+    chanSend(w.tx, MsgSave(snap))
+
+pub def sessionWriterFlush(w: SessionWriter): Void = {
+    let ack: Chan Int = chanUnbounded();
+    if (chanSend(w.tx, MsgFlush(ack))) {
+        let _ = chanRecv(ack);
+        ()
+    } else ()
+}
+
+pub def sessionWriterStop(w: SessionWriter): Void = {
+    let _ = chanSend(w.tx, MsgStop);
+    chanClose(w.tx);
+    await(w.worker)
+}

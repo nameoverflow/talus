@@ -1,235 +1,81 @@
-.PHONY: all clean app dist install setup-cert rust-test deployment-test
+.PHONY: all clean app dist install setup-cert test check deployment-test settings-preview status-cleanup-test integration-test
+
+GEISHA ?= $(shell command -v geisha || echo $(HOME)/.geisha/bin/geisha)
 CERT_NAME ?= Talus Local Code Signing
 CODESIGN_IDENTITY ?= auto
-# Keep local builds and release builds compatible with the supported macOS floor.
-# Swift's default follows the installed toolchain, not MACOSX_DEPLOYMENT_TARGET.
 MACOS_DEPLOYMENT_TARGET = 15.0
 SWIFTC = swiftc -target $(shell uname -m)-apple-macosx$(MACOS_DEPLOYMENT_TARGET)
 export MACOSX_DEPLOYMENT_TARGET = $(MACOS_DEPLOYMENT_TARGET)
-CORE_LIB = Core/target/release/libtalus_core.a
-CORE_HEADER = Core/include/talus_core.h
-CORE_FLAGS = -import-objc-header $(CORE_HEADER) $(CORE_LIB)
-CORE_SOURCES = Core/Cargo.toml $(wildcard Core/src/*.rs)
+
+GSA_SOURCES = geisha.toml $(wildcard src/*.gsa) $(wildcard src/macos/*.gsa)
 
 all: build/talus
 
-$(CORE_LIB): $(CORE_SOURCES)
-	cargo build --release --manifest-path Core/Cargo.toml
+check:
+	$(GEISHA) check
 
-APP_SOURCES = Sources/main.swift Sources/WindowGeometryIO.swift Sources/WindowServerFrames.swift Sources/WindowExecutor.swift Sources/MainLoopUpdate.swift Sources/WindowFocus.swift Sources/WindowDiscovery.swift Sources/Layout.swift Sources/WindowHistory.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/StatusIcon.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusConfiguration.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/StatusCommands.swift Sources/LaunchAtLogin.swift Sources/SettingsWindow.swift
-build/talus: Makefile $(APP_SOURCES) $(CORE_LIB) $(CORE_HEADER)
+build/talus: Makefile $(GSA_SOURCES)
 	mkdir -p build
-	$(SWIFTC) -O $(APP_SOURCES) $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework ServiceManagement -framework Carbon -framework ApplicationServices -o $@
+	$(GEISHA) build -o $@
+
 clean:
 	rm -rf build
-	cargo clean --manifest-path Core/Cargo.toml
-rust-test:
-	cargo test --manifest-path Core/Cargo.toml
-test: rust-test $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/Layout.swift Tests/LayoutTests.swift $(CORE_FLAGS) -o build/layout-tests
-	build/layout-tests
-property-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) -O Sources/Layout.swift Tests/LayoutProperties.swift $(CORE_FLAGS) -o build/layout-properties
-	build/layout-properties
-stack-test:
-	mkdir -p build
-	$(SWIFTC) Sources/WindowStack.swift Tests/WindowStackTests.swift -o build/stack-tests
-	build/stack-tests
-XMONAD_SRC ?= ../xmonad-macos/src
-xmonad-oracle:
-	mkdir -p build/oracle
-	ghc -O -i$(XMONAD_SRC) -outputdir build/oracle Tests/StackOracle.hs -o build/oracle/haskell
-	$(SWIFTC) Sources/WindowStack.swift Tests/StackOracle.swift -o build/oracle/swift
-	build/oracle/haskell > build/oracle/expected
-	build/oracle/swift > build/oracle/actual
-	diff -u build/oracle/expected build/oracle/actual
-history-test:
-	mkdir -p build
-	$(SWIFTC) Sources/WindowHistory.swift Tests/WindowHistoryTests.swift -o build/history-tests
-	build/history-tests
-build/Talus.icns: Scripts/DrawAppIcon.swift
+
+test: deployment-test
+	$(GEISHA) test
+
+build/Talus.icns: build/talus
 	mkdir -p build/Talus.iconset
 	find build/Talus.iconset -type f -delete
-	swift Scripts/DrawAppIcon.swift build/icon-master.png
+	build/talus --render-icon build/icon-master.png
 	@for spec in 16x16:16 16x16@2x:32 32x32:32 32x32@2x:64 128x128:128 128x128@2x:256 256x256:256 256x256@2x:512 512x512:512 512x512@2x:1024; do \
 	  name=$${spec%:*}; size=$${spec#*:}; \
 	  sips -z $$size $$size build/icon-master.png --out build/Talus.iconset/icon_$${name}.png >/dev/null; \
 	done
 	iconutil -c icns build/Talus.iconset -o $@
+
 setup-cert:
 	sh Scripts/setup-local-cert.sh "$(CERT_NAME)"
-app: build/talus Resources/Info.plist build/Talus.icns deployment-test
-	mkdir -p build/Talus.app/Contents/MacOS build/Talus.app/Contents/Resources
-	cp build/talus build/Talus.app/Contents/MacOS/Talus
-	cp Resources/Info.plist build/Talus.app/Contents/Info.plist
-	cp build/Talus.icns build/Talus.app/Contents/Resources/Talus.icns
+
+app: build/Talus.app deployment-test
+
+build/Talus.app: Makefile $(GSA_SOURCES) Resources/Info.plist build/Talus.icns
+	mkdir -p build
+	$(GEISHA) build --target macos-app -o $@
 	@id="$$(sh Scripts/resolve-codesign-identity.sh "$(CODESIGN_IDENTITY)" "$(CERT_NAME)")"; \
-	echo "Signing build/Talus.app with identity: $$id"; \
-	codesign --force --sign "$$id" build/Talus.app
+	echo "Signing $@ with identity: $$id"; \
+	codesign --force --sign "$$id" "$@"
+
+deployment-test: build/Talus.app
+	@actual="$$(xcrun vtool -show-build build/Talus.app/Contents/MacOS/Talus | awk '$$1 == "minos" { print $$2 }')"; \
+	test "$$actual" = "$(MACOS_DEPLOYMENT_TARGET)" || { echo "Expected macOS $(MACOS_DEPLOYMENT_TARGET), binary requires $$actual"; exit 1; }; \
+	echo "Binary minimum macOS version verified: $$actual"
+
 install: app
 	pkill -TERM -x Talus || true
 	sleep 0.6
 	rm -rf /Applications/Talus.app
 	cp -R build/Talus.app /Applications/Talus.app
-	open -g /Applications/Talus.app
-dist: build/talus Resources/Info.plist build/Talus.icns deployment-test
+	open -g /Applications/Talus.app </dev/null >/dev/null 2>&1
+
+dist: build/Talus.app deployment-test
 	rm -rf build/dist build/Talus-macos.zip
-	mkdir -p build/dist/Talus.app/Contents/MacOS build/dist/Talus.app/Contents/Resources
-	cp build/talus build/dist/Talus.app/Contents/MacOS/Talus
-	cp Resources/Info.plist build/dist/Talus.app/Contents/Info.plist
-	cp build/Talus.icns build/dist/Talus.app/Contents/Resources/Talus.icns
+	mkdir -p build/dist
+	cp -R build/Talus.app build/dist/Talus.app
 	@id="$$(sh Scripts/resolve-codesign-identity.sh dist "$(CERT_NAME)")"; \
 	echo "Signing distributable build/dist/Talus.app with identity: $$id"; \
 	codesign --force --sign "$$id" build/dist/Talus.app
 	ditto -c -k --keepParent build/dist/Talus.app build/Talus-macos.zip
 	@echo "Built distributable archive: build/Talus-macos.zip"
-toml-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/TOML.swift Tests/TOMLTests.swift $(CORE_FLAGS) -o build/toml-tests
-	build/toml-tests
-config-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Tests/ConfigurationTests.swift $(CORE_FLAGS) -o build/config-tests
-	build/config-tests
-settings-ui-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/LaunchAtLogin.swift Sources/SettingsWindow.swift Tests/SettingsViewModelTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework ServiceManagement -framework CoreGraphics -o build/settings-ui-tests
-	build/settings-ui-tests
-settings-window-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/LaunchAtLogin.swift Sources/SettingsWindow.swift Tests/SettingsWindowLayoutTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework ServiceManagement -framework CoreGraphics -o build/settings-window-tests
-	build/settings-window-tests
-test: settings-window-test
-integration-test: all
+
+settings-preview: build/Talus.app
+	mkdir -p build/settings-previews
+	build/Talus.app/Contents/MacOS/Talus --render-previews build/settings-previews
+
+status-cleanup-test: build/talus
+	Tests/Integration/command-cleanup.sh
+
+integration-test: build/talus
 	$(SWIFTC) Tests/Integration/Fixture.swift -o build/integration-fixture
 	$(SWIFTC) Tests/Integration/Probe.swift -o build/integration-probe
 	Tests/Integration/smoke.sh
-virtual-workspace-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/VirtualWorkspaces.swift Tests/VirtualWorkspaceTests.swift $(CORE_FLAGS) -o build/virtual-workspace-tests
-	build/virtual-workspace-tests
-test: toml-test config-test settings-ui-test virtual-workspace-test history-test stack-test screen-test
-multi-integration-test: all
-	$(SWIFTC) Tests/Integration/Fixture.swift -o build/integration-fixture
-	$(SWIFTC) Tests/Integration/MultiProbe.swift -o build/multi-probe
-	Tests/Integration/multi.sh
-latency-test: all
-	$(SWIFTC) Tests/Integration/EventFixture.swift -o build/event-fixture
-	$(SWIFTC) Tests/Integration/EventProbe.swift -o build/event-probe
-	Tests/Integration/latency.sh
-screen-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/ScreenGeometry.swift Tests/ScreenGeometryTests.swift $(CORE_FLAGS) -o build/screen-tests
-	build/screen-tests
-icon-test:
-	mkdir -p build
-	$(SWIFTC) Sources/StatusIcon.swift Tests/StatusIconTests.swift -framework Cocoa -o build/icon-tests
-	build/icon-tests
-test: icon-test
-status-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/Spaces.swift Sources/StatusText.swift Tests/StatusTextTests.swift $(CORE_FLAGS) -framework Cocoa -framework CoreGraphics -o build/status-tests
-	build/status-tests
-test: status-test
-status-export-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/Spaces.swift Sources/StatusExport.swift Tests/StatusExportTests.swift $(CORE_FLAGS) -framework Cocoa -framework CoreGraphics -o build/status-export-tests
-	build/status-export-tests
-test: status-export-test
-rich-status-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Tests/StatusRichTests.swift $(CORE_FLAGS) -framework Cocoa -framework CoreGraphics -o build/rich-status-tests
-	build/rich-status-tests
-test: rich-status-test
-status-command-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/StatusCommands.swift Tests/StatusCommandTests.swift $(CORE_FLAGS) -o build/status-command-tests
-	build/status-command-tests
-test: status-command-test
-haskell-status-test: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/StatusCommands.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusExport.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Tests/HaskellStatusIntegration.swift $(CORE_FLAGS) -framework Cocoa -framework CoreGraphics -o build/haskell-status-tests
-	build/haskell-status-tests "$$(command -v runghc)" "$$PWD/Examples/clock.hs"
-status-cleanup-test: all
-	Tests/Integration/command-cleanup.sh
-
-manager-responsiveness-test: $(CORE_LIB)
-	mkdir -p build
-	awk '/^final class HotkeyRegistry/ { exit } { print }' Sources/main.swift > build/ManagerUnderTest.swift
-	$(SWIFTC) -O -parse-as-library build/ManagerUnderTest.swift Sources/WindowGeometryIO.swift Sources/WindowServerFrames.swift Sources/WindowExecutor.swift Sources/MainLoopUpdate.swift Sources/WindowFocus.swift Sources/WindowDiscovery.swift Sources/Layout.swift Sources/VirtualWorkspaces.swift Sources/TOML.swift Sources/Configuration.swift Sources/ScreenGeometry.swift Sources/Spaces.swift Sources/StatusConfiguration.swift Tests/ManagerResponsivenessTests.swift $(CORE_FLAGS) -framework Cocoa -framework Carbon -framework ApplicationServices -o build/manager-responsiveness-tests
-	TALUS_TEST_PID=0 build/manager-responsiveness-tests
-test: manager-responsiveness-test
-
-virtual-integration-test: all
-	$(SWIFTC) Tests/Integration/Fixture.swift -o build/integration-fixture
-	$(SWIFTC) -O Tests/Integration/VirtualResponsivenessProbe.swift -framework Carbon -o build/virtual-responsiveness-probe
-	sh Tests/Integration/virtual-responsiveness.sh
-
-focus-integration-test:
-	mkdir -p build/focus-probe
-	$(SWIFTC) Tests/Integration/Fixture.swift -o build/integration-fixture
-	cp Tests/Integration/FocusProbe.swift build/focus-probe/main.swift
-	$(SWIFTC) -O Sources/WindowFocus.swift build/focus-probe/main.swift -framework Carbon -o build/focus-probe/probe
-	sh Tests/Integration/focus.sh
-
-window-executor-test:
-	mkdir -p build
-	$(SWIFTC) -O Sources/WindowExecutor.swift Sources/MainLoopUpdate.swift Tests/WindowExecutorTests.swift -framework ApplicationServices -o build/window-executor-tests
-	build/window-executor-tests
-test: window-executor-test
-
-layout-stress-build: all
-	mkdir -p build/layout-stress
-	$(SWIFTC) Tests/Integration/Fixture.swift -o build/integration-fixture
-	$(SWIFTC) Tests/Integration/ClickFixture.swift -o build/click-fixture
-	cp Tests/Integration/LayoutStressProbe.swift build/layout-stress/main.swift
-	$(SWIFTC) -O Sources/WindowFocus.swift build/layout-stress/main.swift -framework Carbon -o build/layout-stress/probe
-layout-stress-test: layout-stress-build
-	sh Tests/Integration/layout-stress.sh
-
-geometry-io-test:
-	mkdir -p build
-	$(SWIFTC) Sources/WindowGeometryIO.swift Tests/WindowGeometryIOTests.swift -framework ApplicationServices -o build/geometry-io-tests
-	build/geometry-io-tests
-test: geometry-io-test
-
-launch-at-login-test:
-	mkdir -p build
-	$(SWIFTC) Sources/LaunchAtLogin.swift Tests/LaunchAtLoginTests.swift -framework ServiceManagement -o build/launch-at-login-tests
-	build/launch-at-login-tests
-test: launch-at-login-test
-
-# Opt-in: briefly registers only an isolated, signed test app, then removes it.
-launch-at-login-integration-test:
-	mkdir -p build/LoginItemProbe.app/Contents/MacOS
-	$(SWIFTC) Sources/LaunchAtLogin.swift Tests/Integration/LaunchAtLoginProbe.swift -framework ServiceManagement -o build/LoginItemProbe.app/Contents/MacOS/Probe
-	cp Resources/Info.plist build/LoginItemProbe.app/Contents/Info.plist
-	/usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier local.talus.testing.login' build/LoginItemProbe.app/Contents/Info.plist
-	/usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Probe' build/LoginItemProbe.app/Contents/Info.plist
-	/usr/libexec/PlistBuddy -c 'Set :CFBundleName Talus Login Test' build/LoginItemProbe.app/Contents/Info.plist
-	codesign --force --sign - build/LoginItemProbe.app
-	build/LoginItemProbe.app/Contents/MacOS/Probe
-
-settings-preview: $(CORE_LIB)
-	mkdir -p build
-	$(SWIFTC) Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Sources/LaunchAtLogin.swift Sources/SettingsWindow.swift Scripts/RenderSettingsPreview.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework ServiceManagement -framework CoreGraphics -o build/render-settings-preview
-	build/render-settings-preview build/settings-previews
-
-deployment-test: build/talus
-	@actual="$$(xcrun vtool -show-build build/talus | awk '$$1 == "minos" { print $$2 }')"; \
-	test "$$actual" = "$(MACOS_DEPLOYMENT_TARGET)" || { echo "Expected macOS $(MACOS_DEPLOYMENT_TARGET), binary requires $$actual"; exit 1; }; \
-	echo "Binary minimum macOS version verified: $$actual"
-test: deployment-test
-
-status-click-integration-build: $(CORE_LIB)
-	mkdir -p build/StatusClickProbe.app/Contents/MacOS
-	$(SWIFTC) Sources/TOML.swift Sources/Configuration.swift Sources/StatusConfiguration.swift Sources/Spaces.swift Sources/StatusText.swift Sources/StatusRich.swift Sources/StatusMarkup.swift Tests/Integration/StatusClickProbe.swift $(CORE_FLAGS) -framework Cocoa -o build/StatusClickProbe.app/Contents/MacOS/Probe
-	cp Resources/Info.plist build/StatusClickProbe.app/Contents/Info.plist
-	/usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier local.talus.testing.status-click' build/StatusClickProbe.app/Contents/Info.plist
-	/usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Probe' build/StatusClickProbe.app/Contents/Info.plist
-	codesign --force --sign - build/StatusClickProbe.app
-status-click-integration-test: status-click-integration-build
-	sh Tests/Integration/status-click.sh
-test: status-click-integration-build

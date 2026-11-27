@@ -1,0 +1,559 @@
+/// Common numeric, UTF-8 string, list, and collection utilities for Talus.
+
+use std.option.{Option, Some, None}
+use std.list.{listLen, listRev, listFilter, listAny}
+use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
+use std.math.{abs, floor, ceil}
+
+pub def minInt(a: Int, b: Int): Int = if (a < b) a else b
+pub def maxInt(a: Int, b: Int): Int = if (a > b) a else b
+pub def clampInt(v: Int, lo: Int, hi: Int): Int = minInt(hi, maxInt(lo, v))
+
+pub def minFloat(a: Float, b: Float): Float = if (a < b) a else b
+pub def maxFloat(a: Float, b: Float): Float = if (a > b) a else b
+pub def clampFloat(v: Float, lo: Float, hi: Float): Float = minFloat(hi, maxFloat(lo, v))
+
+/// Half-away-from-zero rounding (matches Rust `f64::round` / Swift `Double.rounded()`).
+pub def roundFloat(x: Float): Float =
+    if (x >= 0.0) floor(x + 0.5)
+    else ceil(x - 0.5)
+
+pub def roundToInt(x: Float): Int = floatToInt(roundFloat(x))
+
+pub def isFiniteFloat(x: Float): Bool = {
+    let bits = floatToBits64(x);
+    let expMask = intToI64(0x7FF) << 52;
+    (bits & expMask) != expMask
+}
+
+pub def i64ToFloat(n: Int64): Float = {
+    // Exact for 53-bit integers; split high/low 31-bit chunks for full range
+    let neg = n < intToI64(0);
+    let v = if (neg) -n else n;
+    let hi = i64ToInt(v >>> 30);
+    let lo = i64ToInt(v & intToI64(0x3FFF_FFFF));
+    let res = intToFloat(hi) * 1073741824.0 + intToFloat(lo);
+    if (neg) -res else res
+}
+
+pub def floatToI64(x: Float): Int64 = {
+    let neg = x < 0.0;
+    let ax = if (neg) -x else x;
+    let hi = floatToInt(floor(ax / 1073741824.0));
+    let lo = floatToInt(ax - intToFloat(hi) * 1073741824.0);
+    let res = (intToI64(hi) << 30) + intToI64(lo);
+    if (neg) -res else res
+}
+
+/// ASCII lowercase conversion (preserves non-ASCII UTF-8 bytes unchanged).
+pub def strToLowerAscii(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        if (c >= 65 && c <= 90) bufPushByte(b, c + 32)
+        else bufPushByte(b, c);
+        cellSet(i, idx + 1)
+    };
+    bufToString(b)
+}
+
+pub def strContains(haystack: String, needle: String): Bool = {
+    let hl = strLen(haystack);
+    let nl = strLen(needle);
+    if (nl == 0) true
+    else if (nl > hl) false
+    else {
+        let limit = hl - nl;
+        let i = cellNew(0);
+        let found = cellNew(false);
+        while (cellGet(i) <= limit && !cellGet(found)) {
+            let start = cellGet(i);
+            let j = cellNew(0);
+            let matched = cellNew(true);
+            while (cellGet(j) < nl && cellGet(matched)) {
+                let k = cellGet(j);
+                if (strByteAt(haystack, start + k) != strByteAt(needle, k)) cellSet(matched, false) else ();
+                cellSet(j, k + 1)
+            };
+            if (cellGet(matched)) cellSet(found, true) else ();
+            cellSet(i, start + 1)
+        };
+        cellGet(found)
+    }
+}
+
+pub def strContainsAsciiCI(haystack: String, needle: String): Bool =
+    strContains(strToLowerAscii(haystack), strToLowerAscii(needle))
+
+pub def strFindSubstr(haystack: String, needle: String, fromIdx: Int): Option Int = {
+    let hl = strLen(haystack);
+    let nl = strLen(needle);
+    if (nl == 0) Some(if (fromIdx < 0) 0 else minInt(fromIdx, hl))
+    else if (fromIdx < 0 || fromIdx + nl > hl) None
+    else {
+        let limit = hl - nl;
+        let i = cellNew(fromIdx);
+        let res: Cell (Option Int) = cellNew(None);
+        while (cellGet(i) <= limit && (match cellGet(res) { None -> true, Some(_) -> false })) {
+            let start = cellGet(i);
+            let j = cellNew(0);
+            let ok = cellNew(true);
+            while (cellGet(j) < nl && cellGet(ok)) {
+                let k = cellGet(j);
+                if (strByteAt(haystack, start + k) != strByteAt(needle, k)) cellSet(ok, false) else ();
+                cellSet(j, k + 1)
+            };
+            if (cellGet(ok)) cellSet(res, Some(start)) else ();
+            cellSet(i, start + 1)
+        };
+        cellGet(res)
+    }
+}
+
+pub def strReplaceAll(src: String, fromStr: String, toStr: String): String = {
+    let fl = strLen(fromStr);
+    if (fl == 0) src
+    else {
+        let n = strLen(src);
+        let b = bufNew();
+        let pos = cellNew(0);
+        let running = cellNew(true);
+        while (cellGet(running)) {
+            let cur = cellGet(pos);
+            match strFindSubstr(src, fromStr, cur) {
+                Some(idx) -> {
+                    if (idx > cur) bufPushStr(b, ptrSliceFromStr(src, cur, idx - cur)) else ();
+                    bufPushStr(b, toStr);
+                    cellSet(pos, idx + fl)
+                },
+                None -> {
+                    if (cur < n) bufPushStr(b, ptrSliceFromStr(src, cur, n - cur)) else ();
+                    cellSet(running, false)
+                },
+            }
+        };
+        bufToString(b)
+    }
+}
+
+/// Number of UTF-8 codepoints (Unicode scalar values) in `s`.
+pub def utf8CharCount(s: String): Int = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    let count = cellNew(0);
+    while (cellGet(i) < n) {
+        let b = strByteAt(s, cellGet(i));
+        // Continuation bytes have top two bits 10xxxxxx (0x80..0xBF)
+        if ((b & 0xC0) != 0x80) cellSet(count, cellGet(count) + 1) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(count)
+}
+
+/// Take at most `maxChars` UTF-8 codepoints from `s` without splitting multi-byte sequences.
+pub def utf8TakeChars(s: String, maxChars: Int): String =
+    if (maxChars <= 0) ""
+    else {
+        let n = strLen(s);
+        let i = cellNew(0);
+        let count = cellNew(0);
+        let cut = cellNew(n);
+        let done = cellNew(false);
+        while (cellGet(i) < n && !cellGet(done)) {
+            let idx = cellGet(i);
+            let b = strByteAt(s, idx);
+            if ((b & 0xC0) != 0x80) {
+                if (cellGet(count) >= maxChars) {
+                    cellSet(cut, idx);
+                    cellSet(done, true)
+                } else {
+                    cellSet(count, cellGet(count) + 1);
+                    cellSet(i, idx + 1)
+                }
+            } else {
+                cellSet(i, idx + 1)
+            }
+        };
+        let endIdx = cellGet(cut);
+        if (endIdx >= n) s else ptrSliceFromStr(s, 0, endIdx)
+    }
+
+/// Decode UTF-8 string into a list of Unicode codepoints (`Int`).
+pub def utf8Codepoints(s: String): List Int = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    let acc: Cell (List Int) = cellNew(Nil);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let b0 = strByteAt(s, idx);
+        if (b0 < 0x80) {
+            cellSet(acc, Cons(b0, cellGet(acc)));
+            cellSet(i, idx + 1)
+        } else if ((b0 & 0xE0) == 0xC0 && idx + 1 < n) {
+            let b1 = strByteAt(s, idx + 1);
+            let cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
+            cellSet(acc, Cons(cp, cellGet(acc)));
+            cellSet(i, idx + 2)
+        } else if ((b0 & 0xF0) == 0xE0 && idx + 2 < n) {
+            let b1 = strByteAt(s, idx + 1);
+            let b2 = strByteAt(s, idx + 2);
+            let cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+            cellSet(acc, Cons(cp, cellGet(acc)));
+            cellSet(i, idx + 3)
+        } else if ((b0 & 0xF8) == 0xF0 && idx + 3 < n) {
+            let b1 = strByteAt(s, idx + 1);
+            let b2 = strByteAt(s, idx + 2);
+            let b3 = strByteAt(s, idx + 3);
+            let cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
+            cellSet(acc, Cons(cp, cellGet(acc)));
+            cellSet(i, idx + 4)
+        } else {
+            cellSet(acc, Cons(b0, cellGet(acc)));
+            cellSet(i, idx + 1)
+        }
+    };
+    listRev(cellGet(acc))
+}
+
+pub def strTrimEndSlash(s: String): String = {
+    let end = cellNew(strLen(s));
+    while (cellGet(end) > 0 && strByteAt(s, cellGet(end) - 1) == 47) {
+        cellSet(end, cellGet(end) - 1)
+    };
+    let e = cellGet(end);
+    if (e == strLen(s)) s else ptrSliceFromStr(s, 0, e)
+}
+
+pub def strTrimCrLf(s: String): String = {
+    let n = strLen(s);
+    let start = cellNew(0);
+    while (cellGet(start) < n && {
+        let b = strByteAt(s, cellGet(start));
+        b == 10 || b == 13
+    }) {
+        cellSet(start, cellGet(start) + 1)
+    };
+    let end = cellNew(n);
+    while (cellGet(end) > cellGet(start) && {
+        let b = strByteAt(s, cellGet(end) - 1);
+        b == 10 || b == 13
+    }) {
+        cellSet(end, cellGet(end) - 1)
+    };
+    ptrSliceFromStr(s, cellGet(start), cellGet(end) - cellGet(start))
+}
+
+pub def strTrimSpacesOnly(s: String): String = {
+    let n = strLen(s);
+    let start = cellNew(0);
+    while (cellGet(start) < n && {
+        let b = strByteAt(s, cellGet(start));
+        b == 32 || b == 9
+    }) {
+        cellSet(start, cellGet(start) + 1)
+    };
+    let end = cellNew(n);
+    while (cellGet(end) > cellGet(start) && {
+        let b = strByteAt(s, cellGet(end) - 1);
+        b == 32 || b == 9
+    }) {
+        cellSet(end, cellGet(end) - 1)
+    };
+    ptrSliceFromStr(s, cellGet(start), cellGet(end) - cellGet(start))
+}
+
+pub def isAsciiAlpha(b: Int): Bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+pub def isAsciiDigit(b: Int): Bool = b >= 48 && b <= 57
+pub def isAsciiAlnum(b: Int): Bool = isAsciiAlpha(b) || isAsciiDigit(b)
+pub def isAsciiHex(b: Int): Bool = isAsciiDigit(b) || (b >= 65 && b <= 70) || (b >= 97 && b <= 102)
+
+def listSplitAt(xs: List a, n: Int): (List a, List a) = {
+    let cur = cellNew(xs);
+    let leftRev: Cell (List a) = cellNew(Nil);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        match cellGet(cur) {
+            Nil -> cellSet(i, n),
+            Cons(h, t) -> {
+                cellSet(leftRev, Cons(h, cellGet(leftRev)));
+                cellSet(cur, t);
+                cellSet(i, cellGet(i) + 1)
+            },
+        }
+    };
+    (listRev(cellGet(leftRev)), cellGet(cur))
+}
+
+def listMergeBy(a: List a, b: List a, le: (a, a) -> Bool): List a = {
+    let ca = cellNew(a);
+    let cb = cellNew(b);
+    let outRev: Cell (List a) = cellNew(Nil);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match (cellGet(ca), cellGet(cb)) {
+            (Nil, Nil) -> cellSet(running, false),
+            (Cons(ha, ta), Nil) -> {
+                cellSet(outRev, Cons(ha, cellGet(outRev)));
+                cellSet(ca, ta)
+            },
+            (Nil, Cons(hb, tb)) -> {
+                cellSet(outRev, Cons(hb, cellGet(outRev)));
+                cellSet(cb, tb)
+            },
+            (Cons(ha, ta), Cons(hb, tb)) ->
+                if (le(ha, hb)) {
+                    cellSet(outRev, Cons(ha, cellGet(outRev)));
+                    cellSet(ca, ta)
+                } else {
+                    cellSet(outRev, Cons(hb, cellGet(outRev)));
+                    cellSet(cb, tb)
+                },
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+/// Generic merge sort for lists using a `<=` comparator `le(a, b)`.
+pub def listSortBy(xs: List a, le: (a, a) -> Bool): List a = {
+    let n = listLen(xs);
+    if (n <= 1) xs
+    else {
+        let half = n / 2;
+        let (left, right) = listSplitAt(xs, half);
+        listMergeBy(listSortBy(left, le), listSortBy(right, le), le)
+    }
+}
+
+pub def optEqBy(a: Option a, b: Option a, eqFn: (a, a) -> Bool): Bool = match (a, b) {
+    (None, None) -> true,
+    (Some(x), Some(y)) -> eqFn(x, y),
+    _ -> false,
+}
+
+pub def listContainsBy(xs: List a, target: a, eqFn: (a, a) -> Bool): Bool =
+    listAny(xs, (x) -> eqFn(x, target))
+
+pub def listIndexOfBy(xs: List a, pred: a -> Bool): Option Int = {
+    let cur = cellNew(xs);
+    let idx = cellNew(0);
+    let res: Cell (Option Int) = cellNew(None);
+    while (match cellGet(res) { None -> true, Some(_) -> false }) {
+        match cellGet(cur) {
+            Nil -> cellSet(res, Some(-1)),
+            Cons(h, t) ->
+                if (pred(h)) cellSet(res, Some(cellGet(idx)))
+                else {
+                    cellSet(cur, t);
+                    cellSet(idx, cellGet(idx) + 1)
+                },
+        }
+    };
+    match cellGet(res) {
+        Some(k) if (k >= 0) -> Some(k),
+        _ -> None,
+    }
+}
+
+pub def listFindBy(xs: List a, pred: a -> Bool): Option a = {
+    let cur = cellNew(xs);
+    let res: Cell (Option a) = cellNew(None);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match cellGet(cur) {
+            Nil -> cellSet(running, false),
+            Cons(h, t) ->
+                if (pred(h)) {
+                    cellSet(res, Some(h));
+                    cellSet(running, false)
+                } else {
+                    cellSet(cur, t)
+                },
+        }
+    };
+    cellGet(res)
+}
+
+pub def listUniqueBy(xs: List a, eqFn: (a, a) -> Bool): List a = {
+    let cur = cellNew(xs);
+    let acc: Cell (List a) = cellNew(Nil);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(h, t) -> {
+                if (!listContainsBy(cellGet(acc), h, eqFn)) {
+                    cellSet(acc, Cons(h, cellGet(acc)))
+                } else ();
+                cellSet(cur, t)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(acc))
+}
+
+pub def listInsertAt(xs: List a, idx: Int, elem: a): List a = {
+    let cur = cellNew(xs);
+    let outRev: Cell (List a) = cellNew(Nil);
+    let i = cellNew(0);
+    let inserted = cellNew(false);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        if (!cellGet(inserted) && cellGet(i) == idx) {
+            cellSet(outRev, Cons(elem, cellGet(outRev)));
+            cellSet(inserted, true)
+        } else ();
+        match cellGet(cur) {
+            Cons(h, t) -> {
+                cellSet(outRev, Cons(h, cellGet(outRev)));
+                cellSet(cur, t);
+                cellSet(i, cellGet(i) + 1)
+            },
+            Nil -> (),
+        }
+    };
+    if (!cellGet(inserted)) cellSet(outRev, Cons(elem, cellGet(outRev))) else ();
+    listRev(cellGet(outRev))
+}
+
+pub def listRemoveAt(xs: List a, idx: Int): List a = {
+    let cur = cellNew(xs);
+    let outRev: Cell (List a) = cellNew(Nil);
+    let i = cellNew(0);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(h, t) -> {
+                if (cellGet(i) != idx) cellSet(outRev, Cons(h, cellGet(outRev))) else ();
+                cellSet(cur, t);
+                cellSet(i, cellGet(i) + 1)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+pub def listReplaceAt(xs: List a, idx: Int, elem: a): List a = {
+    let cur = cellNew(xs);
+    let outRev: Cell (List a) = cellNew(Nil);
+    let i = cellNew(0);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(h, t) -> {
+                if (cellGet(i) == idx) cellSet(outRev, Cons(elem, cellGet(outRev)))
+                else cellSet(outRev, Cons(h, cellGet(outRev)));
+                cellSet(cur, t);
+                cellSet(i, cellGet(i) + 1)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+pub def listNthOpt(xs: List a, idx: Int): Option a =
+    if (idx < 0) None
+    else {
+        let cur = cellNew(xs);
+        let i = cellNew(0);
+        let res: Cell (Option a) = cellNew(None);
+        let running = cellNew(true);
+        while (cellGet(running)) {
+            match cellGet(cur) {
+                Nil -> cellSet(running, false),
+                Cons(h, t) ->
+                    if (cellGet(i) == idx) {
+                        cellSet(res, Some(h));
+                        cellSet(running, false)
+                    } else {
+                        cellSet(cur, t);
+                        cellSet(i, cellGet(i) + 1)
+                    },
+            }
+        };
+        cellGet(res)
+    }
+
+pub def listSwapIndices(xs: List a, i: Int, j: Int): List a =
+    if (i == j) xs
+    else {
+        let len = listLen(xs);
+        if (i < 0 || j < 0 || i >= len || j >= len) xs
+        else {
+            match listNthOpt(xs, i) {
+                Some(vi) -> match listNthOpt(xs, j) {
+                    Some(vj) -> listReplaceAt(listReplaceAt(xs, i, vj), j, vi),
+                    None -> xs,
+                },
+                None -> xs,
+            }
+        }
+    }
+
+pub def listTake(xs: List a, n: Int): List a = {
+    let cur = cellNew(xs);
+    let outRev: Cell (List a) = cellNew(Nil);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        match cellGet(cur) {
+            Nil -> cellSet(i, n),
+            Cons(h, t) -> {
+                cellSet(outRev, Cons(h, cellGet(outRev)));
+                cellSet(cur, t);
+                cellSet(i, cellGet(i) + 1)
+            },
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+pub def listEqualsBy(a: List a, b: List a, eqFn: (a, a) -> Bool): Bool = {
+    let ca = cellNew(a);
+    let cb = cellNew(b);
+    let eq = cellNew(true);
+    let running = cellNew(true);
+    while (cellGet(running)) {
+        match (cellGet(ca), cellGet(cb)) {
+            (Nil, Nil) -> cellSet(running, false),
+            (Cons(ha, ta), Cons(hb, tb)) ->
+                if (eqFn(ha, hb)) {
+                    cellSet(ca, ta);
+                    cellSet(cb, tb)
+                } else {
+                    cellSet(eq, false);
+                    cellSet(running, false)
+                },
+            _ -> {
+                cellSet(eq, false);
+                cellSet(running, false)
+            },
+        }
+    };
+    cellGet(eq)
+}
+
+pub def strLessEq(a: String, b: String): Bool = {
+    let na = strLen(a);
+    let nb = strLen(b);
+    let lim = minInt(na, nb);
+    let i = cellNew(0);
+    let decided = cellNew(false);
+    let res = cellNew(true);
+    while (cellGet(i) < lim && !cellGet(decided)) {
+        let idx = cellGet(i);
+        let ba = strByteAt(a, idx);
+        let bb = strByteAt(b, idx);
+        if (ba != bb) {
+            cellSet(res, ba < bb);
+            cellSet(decided, true)
+        } else {
+            cellSet(i, idx + 1)
+        }
+    };
+    if (cellGet(decided)) cellGet(res) else na <= nb
+}
+
+pub def floatNear(a: Float, b: Float, eps: Float): Bool = abs(a - b) <= eps
+pub def eqInt(a: Int, b: Int): Bool = a == b
+pub def eqI64(a: Int64, b: Int64): Bool = a == b
+pub def eqStr(a: String, b: String): Bool = a == b

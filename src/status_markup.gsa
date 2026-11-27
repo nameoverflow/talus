@@ -1,0 +1,833 @@
+/// Status bar template expansion, `<fc>/<fn>/<box>/<sf>` markup parsing,
+/// custom status file reading, JSON export, and workspace click hit-testing.
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listLen, listRev, listAppend, listMap}
+use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
+use std.str.{
+    intToStr, parseInt, parseFloat, strStartsWith, strTrim, strJoin
+}
+use std.codec.{Value, VNull, VBool, VInt, VStr, VArr, VObj}
+use std.json.{stringify as jsonStringify}
+use sys.fs.{readFile, writeFileAtomicMode}
+use config.{Configuration, StatusCommand, expandTilde}
+use layout.{Rect, rectContainsPoint, rectMinX, rectMaxX}
+use util.{
+    strToLowerAscii, strReplaceAll, utf8TakeChars, utf8Codepoints,
+    isAsciiAlnum, isAsciiHex, listNthOpt, listIndexOfBy, minInt,
+    optEqBy, listEqualsBy
+}
+
+pub data SpaceEntry {
+    id: Int64,
+    isCurrent: Bool,
+    isFullscreen: Bool,
+    windowCount: Option Int,
+}
+
+pub instance Eq SpaceEntry {
+    def eq(a: SpaceEntry, b: SpaceEntry): Bool =
+        a.id == b.id && a.isCurrent == b.isCurrent && a.isFullscreen == b.isFullscreen
+        && optEqBy(a.windowCount, b.windowCount, (x, y) -> x == y)
+}
+
+pub data StatusValues {
+    spaces: Option (List SpaceEntry),
+    layout: String,
+    title: String,
+    count: Int,
+    custom: String,
+    paused: Bool,
+    spaceLabels: List String,
+    spaceIcons: List String,
+}
+
+pub data StatusBoxType {
+    BoxFull,
+    BoxBottom,
+    BoxTop,
+    BoxHBoth,
+    BoxVBoth,
+}
+
+pub instance Eq StatusBoxType {
+    def eq(a: StatusBoxType, b: StatusBoxType): Bool = match (a, b) {
+        (BoxFull, BoxFull) -> true,
+        (BoxBottom, BoxBottom) -> true,
+        (BoxTop, BoxTop) -> true,
+        (BoxHBoth, BoxHBoth) -> true,
+        (BoxVBoth, BoxVBoth) -> true,
+        _ -> false,
+    }
+}
+
+pub data StatusBoxStyle {
+    boxType: StatusBoxType,
+    width: Float,
+    color: Option String,
+    radius: Option Float,
+}
+
+pub instance Eq StatusBoxStyle {
+    def eq(a: StatusBoxStyle, b: StatusBoxStyle): Bool =
+        a.boxType == b.boxType
+        && a.width == b.width
+        && optEqBy(a.color, b.color, (x, y) -> x == y)
+        && optEqBy(a.radius, b.radius, (x, y) -> x == y)
+}
+
+pub def defaultBoxStyle(): StatusBoxStyle = StatusBoxStyle {
+    boxType: BoxFull,
+    width: 2.0,
+    color: None,
+    radius: None,
+}
+
+pub data StatusSegmentStyle {
+    foreground: Option String,
+    background: Option String,
+    font: Option String,
+    fontSize: Option Float,
+    dimmed: Bool,
+    boxStyle: Option StatusBoxStyle,
+}
+
+pub instance Eq StatusSegmentStyle {
+    def eq(a: StatusSegmentStyle, b: StatusSegmentStyle): Bool =
+        optEqBy(a.foreground, b.foreground, (x, y) -> x == y)
+        && optEqBy(a.background, b.background, (x, y) -> x == y)
+        && optEqBy(a.font, b.font, (x, y) -> x == y)
+        && optEqBy(a.fontSize, b.fontSize, (x, y) -> x == y)
+        && a.dimmed == b.dimmed
+        && optEqBy(a.boxStyle, b.boxStyle, (x, y) -> x == y)
+}
+
+pub def defaultSegmentStyle(): StatusSegmentStyle = StatusSegmentStyle {
+    foreground: None,
+    background: None,
+    font: None,
+    fontSize: None,
+    dimmed: false,
+    boxStyle: None,
+}
+
+pub data StatusPart {
+    text: String,
+    style: Option StatusSegmentStyle,
+    isCurrent: Bool,
+    workspaceIndex: Option Int,
+    symbolName: Option String,
+}
+
+pub instance Eq StatusPart {
+    def eq(a: StatusPart, b: StatusPart): Bool =
+        a.text == b.text
+        && optEqBy(a.style, b.style, (x, y) -> x == y)
+        && a.isCurrent == b.isCurrent
+        && optEqBy(a.workspaceIndex, b.workspaceIndex, (x, y) -> x == y)
+        && optEqBy(a.symbolName, b.symbolName, (x, y) -> x == y)
+}
+
+pub data StatusExport {
+    spaces: Option (List SpaceEntry),
+    layout: String,
+    title: String,
+    count: Int,
+    paused: Bool,
+}
+
+pub data StatusWorkspaceHitRegion {
+    index: Int,
+    rect: Rect,
+}
+
+pub instance Eq StatusWorkspaceHitRegion {
+    def eq(a: StatusWorkspaceHitRegion, b: StatusWorkspaceHitRegion): Bool =
+        a.index == b.index && a.rect == b.rect
+}
+
+/// Pure hit test: converts a button-local point into a workspace index (if any).
+pub def statusWorkspaceIndex(
+    px: Float,
+    py: Float,
+    buttonBounds: Rect,
+    imageRect: Rect,
+    regions: List StatusWorkspaceHitRegion
+): Option Int =
+    if (!rectContainsPoint(buttonBounds, px, py)) None
+    else {
+        let imageX = px - rectMinX(imageRect);
+        let cur = cellNew(regions);
+        let res: Cell (Option Int) = cellNew(None);
+        let running = cellNew(true);
+        while (cellGet(running)) {
+            match cellGet(cur) {
+                Nil -> cellSet(running, false),
+                Cons(r, rest) ->
+                    if (imageX >= rectMinX(r.rect) - 1.0 && imageX <= rectMaxX(r.rect) + 1.0) {
+                        cellSet(res, Some(r.index));
+                        cellSet(running, false)
+                    } else cellSet(cur, rest),
+            }
+        };
+        cellGet(res)
+    }
+
+/// Serialize `StatusExport` with alphabetically sorted JSON keys (matching Swift `.sortedKeys`).
+pub def statusExportToJson(exp: StatusExport): String = {
+    let spacesVal = match exp.spaces {
+        None -> VNull,
+        Some(entries) -> VArr(listMap(entries, (e: SpaceEntry) -> {
+            let base: List (String, Value) = [
+                ("id", VInt(e.id)),
+                ("isCurrent", VBool(e.isCurrent)),
+                ("isFullscreen", VBool(e.isFullscreen)),
+            ];
+            let fs = match e.windowCount {
+                Some(wc) -> listAppend(base, [("windowCount", VInt(intToI64(wc)))]),
+                None -> base,
+            };
+            VObj(fs)
+        })),
+    };
+    jsonStringify(VObj([
+        ("count", VInt(intToI64(exp.count))),
+        ("layout", VStr(exp.layout)),
+        ("paused", VBool(exp.paused)),
+        ("spaces", spacesVal),
+        ("title", VStr(exp.title)),
+    ]))
+}
+
+pub def writeStatusAtomic0600(content: String, path: String): Result Void String =
+    writeFileAtomicMode(path, content, 0o600)
+
+pub def readCustomStatus(path: String): String = {
+    let expanded = expandTilde(path, None);
+    match readFile(expanded) {
+        Ok(raw) ->
+            if (strLen(raw) > 1_048_576) ""
+            else if (strLen(raw) > 4096) ptrSliceFromStr(raw, 0, 4096)
+            else raw,
+        Err(_) -> "",
+    }
+}
+
+def cleanWhitespace(text: String, limitChars: Int): String = {
+    let n = strLen(text);
+    let b = bufNew();
+    let inWs = cellNew(false);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(text, cellGet(i));
+        if (c == 13 || c == 10 || c == 9) {
+            if (!cellGet(inWs)) {
+                bufPushByte(b, 32);
+                cellSet(inWs, true)
+            } else ()
+        } else {
+            cellSet(inWs, false);
+            bufPushByte(b, c)
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    utf8TakeChars(bufToString(b), limitChars)
+}
+
+pub def renderStatus(format: String, values: StatusValues): String = {
+    let spaces = match values.spaces {
+        None -> "?",
+        Some(entries) -> {
+            let partsRev: Cell (List String) = cellNew(Nil);
+            let cur = cellNew(entries);
+            let idx = cellNew(0);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(item, r) -> {
+                        let i = cellGet(idx);
+                        let label = match listNthOpt(values.spaceLabels, i) {
+                            Some(l) -> l,
+                            None -> intToStr(i + 1),
+                        };
+                        let number = label + (if (item.isFullscreen) "•" else "");
+                        let formatted = if (item.isCurrent) "[" + number + "]" else number;
+                        cellSet(partsRev, Cons(formatted, cellGet(partsRev)));
+                        cellSet(idx, i + 1);
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            strJoin(listRev(cellGet(partsRev)), " ")
+        },
+    };
+    let layoutStr = if (values.paused) "Paused" else values.layout;
+    let titleClean = cleanWhitespace(values.title, 24);
+    let countStr = intToStr(values.count);
+    let customClean = cleanWhitespace(values.custom, 48);
+
+    let b = bufNew();
+    let n = strLen(format);
+    let pos = cellNew(0);
+    while (cellGet(pos) < n) {
+        let p = cellGet(pos);
+        if (strByteAt(format, p) == 123) {
+            let tail = ptrSliceFromStr(format, p, n - p);
+            if (strStartsWith(tail, "{spaces}")) { bufPushStr(b, spaces); cellSet(pos, p + 8) }
+            else if (strStartsWith(tail, "{layout}")) { bufPushStr(b, layoutStr); cellSet(pos, p + 8) }
+            else if (strStartsWith(tail, "{title}")) { bufPushStr(b, titleClean); cellSet(pos, p + 7) }
+            else if (strStartsWith(tail, "{count}")) { bufPushStr(b, countStr); cellSet(pos, p + 7) }
+            else if (strStartsWith(tail, "{custom}")) { bufPushStr(b, customClean); cellSet(pos, p + 8) }
+            else { bufPushByte(b, 123); cellSet(pos, p + 1) }
+        } else {
+            bufPushByte(b, strByteAt(format, p));
+            cellSet(pos, p + 1)
+        }
+    };
+    cleanWhitespace(bufToString(b), 160)
+}
+
+def markupColor(value: String): Option String = {
+    let low = strToLowerAscii(value);
+    if (low == "black") Some("#000000")
+    else if (low == "white") Some("#FFFFFF")
+    else if (low == "red") Some("#FF5555")
+    else if (low == "green") Some("#50FA7B")
+    else if (low == "blue") Some("#6272A4")
+    else if (low == "yellow") Some("#F1FA8C")
+    else if (low == "cyan") Some("#8BE9FD")
+    else if (low == "magenta") Some("#FF79C6")
+    else if (strStartsWith(value, "#")) {
+        let hexLen = strLen(value) - 1;
+        if (hexLen == 6 || hexLen == 8) {
+            let i = cellNew(1);
+            let ok = cellNew(true);
+            while (cellGet(i) < strLen(value) && cellGet(ok)) {
+                if (!isAsciiHex(strByteAt(value, cellGet(i)))) cellSet(ok, false) else ();
+                cellSet(i, cellGet(i) + 1)
+            };
+            if (cellGet(ok)) Some(value) else None
+        } else None
+    } else None
+}
+
+pub def isValidSfSymbol(sym: String): Bool = {
+    let n = strLen(sym);
+    if (n == 0 || n > 64) false
+    else if (!isAsciiAlnum(strByteAt(sym, 0))) false
+    else {
+        let i = cellNew(1);
+        let ok = cellNew(true);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let b = strByteAt(sym, cellGet(i));
+            if (!(isAsciiAlnum(b) || b == 46 || b == 95 || b == 45)) cellSet(ok, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
+    }
+}
+
+def splitWhitespaceTokens(s: String): List String = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    let outRev: Cell (List String) = cellNew(Nil);
+    while (cellGet(i) < n) {
+        while (cellGet(i) < n && {
+            let b = strByteAt(s, cellGet(i));
+            b == 32 || b == 9 || b == 10 || b == 13
+        }) {
+            cellSet(i, cellGet(i) + 1)
+        };
+        let start = cellGet(i);
+        while (cellGet(i) < n && {
+            let b = strByteAt(s, cellGet(i));
+            b != 32 && b != 9 && b != 10 && b != 13
+        }) {
+            cellSet(i, cellGet(i) + 1)
+        };
+        let end = cellGet(i);
+        if (end > start) cellSet(outRev, Cons(ptrSliceFromStr(s, start, end - start), cellGet(outRev))) else ()
+    };
+    listRev(cellGet(outRev))
+}
+
+def splitOnceByte(s: String, sepByte: Int): Option (String, String) = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    let idx = cellNew(-1);
+    while (cellGet(i) < n && cellGet(idx) < 0) {
+        if (strByteAt(s, cellGet(i)) == sepByte) cellSet(idx, cellGet(i)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    let pos = cellGet(idx);
+    if (pos < 0) None
+    else Some((ptrSliceFromStr(s, 0, pos), ptrSliceFromStr(s, pos + 1, n - pos - 1)))
+}
+
+def parseBoxTag(tag: String): Option StatusBoxStyle =
+    if (strLen(tag) < 3) None
+    else {
+        let body = strTrim(ptrSliceFromStr(tag, 3, strLen(tag) - 3));
+        if (strLen(body) == 0) Some(defaultBoxStyle())
+        else {
+            let bt = cellNew(BoxFull);
+            let bw = cellNew(2.0);
+            let bc: Cell (Option String) = cellNew(None);
+            let br: Cell (Option Float) = cellNew(None);
+            let ok = cellNew(true);
+            let cur = cellNew(splitWhitespaceTokens(body));
+            while (match cellGet(cur) { Nil -> false, _ -> cellGet(ok) }) {
+                match cellGet(cur) {
+                    Cons(tok, r) -> {
+                        match splitOnceByte(tok, 61) {
+                            None -> cellSet(ok, false),
+                            Some((k, v)) -> {
+                                let kl = strToLowerAscii(k);
+                                if (kl == "type") {
+                                    let vl = strToLowerAscii(v);
+                                    if (vl == "full") cellSet(bt, BoxFull)
+                                    else if (vl == "bottom") cellSet(bt, BoxBottom)
+                                    else if (vl == "top") cellSet(bt, BoxTop)
+                                    else if (vl == "hboth") cellSet(bt, BoxHBoth)
+                                    else if (vl == "vboth") cellSet(bt, BoxVBoth)
+                                    else cellSet(ok, false)
+                                } else if (kl == "width") {
+                                    match parseFloat(v) {
+                                        Ok(w) if (w >= 1.0 && w <= 4.0) -> cellSet(bw, w),
+                                        _ -> cellSet(ok, false),
+                                    }
+                                } else if (kl == "color") {
+                                    match markupColor(v) {
+                                        Some(c) -> cellSet(bc, Some(c)),
+                                        None -> cellSet(ok, false),
+                                    }
+                                } else if (kl == "radius") {
+                                    match parseFloat(v) {
+                                        Ok(rad) if (rad >= 0.0 && rad <= 9.0) -> cellSet(br, Some(rad)),
+                                        _ -> cellSet(ok, false),
+                                    }
+                                } else cellSet(ok, false)
+                            },
+                        };
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            if (cellGet(ok)) Some(StatusBoxStyle {
+                boxType: cellGet(bt),
+                width: cellGet(bw),
+                color: cellGet(bc),
+                radius: cellGet(br),
+            }) else None
+        }
+    }
+
+def findByteWithin(s: String, target: Int, start: Int, maxOffset: Int): Option Int = {
+    let lim = minInt(strLen(s), start + maxOffset + 1);
+    let i = cellNew(start);
+    let found = cellNew(-1);
+    while (cellGet(i) < lim && cellGet(found) < 0) {
+        if (strByteAt(s, cellGet(i)) == target) cellSet(found, cellGet(i)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    let res = cellGet(found);
+    if (res < 0) None else Some(res)
+}
+
+pub def parseStatusMarkup(
+    source: String,
+    fonts: List String,
+    fontSize: Float,
+    initial: Option StatusSegmentStyle,
+    current: Bool,
+    workspaceIndex: Option Int,
+    resolve: (String, StatusSegmentStyle) -> Option (List StatusPart)
+): List StatusPart = {
+    let clampedSrc = utf8TakeChars(source, 4096);
+    let n = strLen(clampedSrc);
+    let resRev: Cell (List StatusPart) = cellNew(Nil);
+    let resCount = cellNew(0);
+    let buf = cellNew(bufNew());
+    let initStyle0 = match initial { Some(st) -> st, None -> defaultSegmentStyle() };
+    let initStyle = match initStyle0.fontSize {
+        Some(_) -> initStyle0,
+        None -> StatusSegmentStyle {
+            foreground: initStyle0.foreground,
+            background: initStyle0.background,
+            font: initStyle0.font,
+            fontSize: Some(fontSize),
+            dimmed: initStyle0.dimmed,
+            boxStyle: initStyle0.boxStyle,
+        },
+    };
+    let styleCell = cellNew(initStyle);
+    let stack: Cell (List (String, StatusSegmentStyle)) = cellNew(Nil);
+    let i = cellNew(0);
+
+    let flush = () -> {
+        let s = bufToString(cellGet(buf));
+        cellSet(buf, bufNew());
+        if (strLen(s) > 0 && cellGet(resCount) < 512) {
+            let clean = cleanWhitespace(s, 512);
+            if (strLen(clean) > 0) {
+                cellSet(resRev, Cons(StatusPart {
+                    text: clean,
+                    style: Some(cellGet(styleCell)),
+                    isCurrent: current,
+                    workspaceIndex: workspaceIndex,
+                    symbolName: None,
+                }, cellGet(resRev)));
+                cellSet(resCount, cellGet(resCount) + 1)
+            } else ()
+        } else ()
+    };
+
+    while (cellGet(i) < n) {
+        let pos = cellGet(i);
+        let b = strByteAt(clampedSrc, pos);
+        let handled = cellNew(false);
+
+        // 1. Closing tags </fc>, </fn>, </box>
+        if (b == 60 && pos + 4 < n && strByteAt(clampedSrc, pos + 1) == 47) {
+            let tail = ptrSliceFromStr(clampedSrc, pos, minInt(6, n - pos));
+            let closeInfo =
+                if (strStartsWith(tail, "</fc>")) Some(("fc", 5))
+                else if (strStartsWith(tail, "</fn>")) Some(("fn", 5))
+                else if (strStartsWith(tail, "</box>")) Some(("box", 6))
+                else None;
+            match closeInfo {
+                Some((tagName, closeLen)) -> match cellGet(stack) {
+                    Cons((topTag, prevStyle), restStack) if (topTag == tagName) -> {
+                        flush();
+                        cellSet(styleCell, prevStyle);
+                        cellSet(stack, restStack);
+                        cellSet(i, pos + closeLen);
+                        cellSet(handled, true)
+                    },
+                    _ -> (),
+                },
+                None -> (),
+            }
+        } else ();
+
+        // 2. Opening tags <fc=...>, <fn=...>, <box...>, <sf=...>
+        if (!cellGet(handled) && b == 60 && listLen(cellGet(stack)) < 16) {
+            match findByteWithin(clampedSrc, 62, pos + 1, 100) {
+                Some(endIdx) -> {
+                    let tag = ptrSliceFromStr(clampedSrc, pos + 1, endIdx - pos - 1);
+                    let curStyle = cellGet(styleCell);
+                    if (strStartsWith(tag, "fc=")) {
+                        let fcBody = ptrSliceFromStr(tag, 3, strLen(tag) - 3);
+                        match splitOnceByte(fcBody, 44) {
+                            None -> match markupColor(fcBody) {
+                                Some(fg) -> {
+                                    flush();
+                                    cellSet(stack, Cons(("fc", curStyle), cellGet(stack)));
+                                    cellSet(styleCell, StatusSegmentStyle {
+                                        foreground: Some(fg),
+                                        background: curStyle.background,
+                                        font: curStyle.font,
+                                        fontSize: curStyle.fontSize,
+                                        dimmed: curStyle.dimmed,
+                                        boxStyle: curStyle.boxStyle,
+                                    });
+                                    cellSet(i, endIdx + 1);
+                                    cellSet(handled, true)
+                                },
+                                None -> (),
+                            },
+                            Some((p0, p1)) -> {
+                                let noExtraComma = match splitOnceByte(p1, 44) { None -> true, Some(_) -> false };
+                                let fgOpt = if (strLen(p0) == 0) None else markupColor(p0);
+                                let fgValid = strLen(p0) == 0 || (match fgOpt { Some(_) -> true, None -> false });
+                                let bgOpt = markupColor(p1);
+                                if (noExtraComma && fgValid && (match bgOpt { Some(_) -> true, None -> false })) {
+                                    flush();
+                                    cellSet(stack, Cons(("fc", curStyle), cellGet(stack)));
+                                    cellSet(styleCell, StatusSegmentStyle {
+                                        foreground: match fgOpt { Some(fg) -> Some(fg), None -> curStyle.foreground },
+                                        background: bgOpt,
+                                        font: curStyle.font,
+                                        fontSize: curStyle.fontSize,
+                                        dimmed: curStyle.dimmed,
+                                        boxStyle: curStyle.boxStyle,
+                                    });
+                                    cellSet(i, endIdx + 1);
+                                    cellSet(handled, true)
+                                } else ()
+                            },
+                        }
+                    } else if (strStartsWith(tag, "fn=")) {
+                        let fnBody = ptrSliceFromStr(tag, 3, strLen(tag) - 3);
+                        match parseInt(fnBody) {
+                            Ok(fontIdx) if (fontIdx >= 0) -> {
+                                flush();
+                                cellSet(stack, Cons(("fn", curStyle), cellGet(stack)));
+                                cellSet(styleCell, StatusSegmentStyle {
+                                    foreground: curStyle.foreground,
+                                    background: curStyle.background,
+                                    font: listNthOpt(fonts, fontIdx),
+                                    fontSize: curStyle.fontSize,
+                                    dimmed: curStyle.dimmed,
+                                    boxStyle: curStyle.boxStyle,
+                                });
+                                cellSet(i, endIdx + 1);
+                                cellSet(handled, true)
+                            },
+                            _ -> (),
+                        }
+                    } else if (tag == "box" || strStartsWith(tag, "box ")) {
+                        match parseBoxTag(tag) {
+                            Some(bs) -> {
+                                flush();
+                                cellSet(stack, Cons(("box", curStyle), cellGet(stack)));
+                                cellSet(styleCell, StatusSegmentStyle {
+                                    foreground: curStyle.foreground,
+                                    background: curStyle.background,
+                                    font: curStyle.font,
+                                    fontSize: curStyle.fontSize,
+                                    dimmed: curStyle.dimmed,
+                                    boxStyle: Some(bs),
+                                });
+                                cellSet(i, endIdx + 1);
+                                cellSet(handled, true)
+                            },
+                            None -> (),
+                        }
+                    } else if (strStartsWith(tag, "sf=")) {
+                        let sym = ptrSliceFromStr(tag, 3, strLen(tag) - 3);
+                        if (isValidSfSymbol(sym)) {
+                            flush();
+                            if (cellGet(resCount) < 512) {
+                                cellSet(resRev, Cons(StatusPart {
+                                    text: "",
+                                    style: Some(curStyle),
+                                    isCurrent: current,
+                                    workspaceIndex: workspaceIndex,
+                                    symbolName: Some(sym),
+                                }, cellGet(resRev)));
+                                cellSet(resCount, cellGet(resCount) + 1)
+                            } else ();
+                            cellSet(i, endIdx + 1);
+                            cellSet(handled, true)
+                        } else ()
+                    } else ()
+                },
+                None -> (),
+            }
+        } else ();
+
+        // 3. %token% substitution & %% escape
+        if (!cellGet(handled) && b == 37) {
+            let next = pos + 1;
+            if (next < n && strByteAt(clampedSrc, next) == 37) {
+                bufPushByte(cellGet(buf), 37);
+                cellSet(i, next + 1);
+                cellSet(handled, true)
+            } else if (next < n) {
+                match findByteWithin(clampedSrc, 37, next, 32) {
+                    Some(endIdx) -> {
+                        let token = ptrSliceFromStr(clampedSrc, next, endIdx - next);
+                        match resolve(token, cellGet(styleCell)) {
+                            Some(subParts) -> {
+                                flush();
+                                let cs = cellNew(subParts);
+                                while (match cellGet(cs) { Nil -> false, _ -> cellGet(resCount) < 512 }) {
+                                    match cellGet(cs) {
+                                        Cons(sp, sr) -> {
+                                            cellSet(resRev, Cons(sp, cellGet(resRev)));
+                                            cellSet(resCount, cellGet(resCount) + 1);
+                                            cellSet(cs, sr)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                cellSet(i, endIdx + 1);
+                                cellSet(handled, true)
+                            },
+                            None -> (),
+                        }
+                    },
+                    None -> (),
+                }
+            } else ()
+        } else ();
+
+        if (!cellGet(handled)) {
+            bufPushByte(cellGet(buf), b);
+            cellSet(i, pos + 1)
+        } else ()
+    };
+    flush();
+    listRev(cellGet(resRev))
+}
+
+pub def templateStatusParts(
+    cfg: Configuration,
+    values: StatusValues,
+    commandOutput: Int -> String
+): List StatusPart = {
+    let layoutVal = if (values.paused) "Paused" else values.layout;
+    let titleVal = utf8TakeChars(values.title, 24);
+    let countVal = intToStr(values.count);
+    let customVal = utf8TakeChars(values.custom, 48);
+
+    let mkLiteral = (text: String, style: StatusSegmentStyle, isCur: Bool, wsIdx: Option Int) -> {
+        let clean = cleanWhitespace(text, 160);
+        if (strLen(clean) == 0) Nil
+        else [StatusPart {
+            text: clean,
+            style: Some(style),
+            isCurrent: isCur,
+            workspaceIndex: wsIdx,
+            symbolName: None,
+        }]
+    };
+
+    let renderWorkspaces = (inherited: StatusSegmentStyle) -> match values.spaces {
+        None -> mkLiteral("?", inherited, false, None),
+        Some(entries) -> {
+            let outRev: Cell (List StatusPart) = cellNew(Nil);
+            let cur = cellNew(entries);
+            let idx = cellNew(0);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(entry, r) -> {
+                        let i = cellGet(idx);
+                        if (i > 0) {
+                            let sep = mkLiteral(" ", inherited, false, None);
+                            let cs = cellNew(sep);
+                            while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                                match cellGet(cs) { Cons(p, pr) -> { cellSet(outRev, Cons(p, cellGet(outRev))); cellSet(cs, pr) }, Nil -> () }
+                            }
+                        } else ();
+                        let label = match listNthOpt(values.spaceLabels, i) {
+                            Some(l) -> l,
+                            None -> intToStr(i + 1),
+                        };
+                        let isOccupied = match entry.windowCount { Some(c) -> c > 0, None -> false };
+                        let idxStr = intToStr(i + 1);
+                        let fsStr = if (entry.isFullscreen) "•" else "";
+                        let occStr = if (!entry.isCurrent && isOccupied) "•" else "";
+                        let wsTemplate = if (entry.isCurrent) cfg.workspaceCurrent else cfg.workspaceOther;
+                        let isDim = !entry.isCurrent && (match entry.windowCount { Some(0) -> true, _ -> false });
+                        let entryStyle = StatusSegmentStyle {
+                            foreground: inherited.foreground,
+                            background: inherited.background,
+                            font: inherited.font,
+                            fontSize: inherited.fontSize,
+                            dimmed: if (isDim) true else inherited.dimmed,
+                            boxStyle: inherited.boxStyle,
+                        };
+                        let subParts = parseStatusMarkup(
+                            wsTemplate,
+                            cfg.statusFonts,
+                            cfg.statusFontSize,
+                            Some(entryStyle),
+                            entry.isCurrent,
+                            Some(i),
+                            (token, st) ->
+                                if (token == "icon") {
+                                    let iconSpec = match listNthOpt(values.spaceIcons, i) { Some(s) -> s, None -> "" };
+                                    if (isValidSfSymbol(iconSpec)) {
+                                        Some([StatusPart {
+                                            text: "",
+                                            style: Some(st),
+                                            isCurrent: entry.isCurrent,
+                                            workspaceIndex: Some(i),
+                                            symbolName: Some(iconSpec),
+                                        }])
+                                    } else {
+                                        let fb = if (strLen(iconSpec) == 0) label else iconSpec;
+                                        Some(mkLiteral(fb, st, entry.isCurrent, Some(i)))
+                                    }
+                                } else if (token == "label") Some(mkLiteral(label, st, entry.isCurrent, Some(i)))
+                                else if (token == "index") Some(mkLiteral(idxStr, st, entry.isCurrent, Some(i)))
+                                else if (token == "fullscreen") Some(mkLiteral(fsStr, st, entry.isCurrent, Some(i)))
+                                else if (token == "occupied") Some(mkLiteral(occStr, st, entry.isCurrent, Some(i)))
+                                else None
+                        );
+                        let cp = cellNew(subParts);
+                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                            match cellGet(cp) { Cons(p, pr) -> { cellSet(outRev, Cons(p, cellGet(outRev))); cellSet(cp, pr) }, Nil -> () }
+                        };
+                        cellSet(idx, i + 1);
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            listRev(cellGet(outRev))
+        },
+    };
+
+    let legacy0 = strReplaceAll(cfg.statusFormat, "{spaces}", "%spaces%");
+    let legacy1 = strReplaceAll(legacy0, "{layout}", "%layout%");
+    let legacy2 = strReplaceAll(legacy1, "{title}", "%title%");
+    let legacy3 = strReplaceAll(legacy2, "{count}", "%count%");
+    let legacy = strReplaceAll(legacy3, "{custom}", "%custom%");
+    let tmplStr = match cfg.statusTemplate { Some(t) -> t, None -> legacy };
+
+    let raw = parseStatusMarkup(
+        tmplStr,
+        cfg.statusFonts,
+        cfg.statusFontSize,
+        None,
+        false,
+        None,
+        (token, st) ->
+            if (token == "spaces") Some(renderWorkspaces(st))
+            else if (token == "layout") Some(mkLiteral(layoutVal, st, false, None))
+            else if (token == "title") Some(mkLiteral(titleVal, st, false, None))
+            else if (token == "count") Some(mkLiteral(countVal, st, false, None))
+            else if (token == "custom") Some(mkLiteral(customVal, st, false, None))
+            else match listIndexOfBy(cfg.statusCommands, (c: StatusCommand) -> c.name == token) {
+                Some(idx) -> {
+                    let text = commandOutput(idx);
+                    let useMarkup = match listNthOpt(cfg.statusCommands, idx) {
+                        Some(cmd) -> match cmd.markup { Some(true) -> true, _ -> false },
+                        None -> false,
+                    };
+                    if (useMarkup) {
+                        Some(parseStatusMarkup(text, cfg.statusFonts, cfg.statusFontSize, Some(st), false, None, (_, _) -> None))
+                    } else {
+                        Some(mkLiteral(text, st, false, None))
+                    }
+                },
+                None -> None,
+            }
+    );
+
+    // Coalesce adjacent text parts with identical style/current/workspaceIndex
+    let mergedRev: Cell (List StatusPart) = cellNew(Nil);
+    let cr = cellNew(raw);
+    while (match cellGet(cr) { Nil -> false, _ -> true }) {
+        match cellGet(cr) {
+            Cons(part, rest) -> {
+                match cellGet(mergedRev) {
+                    Cons(last, tail)
+                        if (optEqBy(last.symbolName, None, (x, y) -> x == y)
+                            && optEqBy(part.symbolName, None, (x, y) -> x == y)
+                            && optEqBy(last.style, part.style, (x, y) -> x == y)
+                            && last.isCurrent == part.isCurrent
+                            && optEqBy(last.workspaceIndex, part.workspaceIndex, (x, y) -> x == y)) -> {
+                        let combined = StatusPart {
+                            text: last.text + part.text,
+                            style: last.style,
+                            isCurrent: last.isCurrent,
+                            workspaceIndex: last.workspaceIndex,
+                            symbolName: None,
+                        };
+                        cellSet(mergedRev, Cons(combined, tail))
+                    },
+                    _ -> cellSet(mergedRev, Cons(part, cellGet(mergedRev))),
+                };
+                cellSet(cr, rest)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(mergedRev))
+}
