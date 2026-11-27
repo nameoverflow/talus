@@ -53,7 +53,7 @@ jobs:
           echo "$HOME/.geisha/bin" >> "$GITHUB_PATH"
           "$HOME/.geisha/bin/geisha" --version || true
       - name: Build and test
-        run: make all test status-cleanup-test app CODESIGN_IDENTITY=-
+        run: make all test status-cleanup-test man-lint app CODESIGN_IDENTITY=-
       - name: Package and verify archive
         run: |
           make dist

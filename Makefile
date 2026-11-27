@@ -1,4 +1,4 @@
-.PHONY: all clean app dist install setup-cert test check deployment-test settings-preview status-cleanup-test integration-test
+.PHONY: all clean app dist install install-man man-lint setup-cert test check deployment-test settings-preview status-cleanup-test integration-test
 
 GEISHA ?= $(shell command -v geisha || echo $(HOME)/.geisha/bin/geisha)
 CERT_NAME ?= Talus Local Code Signing
@@ -62,6 +62,17 @@ install: app
 	rm -rf /Applications/Talus.app
 	cp -R build/Talus.app /Applications/Talus.app
 	open -g /Applications/Talus.app </dev/null >/dev/null 2>&1
+
+MANDIR ?= $(HOME)/.local/share/man
+
+man-lint:
+	mandoc -T lint -W warning man/talus.1 man/talus.toml.5
+
+install-man: man-lint
+	install -d "$(MANDIR)/man1" "$(MANDIR)/man5"
+	install -m 644 man/talus.1 "$(MANDIR)/man1/talus.1"
+	install -m 644 man/talus.toml.5 "$(MANDIR)/man5/talus.toml.5"
+	@echo "Installed man pages to $(MANDIR) (view with: man -M $(MANDIR) talus)"
 
 dist: build/Talus.app deployment-test
 	rm -rf build/dist build/Talus-macos.zip

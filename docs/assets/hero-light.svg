@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="Talus — Tiling window manager for macOS.">
+  <title>Talus — Tiling window manager for macOS.</title>
+  <defs>
+    <clipPath id="clipLight">
+      <rect width="1280" height="640" rx="14"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#clipLight)">
+    <!-- Solid Flat Limestone Canvas (Zero Gradients, Zero Shadows) -->
+    <rect width="1280" height="640" fill="#F4F2EA"/>
+
+    <!-- Left: Quiet Typographic Anchor + Talus Status Bar Schematic -->
+    <rect x="88" y="198" width="40" height="4.5" rx="2.25" fill="#D37859"/>
+    <text x="86" y="302" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', 'Helvetica Neue', sans-serif" font-size="94" font-weight="600" letter-spacing="-3.4" fill="#172631">Talus</text>
+    <text x="90" y="352" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', 'Helvetica Neue', sans-serif" font-size="22" font-weight="400" letter-spacing="-0.2" fill="#4D616E">Tiling window manager for macOS.</text>
+
+    <!-- Flat Talus Menu-Bar Status Schematic -->
+    <g transform="translate(88, 394)">
+      <rect x="0" y="0" width="352" height="38" rx="9" fill="#ECEEE7" stroke="#CFD9D4" stroke-width="1.5"/>
+      <!-- Mini Talus Status Mark -->
+      <g transform="translate(13, 10.5)">
+        <rect x="0" y="0" width="17" height="17" rx="3.5" fill="none" stroke="#172631" stroke-width="1.5"/>
+        <rect x="2.8" y="2.8" width="5.8" height="11.4" rx="1.2" fill="#172631"/>
+        <rect x="10.2" y="2.8" width="4" height="5" rx="0.9" fill="#172631"/>
+        <rect x="10.2" y="9.2" width="4" height="5" rx="0.9" fill="#637885"/>
+      </g>
+      <!-- Active Workspace Pill (matches 01 · TALL) -->
+      <rect x="42" y="7" width="66" height="24" rx="5.5" fill="#172631"/>
+      <text x="75" y="23" text-anchor="middle" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="12" font-weight="600" fill="#F5F3EC">1 term</text>
+      <text x="122" y="23" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="12" fill="#546976">2 web</text>
+      <text x="174" y="23" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="12" fill="#546976">3 code</text>
+      <line x1="234" y1="10" x2="234" y2="28" stroke="#C8D3CE" stroke-width="1.5"/>
+      <text x="249" y="23" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="12" font-weight="600" fill="#C46344">Tall</text>
+      <text x="338" y="23" text-anchor="end" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="12" fill="#465A67">17:42</text>
+    </g>
+
+    <!-- Right: Three Flat Stacked Spaces (Tall · Mirror · Full) -->
+
+    <!-- SPACE 3 (Back): Full Layout -->
+    <g transform="translate(800, 72)">
+      <rect x="0" y="0" width="400" height="260" rx="20" fill="#E4EBE7" stroke="#C5D2CC" stroke-width="1.5"/>
+      <text x="18" y="24" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="10.5" letter-spacing="0.8" fill="#687C88">03 · FULL</text>
+      <rect x="16" y="36" width="368" height="208" rx="12" fill="#D4E0DA" stroke="#BDCBC4" stroke-width="1.2"/>
+      <rect x="32" y="52" width="42" height="7" rx="3.5" fill="#6F8694"/>
+    </g>
+
+    <!-- SPACE 2 (Middle): Mirror Layout -->
+    <g transform="translate(684, 184)">
+      <rect x="0" y="0" width="400" height="260" rx="20" fill="#ECF0EC" stroke="#C2D0C9" stroke-width="1.5"/>
+      <text x="18" y="24" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="10.5" letter-spacing="0.8" fill="#526774">02 · MIRROR</text>
+      <!-- Top Master Pane -->
+      <rect x="16" y="36" width="368" height="106" rx="12" fill="#D8E3DE" stroke="#BCCBC4" stroke-width="1.2"/>
+      <rect x="32" y="52" width="42" height="7" rx="3.5" fill="#3B5566"/>
+      <!-- Bottom Three Side-by-Side Stack Panes -->
+      <rect x="16" y="154" width="115" height="90" rx="11" fill="#E3EBE6" stroke="#C6D4CD" stroke-width="1.2"/>
+      <rect x="143" y="154" width="114" height="90" rx="11" fill="#E3EBE6" stroke="#C6D4CD" stroke-width="1.2"/>
+      <rect x="269" y="154" width="115" height="90" rx="11" fill="#DCE6E1" stroke="#C6D4CD" stroke-width="1.2"/>
+    </g>
+
+    <!-- SPACE 1 (Front, Active): Tall Layout -->
+    <g transform="translate(556, 296)">
+      <rect x="0" y="0" width="400" height="260" rx="20" fill="#FAF9F5" stroke="#B7C6C0" stroke-width="1.6"/>
+      <circle cx="24" cy="20" r="3.5" fill="#D37859"/>
+      <text x="36" y="24" font-family="'SF Mono', ui-monospace, 'Menlo', monospace" font-size="10.5" font-weight="600" letter-spacing="0.8" fill="#172631">01 · TALL</text>
+      <!-- Left Master Pane (Flat Deep Slate + Terracotta Focus Bar) -->
+      <rect x="16" y="36" width="208" height="208" rx="12" fill="#1D2F3C"/>
+      <rect x="34" y="54" width="46" height="8" rx="4" fill="#D37859"/>
+      <!-- Right Top Stack Pane (Flat Crisp White) -->
+      <rect x="236" y="36" width="148" height="98" rx="12" fill="#FFFFFF" stroke="#D5DFDA" stroke-width="1.2"/>
+      <!-- Right Bottom Stack Pane (Flat Soft Sage) -->
+      <rect x="236" y="146" width="148" height="98" rx="12" fill="#CFE2DA" stroke="#B8CEC5" stroke-width="1.2"/>
+    </g>
+  </g>
+</svg>
