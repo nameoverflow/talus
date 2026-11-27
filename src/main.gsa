@@ -77,6 +77,12 @@ use macos.ffi.{
 }
 use macos.window_focus.{frontmostPid, isFrontmostPid}
 use macos.spaces.{windowServerFrame, nativeSpacesForScreen}
+use macos.launch_at_login.{
+    LaunchAtLoginModel, LoginNotRegistered, LoginNotFound, loginStatusEq,
+    systemLaunchAtLoginService, launchAtLoginNew, launchAtLoginStatus,
+    launchAtLoginIsEnabled, launchAtLoginNeedsApproval, launchAtLoginError,
+    launchAtLoginRefresh, launchAtLoginSetEnabled
+}
 use macos.executor.{
     WindowExecutor, WindowGoal, ApplyRealAX, ExecEvent, ExecCustomSignal,
     MainLoopUpdate, mainLoopUpdateNew, mainLoopUpdateRequest, mainLoopUpdateHandleSignal, mainLoopUpdateFlush,
@@ -1253,6 +1259,8 @@ data StatusMenu {
         workspaceItems: List Ptr,
         workspaceSeparator: Ptr,
         pauseItem: Ptr,
+        loginItem: Ptr,
+        loginModel: LaunchAtLoginModel,
         openFileItem: Ptr,
         retainedTargets: Cell (List (Id NSObject)),
         lastExportJson: Cell (Option String),
@@ -1545,6 +1553,17 @@ def statusMenuNew(m: Manager, cfg: Configuration, savePath: String): StatusMenu 
     let pauseItemId = makeMenuItem("暂停平铺", "", Some(pauseTgt));
     let pauseItemPtr = keep(pauseItemId);
     nsMenuAddItem(menuRaw, pauseItemId);
+
+    let loginModel = launchAtLoginNew(systemLaunchAtLoginService());
+    let loginTgt = makeActionTarget((_) -> {
+        launchAtLoginRefresh(loginModel);
+        let targetEnabled = !launchAtLoginIsEnabled(loginModel);
+        launchAtLoginSetEnabled(loginModel, targetEnabled)
+    });
+    let _ = keep(loginTgt);
+    let loginItemId = makeMenuItem("登录时自动启动", "", Some(loginTgt));
+    let loginItemPtr = keep(loginItemId);
+    nsMenuAddItem(menuRaw, loginItemId);
     nsMenuAddSeparator(menuRaw);
 
     let smCell: Cell (Option StatusMenu) = cellNew(None);
@@ -1597,6 +1616,8 @@ def statusMenuNew(m: Manager, cfg: Configuration, savePath: String): StatusMenu 
         workspaceItems: listRev(cellGet(wsItemsRev)),
         workspaceSeparator: wsSepRaw,
         pauseItem: pauseItemPtr,
+        loginItem: loginItemPtr,
+        loginModel: loginModel,
         openFileItem: openFilePtr,
         retainedTargets: retained,
         lastExportJson: cellNew(None),
@@ -1662,6 +1683,10 @@ def statusMenuNew(m: Manager, cfg: Configuration, savePath: String): StatusMenu 
         };
         let pTitle = if (snap.paused) "恢复平铺" else "暂停平铺";
         withId(nsString(pTitle), (tp) -> c_nsSetStrScoped(sm.pauseItem, objcSel("setTitle:"), tp));
+        launchAtLoginRefresh(sm.loginModel);
+        let lTitle = if (launchAtLoginNeedsApproval(sm.loginModel)) "登录时自动启动（需在系统设置中批准…）" else "登录时自动启动";
+        withId(nsString(lTitle), (tp) -> c_nsSetStrScoped(sm.loginItem, objcSel("setTitle:"), tp));
+        msgSendVoid1I64(sm.loginItem, objcSel("setState:"), if (launchAtLoginIsEnabled(sm.loginModel)) intToI64(1) else intToI64(0));
         let fTitle = "打开配置文件 (" + abbreviatedPath(cellGet(sm.savePathCell)) + ")";
         withId(nsString(fTitle), (tp) -> c_nsSetStrScoped(sm.openFileItem, objcSel("setTitle:"), tp))
     });
@@ -1809,6 +1834,37 @@ def main(): Void = withAutoreleasePool(() -> {
         },
         None -> (),
     };
+
+    // 0b. Isolated SMAppService login-item integration probe (only runs inside local.talus.testing.login bundle)
+    if (listContainsBy(cliArgs, "--probe-login-item", eqStr)) {
+        let mb = msgSend0(objcClass("NSBundle"), objcSel("mainBundle"));
+        let bid = fromNSStringPtr(msgSend0(mb, objcSel("bundleIdentifier")));
+        if (bid != "local.talus.testing.login") {
+            eprintLn("Refusing to run --probe-login-item outside local.talus.testing.login bundle (got: " + bid + ")");
+            exit(1)
+        } else ();
+        let m = launchAtLoginNew(systemLaunchAtLoginService());
+        let st0 = launchAtLoginStatus(m);
+        if (!loginStatusEq(st0, LoginNotRegistered) && !loginStatusEq(st0, LoginNotFound)) {
+            eprintLn("Expected fresh test login item");
+            exit(1)
+        } else ();
+        launchAtLoginSetEnabled(m, true);
+        let enabledOk = launchAtLoginIsEnabled(m);
+        let err1 = launchAtLoginError(m);
+        let m2 = launchAtLoginNew(systemLaunchAtLoginService());
+        let readbackEnabled = launchAtLoginIsEnabled(m2);
+        launchAtLoginSetEnabled(m, false);
+        let removedOk = loginStatusEq(launchAtLoginStatus(m), LoginNotRegistered);
+        if (enabledOk && readbackEnabled && removedOk) {
+            printLn("Signed app registered, read back enabled, unregistered and read back disabled; test login item removed");
+            exit(0)
+        } else {
+            let msg = match err1 { Some(e) -> e, None -> "register/unregister verification failed" };
+            eprintLn("Login item probe failed: " + msg);
+            exit(1)
+        }
+    } else ();
 
     // 1. Offline Settings UI preview renderer (`--render-previews <dir>`)
     match findFlagValue(cliArgs, "--render-previews") {

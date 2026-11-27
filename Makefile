@@ -84,3 +84,15 @@ integration-test: build/talus
 	$(SWIFTC) Tests/Integration/Fixture.swift -o build/integration-fixture
 	$(SWIFTC) Tests/Integration/Probe.swift -o build/integration-probe
 	Tests/Integration/smoke.sh
+
+# Opt-in: briefly registers only an isolated, signed test app via SMAppService.mainApp, then removes it.
+launch-at-login-integration-test: build/Talus.app
+	rm -rf build/LoginItemProbe.app
+	mkdir -p build/LoginItemProbe.app/Contents/MacOS
+	cp build/Talus.app/Contents/MacOS/Talus build/LoginItemProbe.app/Contents/MacOS/Probe
+	cp Resources/Info.plist build/LoginItemProbe.app/Contents/Info.plist
+	/usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier local.talus.testing.login' build/LoginItemProbe.app/Contents/Info.plist
+	/usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Probe' build/LoginItemProbe.app/Contents/Info.plist
+	/usr/libexec/PlistBuddy -c 'Set :CFBundleName Talus Login Test' build/LoginItemProbe.app/Contents/Info.plist
+	codesign --force --sign - build/LoginItemProbe.app
+	build/LoginItemProbe.app/Contents/MacOS/Probe --probe-login-item
