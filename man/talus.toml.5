@@ -1,0 +1,212 @@
+.Dd November 27, 2026
+.Dt TALUS.TOML 5
+.Os macOS 15.0
+.Sh NAME
+.Nm talus.toml
+.Nd configuration file format for the Talus macOS tiling window manager
+.Sh SYNOPSIS
+.Pa ~/.talus.toml
+.Sh DESCRIPTION
+.Nm
+configures keyboard modifiers, workspace mode, layout geometry, application
+rules, and the xmobar-inspired macOS menu-bar status item for
+.Xr talus 1 .
+Every key is optional; omitted keys use their defaults.
+Changes saved from disk hot-reload automatically (every ~2 seconds or via
+.Ic Cmd+R
+in the menu bar), and changes saved from the native Settings window patch
+the file in place via
+.Li std.toml.patch
+without stripping comments.
+.Sh TOP-LEVEL KEYS
+.Bl -tag -width Ds
+.It Va modifiers = [ "control", "option" ]
+Non-empty list of distinct modifier names chosen from
+.Cm control ,
+.Cm option ,
+and
+.Cm command .
+.Cm shift
+is reserved for swap and throw shortcuts.
+.El
+.Sh WORKSPACES SECTION
+.Li [workspaces]
+.Bl -tag -width Ds
+.It Va mode = "native" | "virtual"
+Selects macOS Spaces tracking
+.Pq Cm native , default
+or Talus virtual workspaces
+.Pq Cm virtual .
+.It Va count = 5
+Number of virtual workspaces
+.Pq Li 1..9 .
+.It Va labels = [ ... ]
+Up to 32 display labels
+.Pq 1\(en16 characters each
+exposed as
+.Li %label% .
+.It Va icons = [ ... ]
+Up to 32 SF Symbol names or text glyphs
+.Pq 1\(en64 characters each
+exposed as
+.Li %icon% .
+.El
+.Sh LAYOUT SECTION
+.Li [layout]
+.Bl -tag -width Ds
+.It Va master_ratio = 0.5
+Master pane fraction
+.Pq Li 0.2..0.8 .
+.It Va ratio_step = 0.03
+Resize step per
+.Ic <Mod>+H/L
+.Pq greater than Li 0.0 , at most Li 0.2 .
+.It Va master_count = 1
+Initial number of windows in the master pane
+.Pq Li 1..20 .
+.It Va outer_gap = 0.0
+Outer display margin in macOS logical points
+.Pq Li 0.0..64.0 .
+Applied to Tall, Mirror Tall, and Full.
+.It Va inner_gap = 0.0
+Inter-window gap in macOS logical points
+.Pq Li 0.0..64.0 .
+Applied to Tall and Mirror Tall.
+.El
+.Sh RULES SECTION
+.Li [rules] ,
+.Li [rules.app_workspaces] ,
+and
+.Li [[rules.float_windows]]
+.Bl -tag -width Ds
+.It Va ignore_apps = [ "com.example.App", ... ]
+Bundle identifiers ignored completely by Talus.
+.It Va [rules.app_workspaces]
+Maps up to 64 application bundle identifiers to a virtual workspace number
+.Pq Li 1..9
+or workspace label name.
+.It Va [[rules.float_windows]]
+Up to 64 rules, each with
+.Va app
+.Pq bundle ID
+and optional
+.Va titles
+and
+.Va except_titles
+arrays
+.Pq up to 32 patterns each .
+Patterns containing
+.Li *
+use case-insensitive glob matching;
+.Va except_titles
+takes precedence over
+.Va titles .
+.El
+.Sh STATUS SECTION
+.Li [status]
+and
+.Li [[status.commands]]
+.Bl -tag -width Ds
+.It Va show_icon = true
+Draw the Talus vector emblem beside the status text.
+.It Va template
+Rich status string
+.Pq \(<= 1024 characters
+supporting
+.Li %spaces% ,
+.Li %layout% ,
+.Li %title% ,
+.Li %count% ,
+.Li %custom% ,
+.Li %<cmd>% ,
+and
+.Li %% ,
+as well as nested markup tags:
+.Li <fc=fg,bg>...</fc> ,
+.Li <box type=Bottom|Top|Full|HBoth|VBoth width=N color=... radius=R>...</box> ,
+.Li <fn=N>...</fn> ,
+and
+.Li <sf=symbol.name> .
+.It Va workspace_current , workspace_other
+Templates
+.Pq \(<= 512 characters
+for active and inactive Spaces/workspaces using
+.Li %label% ,
+.Li %index% ,
+.Li %icon% ,
+.Li %occupied% ,
+and
+.Li %fullscreen% .
+.It Va fonts = [ ... ]
+Up to 16 installed font names indexed by
+.Li <fn=0> ,
+.Li <fn=1> ,
+etc.
+.It Va font_size = 11.5
+Base status bar font size in points
+.Pq Li 8.0..14.0 .
+.It Va text_file , state_file
+Optional input file for
+.Li %custom%
+and atomic
+.Pq Li 0600
+JSON export path; the two paths must be distinct.
+.It Va [[status.commands]]
+Up to 16 asynchronous commands launched directly without a shell in isolated
+process groups.
+Fields:
+.Va name
+.Pq unique non-reserved identifier ,
+.Va executable
+.Pq absolute path ,
+.Va arguments
+.Pq \(<= 32 strings ,
+.Va interval
+.Pq Li 1.0..3600.0 s ,
+.Va timeout
+.Pq Li 0.1..10.0 s ,
+.Va markup
+.Pq default false ,
+and
+.Va on_change
+.Pq default false .
+Each command receives current status JSON in
+.Ev TALUS_STATUS_JSON .
+.El
+.Sh EXAMPLES
+.Bd -literal -offset indent
+modifiers = ["control", "option"]
+
+[workspaces]
+mode = "virtual"
+count = 5
+labels = ["term", "web", "code", "chat", "misc"]
+
+[layout]
+master_ratio = 0.55
+outer_gap = 10
+inner_gap = 8
+
+[rules.app_workspaces]
+"com.apple.Terminal" = "term"
+"com.apple.Safari" = "web"
+
+[[rules.float_windows]]
+app = "com.tencent.xinWeChat"
+except_titles = ["微信", "WeChat"]
+
+[status]
+show_icon = true
+template = "%spaces%  <fc=#89CFC2>%layout%</fc>  %clock%"
+workspace_current = "<fc=#10201E,#89CFC2> %label%%fullscreen% </fc>"
+workspace_other = "%label%%fullscreen%"
+
+[[status.commands]]
+name = "clock"
+executable = "/bin/date"
+arguments = ["+%H:%M"]
+interval = 30
+timeout = 2
+.Ed
+.Sh SEE ALSO
+.Xr talus 1

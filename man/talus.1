@@ -1,0 +1,190 @@
+.Dd November 27, 2026
+.Dt TALUS 1
+.Os macOS 15.0
+.Sh NAME
+.Nm talus
+.Nd XMonad-inspired tiling window manager for macOS
+.Sh SYNOPSIS
+.Nm
+.Op Fl -settings
+.Op Fl -settings-only
+.Op Fl -tab Ns = Ns Ar general | layout | rules | status
+.Op Fl -render-icon Ar out.png
+.Op Fl -render-previews Ar dir
+.Op Fl -probe-login-item
+.Sh DESCRIPTION
+.Nm
+is a deterministic, XMonad-inspired tiling window manager for macOS 15+
+(Apple Silicon), written in 100% pure Geisha using native AppKit,
+Accessibility
+.Pq Dv AXUIElement ,
+Carbon global hotkeys, and
+.Dv SMAppService .
+No X11 server, SIP modifications, or process injection are required.
+.Pp
+.Nm
+arranges visible windows into
+.Cm Tall ,
+.Cm Mirror Tall ,
+or
+.Cm Full
+layouts with configurable outer and inner gaps, supports either native macOS
+Spaces or zero-animation virtual workspaces
+.Pq 1\(en9
+with 1px corner parking and atomic session persistence, renders an
+xmobar-inspired menu-bar status item, and provides a native AppKit Settings
+window that preserves comments when editing
+.Pa ~/.talus.toml .
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl -settings
+Start
+.Nm
+normally and immediately open the native Settings window.
+.It Fl -settings-only
+Open only the Settings window without starting window tiling, AX observers,
+or global hotkeys.
+.It Fl -tab Ns = Ns Ar name
+Select the initial Settings tab when used with
+.Fl -settings
+or
+.Fl -settings-only .
+Valid values are
+.Cm general ,
+.Cm layout ,
+.Cm rules ,
+and
+.Cm status .
+.It Fl -render-icon Ar out.png
+Render the 1024\(mu1024 vector application icon PNG to
+.Ar out.png
+and exit.
+.It Fl -render-previews Ar dir
+Render 2\(mu Retina light and dark Settings window screenshots into
+.Ar dir
+and exit.
+.It Fl -probe-login-item
+Run an isolated
+.Dv SMAppService.mainApp
+register/read/unregister verification probe.
+Refuses to run unless executed from a bundle whose identifier is
+.Li local.talus.testing.login .
+.El
+.Sh KEYBOARD SHORTCUTS
+All shortcuts combine the configured
+.Va modifiers
+chord (default
+.Ic Control + Option ,
+written
+.Ic <Mod>
+below) with a key.
+.Ic Shift
+is reserved for swapping and throwing windows.
+.Bl -tag -width "<Mod>+Shift+1..9" -compact
+.It Ic <Mod>+J / K
+Focus next / previous window on the active display.
+.It Ic <Mod>+Shift+J / K
+Swap focused window with next / previous window.
+.It Ic <Mod>+Return
+Swap focused window with master (or first stack window if already master).
+.It Ic <Mod>+H / L
+Shrink / expand master pane width by
+.Va ratio_step .
+.It Ic <Mod>+, / .
+Increment / decrement the number of master windows.
+.It Ic <Mod>+Space
+Cycle layout:
+.Cm Tall
+\(->
+.Cm Mirror Tall
+\(->
+.Cm Full .
+.It Ic <Mod>+T
+Toggle floating for the focused window.
+.It Ic <Mod>+P
+Pause or resume tiling (restores parked windows while paused).
+.It Ic <Mod>+1..9
+Switch to virtual workspace 1..count
+.Pq when Va mode = \(dqvirtual\(dq .
+.It Ic <Mod>+Shift+1..9
+Move the focused window to virtual workspace 1..count
+.Pq when Va mode = \(dqvirtual\(dq .
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width "TALUS_LEGACY_FOCUS"
+.It Ev TALUS_CONFIG
+Override configuration file search order with an explicit
+.Pa .toml
+or
+.Pa .json
+path (supports leading
+.Pa ~ ) .
+.It Ev TALUS_LEGACY_FOCUS
+When set to
+.Li 1 ,
+force the legacy full focus activation sequence instead of the optimized
+.Fn _SLPSGetFrontProcess
+path.
+.It Ev TALUS_TRACE_EVENTS
+When set to
+.Li 1 ,
+log Accessibility, workspace, and executor diagnostic events to standard error.
+.It Ev TALUS_TRACE_STATUS
+When set to
+.Li 1 ,
+log menu-bar status rendering diagnostics to standard error.
+.It Ev TALUS_TEST_PID
+Restrict window management to specific process ID(s) during automated tests.
+.It Ev TALUS_TEST_HOTKEYS
+When set to
+.Li 1 ,
+keep global Carbon hotkeys enabled even when
+.Ev TALUS_TEST_PID
+is set.
+.El
+.Sh FILES
+Unless
+.Ev TALUS_CONFIG
+is set,
+.Nm
+searches for configuration in the following order:
+.Bl -tag -width Ds -compact
+.It Pa ~/.talus.toml
+Primary user configuration file.
+.It Pa ~/.config/talus/config.toml
+XDG-style fallback configuration file.
+.It Pa ~/Library/Application Support/Talus/config.toml
+macOS Application Support TOML fallback.
+.It Pa ~/Library/Application Support/Talus/config.json
+Legacy JSON fallback (migrated to
+.Pa ~/.talus.toml
+on first UI save).
+.It Pa ~/Library/Application Support/Talus/session-state.json
+Atomic
+.Pq Li 0600
+virtual workspace session persistence file.
+.It Pa /Applications/Talus.app
+Canonical macOS application bundle installation path.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh DIAGNOSTICS
+.Bl -diag
+.It "Accessibility permission required"
+Grant permission to
+.Pa /Applications/Talus.app
+in
+.Dq System Settings \(-> Privacy & Security \(-> Accessibility .
+For local builds, run
+.Ic make setup-cert
+once so code signatures persist across rebuilds.
+.It "Invalid configuration"
+Reported to standard error (or via an AppKit alert when launched as an app)
+at startup; invalid live edits are logged without terminating the active
+session.
+.El
+.Sh SEE ALSO
+.Xr talus.toml 5
+.Sh AUTHORS
+.An Talus contributors
+.Pq Lk https://github.com/nameoverflow/talus .
