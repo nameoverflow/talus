@@ -1,8 +1,8 @@
 # Talus
 
-Experimental macOS window manager inspired by XMonad. Written in **Rust (`Core/` / `libtalus_core.a`)** for all tiling geometry, virtual workspaces, session persistence, TOML configuration (`serde` + `toml_edit`, preserving user comments on save), status markup/template rendering, subprocess status command scheduling, and the core window-manager state machine (`ManagerCore`), paired with a thin **Swift/AppKit/SwiftUI shell (`Sources/`)** for macOS Accessibility (`AXUIElement`), Carbon hotkeys, menu-bar `NSStatusItem` rendering, and the Settings window; no X11. This is not yet a daily-use release.
+Experimental macOS window manager inspired by XMonad. Written in **100% pure Geisha** (`src/*.gsa` + `src/macos/*.gsa` using `objc.gsa` and `geisha build --target macos-app`): pure Geisha modules handle all tiling geometry, virtual workspaces, session persistence, TOML configuration (`std.toml.patch`, preserving user comments on save), status markup/template rendering, subprocess status command scheduling (`sys.proc`), per-app `std.actor` window discovery/execution, and the core window-manager state machine (`ManagerCore`), while directly driving macOS AppKit, Accessibility (`AXUIElement`), Carbon hotkeys, `SMAppService` Launch-at-Login, menu-bar `NSStatusItem` rendering, and the native Settings window; no X11, no Rust, no Swift. This is not yet a daily-use release.
 
-Build and test with `make all test` on macOS 15 or later with Xcode Command Line Tools and a Rust toolchain (`cargo`). `make app` builds `build/Talus.app` (automatically signing with `Developer ID Application`, `Apple Development`, or `Talus Local Code Signing` if present, and falling back to ad-hoc `-` otherwise), with a menu-bar control to pause, open Settings (`⌘,`), reload configuration, and quit. Run `make setup-cert` once locally to create a persistent `Code Signing`-only self-signed certificate so macOS Accessibility permission survives rebuilds (`make install` updates `/Applications/Talus.app`), and use `make dist` to build a clean ad-hoc `build/Talus-macos.zip` for sharing with other Macs. The program will move visible windows. Quit other window managers before starting and save your work. Control-C quits. Control-Option-P pauses/resumes.
+Build and test with `make all test` on macOS 15 or later with Xcode Command Line Tools and the [Geisha](https://github.com/geisha-lang/geisha.gsa) toolchain (`geisha`). `make app` builds `build/Talus.app` (automatically signing with `Developer ID Application`, `Apple Development`, or `Talus Local Code Signing` if present, and falling back to ad-hoc `-` otherwise), with a menu-bar control to pause, toggle Launch at Login, open Settings (`⌘,`), reload configuration, and quit. Run `make setup-cert` once locally to create a persistent `Code Signing`-only self-signed certificate so macOS Accessibility permission survives rebuilds (`make install` updates `/Applications/Talus.app`), and use `make dist` to build a clean ad-hoc `build/Talus-macos.zip` for sharing with other Macs. The program will move visible windows. Quit other window managers before starting and save your work. Control-C quits. Control-Option-P pauses/resumes.
 
 Control-Option J/K focuses the next/previous window on the screen; add Shift to swap. Return swaps the focused window with master. H/L changes the master width. Comma/period changes the master count; Space cycles Tall, Mirror Tall, and Full; T toggles floating for the focused window. Window creation/destruction uses Accessibility notifications with a two-second fallback reconciliation.
 
@@ -14,12 +14,7 @@ Apple Silicon (arm64) packages are published on [GitHub Releases](https://github
 Extract `Talus-macos-arm64.zip` and move `Talus.app` to `/Applications`. Builds explicitly target macOS 15.0 so newer local toolchains do not silently raise the minimum supported system version.
 Release builds are ad-hoc signed, without Apple notarization; macOS Gatekeeper may require explicit approval.
 
-The `macOS CI and Release` workflow builds, runs the existing test suite, layout
-property tests and command cleanup check, and verifies the packaged app on every
-pull request and push to `main`. Pushing a `vMAJOR.MINOR.PATCH` tag (for example,
-`v0.1.0`) runs the same checks and publishes the ZIP and SHA-256 checksum only
-after they pass. The tag supplies the bundle version. Manual workflow runs build
-the selected ref and publish only when that ref is a version tag.
+The `macOS CI and Release` workflow builds, runs the test suite and command cleanup check, and verifies the packaged app on every pull request and push to `main`. Pushing a `vMAJOR.MINOR.PATCH` tag (for example, `v0.1.0`) runs the same checks and publishes the ZIP and SHA-256 checksum only after they pass. The tag supplies the bundle version. Manual workflow runs build the selected ref and publish only when that ref is a version tag.
 
 ## Configuration (TOML Dotfile & Graphical Settings UI)
 
@@ -179,7 +174,7 @@ the old path's resize delay without requiring it to pass the new concurrency che
 `make xmonad-oracle XMONAD_SRC=/path/to/xmonad/src`
 compares stack wraparound with XMonad and requires GHC.
 
-The app icon is generated from vector drawing code in `Scripts/DrawAppIcon.swift`.
+The app icon is generated from vector drawing code in `src/macos/app_icon.gsa` (`talus --render-icon`).
 The status image draws the same symbol next to the configured text.
 
 New-window geometry is confirmed by reading the actual frame after AX writes.
@@ -188,8 +183,3 @@ unapplied target returns a retryable error instead of being cached as complete.
 Foreground window-creation intent also supersedes an older queued focus once the
 new window is discovered, preventing Full layout from raising the older window.
 Explicit pointer or workspace input cancels that creation hint.
-`make xmonad-oracle XMONAD_SRC=/path/to/xmonad/src`
-compares stack wraparound with XMonad and requires GHC.
-
-The app icon is generated from vector drawing code in `Scripts/DrawAppIcon.swift`.
-The status image draws the same symbol next to the configured text.

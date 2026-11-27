@@ -4,7 +4,7 @@ entry = "src/main.gsa"
 src_dir = "src"
 
 [deps]
-objc = { path = "../objc.gsa" }
+objc = { git = "github.com/geisha-lang/objc.gsa", version = "0.1.0" }
 
 [target.native]
 link_flags = [
